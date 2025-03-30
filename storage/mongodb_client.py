@@ -265,14 +265,14 @@ class MongoDBClient:
         db = self.get_db(db_name)
         return db[collection_name]
     
-    def insert_one(self, db_name: str, collection_name: str, document: Dict) -> Any:
+    def insert_one(self, collection_name: str, document: Dict, db_name: str = None) -> Any:
         """
         插入单个文档
         
         Args:
-            db_name: 数据库名称
             collection_name: 集合名称
             document: 要插入的文档
+            db_name: 可选的数据库名称，不提供则使用默认数据库
             
         Returns:
             插入结果
@@ -280,17 +280,18 @@ class MongoDBClient:
         Raises:
             RuntimeError: 如果未连接到MongoDB
         """
-        collection = self.get_collection(collection_name, db_name)
+        db_to_use = db_name or self.db_name
+        collection = self.get_collection(collection_name, db_to_use)
         return collection.insert_one(document)
     
-    def insert_many(self, db_name: str, collection_name: str, documents: List[Dict]) -> Any:
+    def insert_many(self, collection_name: str, documents: List[Dict], db_name: str = None) -> Any:
         """
         插入多个文档
         
         Args:
-            db_name: 数据库名称
             collection_name: 集合名称
             documents: 要插入的文档列表
+            db_name: 可选的数据库名称，不提供则使用默认数据库
             
         Returns:
             插入结果
@@ -298,17 +299,18 @@ class MongoDBClient:
         Raises:
             RuntimeError: 如果未连接到MongoDB
         """
-        collection = self.get_collection(collection_name, db_name)
+        db_to_use = db_name or self.db_name
+        collection = self.get_collection(collection_name, db_to_use)
         return collection.insert_many(documents)
     
-    def find_one(self, db_name: str, collection_name: str, query: Dict) -> Optional[Dict]:
+    def find_one(self, collection_name: str, query: Dict, db_name: str = None) -> Optional[Dict]:
         """
         查找单个文档
         
         Args:
-            db_name: 数据库名称
             collection_name: 集合名称
             query: 查询条件
+            db_name: 可选的数据库名称，不提供则使用默认数据库
             
         Returns:
             查找到的文档，如果未找到则返回None
@@ -316,17 +318,18 @@ class MongoDBClient:
         Raises:
             RuntimeError: 如果未连接到MongoDB
         """
-        collection = self.get_collection(collection_name, db_name)
+        db_to_use = db_name or self.db_name
+        collection = self.get_collection(collection_name, db_to_use)
         return collection.find_one(query)
     
-    def find(self, db_name: str, collection_name: str, query: Dict, projection: Dict = None) -> List[Dict]:
+    def find(self, collection_name: str, query: Dict, db_name: str = None, projection: Dict = None) -> List[Dict]:
         """
         查找多个文档
         
         Args:
-            db_name: 数据库名称
             collection_name: 集合名称
             query: 查询条件
+            db_name: 可选的数据库名称，不提供则使用默认数据库
             projection: 投影参数
             
         Returns:
@@ -335,18 +338,19 @@ class MongoDBClient:
         Raises:
             RuntimeError: 如果未连接到MongoDB
         """
-        collection = self.get_collection(collection_name, db_name)
+        db_to_use = db_name or self.db_name
+        collection = self.get_collection(collection_name, db_to_use)
         return list(collection.find(query, projection))
     
-    def update_one(self, db_name: str, collection_name: str, query: Dict, update: Dict) -> Any:
+    def update_one(self, collection_name: str, query: Dict, update: Dict, db_name: str = None) -> Any:
         """
         更新单个文档
         
         Args:
-            db_name: 数据库名称
             collection_name: 集合名称
             query: 查询条件
             update: 更新操作
+            db_name: 可选的数据库名称，不提供则使用默认数据库
             
         Returns:
             更新结果
@@ -354,18 +358,19 @@ class MongoDBClient:
         Raises:
             RuntimeError: 如果未连接到MongoDB
         """
-        collection = self.get_collection(collection_name, db_name)
+        db_to_use = db_name or self.db_name
+        collection = self.get_collection(collection_name, db_to_use)
         return collection.update_one(query, update)
     
-    def update_many(self, db_name: str, collection_name: str, query: Dict, update: Dict) -> Any:
+    def update_many(self, collection_name: str, query: Dict, update: Dict, db_name: str = None) -> Any:
         """
         更新多个文档
         
         Args:
-            db_name: 数据库名称
             collection_name: 集合名称
             query: 查询条件
             update: 更新操作
+            db_name: 可选的数据库名称，不提供则使用默认数据库
             
         Returns:
             更新结果
@@ -373,17 +378,18 @@ class MongoDBClient:
         Raises:
             RuntimeError: 如果未连接到MongoDB
         """
-        collection = self.get_collection(collection_name, db_name)
+        db_to_use = db_name or self.db_name
+        collection = self.get_collection(collection_name, db_to_use)
         return collection.update_many(query, update)
     
-    def delete_one(self, db_name: str, collection_name: str, query: Dict) -> Any:
+    def delete_one(self, collection_name: str, query: Dict, db_name: str = None) -> Any:
         """
         删除单个文档
         
         Args:
-            db_name: 数据库名称
             collection_name: 集合名称
             query: 查询条件
+            db_name: 可选的数据库名称，不提供则使用默认数据库
             
         Returns:
             删除结果
@@ -391,17 +397,18 @@ class MongoDBClient:
         Raises:
             RuntimeError: 如果未连接到MongoDB
         """
-        collection = self.get_collection(collection_name, db_name)
+        db_to_use = db_name or self.db_name
+        collection = self.get_collection(collection_name, db_to_use)
         return collection.delete_one(query)
     
-    def delete_many(self, db_name: str, collection_name: str, query: Dict) -> Any:
+    def delete_many(self, collection_name: str, query: Dict, db_name: str = None) -> Any:
         """
         删除多个文档
         
         Args:
-            db_name: 数据库名称
             collection_name: 集合名称
             query: 查询条件
+            db_name: 可选的数据库名称，不提供则使用默认数据库
             
         Returns:
             删除结果
@@ -409,7 +416,8 @@ class MongoDBClient:
         Raises:
             RuntimeError: 如果未连接到MongoDB
         """
-        collection = self.get_collection(collection_name, db_name)
+        db_to_use = db_name or self.db_name
+        collection = self.get_collection(collection_name, db_to_use)
         return collection.delete_many(query)
     
     def ensure_indexes(self, collection_name: str, indexes: List[Dict[str, Any]], db_name: str = None):
@@ -424,7 +432,8 @@ class MongoDBClient:
         Raises:
             RuntimeError: 如果未连接到MongoDB
         """
-        collection = self.get_collection(collection_name, db_name)
+        db_to_use = db_name or self.db_name
+        collection = self.get_collection(collection_name, db_to_use)
         
         try:
             # 获取现有索引信息
@@ -628,7 +637,8 @@ class MongoDBClient:
         Raises:
             RuntimeError: 如果未连接到MongoDB
         """
-        collection = self.get_collection(collection_name, db_name)
+        db_to_use = db_name or self.db_name
+        collection = self.get_collection(collection_name, db_to_use)
         
         # 查找最新日期
         result = collection.find().sort(date_field, DESCENDING).limit(1)
@@ -655,7 +665,8 @@ class MongoDBClient:
         Raises:
             RuntimeError: 如果未连接到MongoDB
         """
-        collection = self.get_collection(collection_name, db_name)
+        db_to_use = db_name or self.db_name
+        collection = self.get_collection(collection_name, db_to_use)
         
         # 查找最新日期
         result = collection.find({stock_field: stock_code}).sort(date_field, DESCENDING).limit(1)
@@ -680,7 +691,8 @@ class MongoDBClient:
         Raises:
             RuntimeError: 如果未连接到MongoDB
         """
-        collection = self.get_collection(collection_name, db_name)
+        db_to_use = db_name or self.db_name
+        collection = self.get_collection(collection_name, db_to_use)
         
         if query is None:
             query = {}

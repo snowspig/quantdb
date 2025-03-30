@@ -7,8 +7,9 @@ Stock Basic Fetcher - 获取股票基本信息并保存到MongoDB
 参考接口文档：http://tushare.xcsc.com:7173/document/2?doc_id=25
 
 使用方法：
-    python stock_basic_fetcher.py             # 简洁日志模式
-    python stock_basic_fetcher.py --verbose    # 详细日志模式
+    python stock_basic_fetcher.py              # 使用湘财真实API数据，简洁日志模式
+    python stock_basic_fetcher.py --verbose     # 使用湘财真实API数据，详细日志模式
+    python stock_basic_fetcher.py --mock        # 使用模拟数据模式（API不可用时）
 """
 import os
 import sys
@@ -64,7 +65,7 @@ class StockBasicFetcher:
         self.interface_dir = interface_dir
         self.interface_name = interface_name
         self.target_market_codes = target_market_codes
-        self.db_name = db_name
+        self.db_name = "tushare_data"  # 强制使用tushare_data作为数据库名
         self.collection_name = collection_name
         self.verbose = verbose
 
@@ -85,6 +86,7 @@ class StockBasicFetcher:
         
         # 初始化多WAN口管理器
         self.port_allocator = self._init_port_allocator()
+
 
     def _load_config(self) -> Dict[str, Any]:
         """加载配置文件"""
@@ -132,7 +134,7 @@ class StockBasicFetcher:
         except Exception as e:
             logger.error(f"初始化Tushare客户端失败: {str(e)}")
             sys.exit(1)
-    
+
     def _init_mongo_client(self) -> MongoDBClient:
         """初始化MongoDB客户端"""
         try:
@@ -145,13 +147,14 @@ class StockBasicFetcher:
             username = mongodb_config.get("username", "")
             password = mongodb_config.get("password", "")
             
-            # 创建MongoDB客户端
+            # 创建MongoDB客户端 - 明确指定数据库名称为tushare_data
             mongo_client = MongoDBClient(
                 uri=uri,
                 host=host,
                 port=port,
                 username=username,
-                password=password
+                password=password,
+                db_name="tushare_data"  # 明确设置数据库名
             )
             
             # 连接到数据库
@@ -194,7 +197,7 @@ class StockBasicFetcher:
         except Exception as e:
             logger.error(f"初始化多WAN口管理器失败: {str(e)}")
             return None
-            
+
     def _get_wan_socket(self) -> Optional[Tuple[int, int]]:
         """获取WAN接口和端口"""
         if not self.port_allocator:
@@ -369,6 +372,9 @@ class StockBasicFetcher:
         Returns:
             是否成功保存
         """
+        # 强制确保使用tushare_data作为数据库名称
+        logger.info(f"保存数据到MongoDB数据库：{self.db_name}，集合：{self.collection_name}")
+        
         if df is None or df.empty:
             logger.warning("没有数据可保存到MongoDB")
             return False
@@ -390,37 +396,40 @@ class StockBasicFetcher:
             # 删除集合中的旧数据（可选）
             if self.verbose:
                 logger.debug(f"清空集合 {self.db_name}.{self.collection_name} 中的旧数据")
-                
-            self.mongo_client.delete_many(self.db_name, self.collection_name, {})
+            
+            self.mongo_client.delete_many(self.collection_name, {}, self.db_name)
             
             # 批量插入新数据
             if self.verbose:
                 logger.debug(f"向集合 {self.db_name}.{self.collection_name} 插入 {len(records)} 条记录")
                 
-            result = self.mongo_client.insert_many(self.db_name, self.collection_name, records)
+            result = self.mongo_client.insert_many(self.collection_name, records, self.db_name)
             
             elapsed = time.time() - start_time
             inserted_count = len(result.inserted_ids) if result else 0
+
             
             if inserted_count > 0:
-                # 创建索引
+                # 创建索引 - 修正获取集合的方式
                 try:
-                    collection = self.mongo_client.get_collection(self.db_name, self.collection_name)
-                    if collection is not None:  # 修改为与None比较，避免布尔测试警告
-                        # 根据接口配置中的index_fields创建索引
-                        index_fields = self.interface_config.get("index_fields", [])
-                        if index_fields:
-                            for field in index_fields:
-                                collection.create_index(field)
-                                logger.debug(f"已为字段 {field} 创建索引")
-                        else:
-                            # 默认为ts_code和symbol创建索引
-                            collection.create_index("ts_code")
-                            collection.create_index("symbol")
-                            logger.debug("已为默认字段创建索引")
-                            
-                        # 为update_time创建索引，便于查询最新数据
-                        collection.create_index("update_time")
+                    # 直接获取数据库并从中获取集合，避免混淆参数顺序
+                    db = self.mongo_client.get_db(self.db_name)
+                    collection = db[self.collection_name]
+                    
+                    # 根据接口配置中的index_fields创建索引
+                    index_fields = self.interface_config.get("index_fields", [])
+                    if index_fields:
+                        for field in index_fields:
+                            collection.create_index(field)
+                            logger.debug(f"已为字段 {field} 创建索引")
+                    else:
+                        # 默认为ts_code和symbol创建索引
+                        collection.create_index("ts_code")
+                        collection.create_index("symbol")
+                        logger.debug("已为默认字段创建索引")
+                        
+                    # 为update_time创建索引，便于查询最新数据
+                    collection.create_index("update_time")
                 except Exception as e:
                     logger.warning(f"创建索引时出错: {str(e)}")
                 
@@ -494,6 +503,7 @@ def create_mock_data() -> pd.DataFrame:
         {'ts_code': '603501.SH', 'symbol': '603501', 'name': '韦尔股份', 'exchange': 'SSE', 'list_date': '20170504'},
         {'ts_code': '688981.SH', 'symbol': '688981', 'name': '中芯国际', 'exchange': 'SSE', 'list_date': '20200716'}
     ]
+
     
     # 转换为DataFrame
     df = pd.DataFrame(data)
@@ -524,7 +534,8 @@ def main():
     parser.add_argument('--db-name', default='tushare_data', help='MongoDB数据库名称')
     parser.add_argument('--collection-name', default='stock_basic', help='MongoDB集合名称')
     parser.add_argument('--verbose', action='store_true', help='输出详细日志')
-    parser.add_argument('--mock', action='store_true', help='使用模拟数据（当API不可用时）')
+    parser.add_argument('--mock', action='store_false', dest='use_real_api', help='使用模拟数据（当API不可用时）')
+    parser.add_argument('--use-real-api', action='store_true', default=True, help='使用湘财真实API数据（默认）')
     parser.add_argument('--dry-run', action='store_true', help='仅运行流程，不保存数据')
     args = parser.parse_args()
     
@@ -536,45 +547,42 @@ def main():
         config_path=args.config,
         interface_dir=args.interface_dir,
         target_market_codes=target_market_codes,
-        db_name=args.db_name,
+        db_name=args.db_name,  # 这个值会被内部强制设为"tushare_data"
         collection_name=args.collection_name,
         verbose=args.verbose
     )
     
-    # 如果使用模拟数据模式
-    if args.mock:
-        logger.info("使用模拟数据模式运行")
+    # 使用真实API或模拟数据模式
+    if args.use_real_api:
+        logger.info("使用湘财Tushare真实API获取数据")
+        success = fetcher.run()
+    else:
+        logger.info("使用模拟数据模式")
         # 创建模拟数据
         df = create_mock_data()
         # 过滤数据
         filtered_df = fetcher.filter_stock_data(df)
-        # 添加更新时间
+        if filtered_df.empty:
+            logger.warning("过滤后没有符合条件的股票数据")
+            sys.exit(1)
+        # 添加更新时间字段
         filtered_df['update_time'] = datetime.now().isoformat()
-        
-        # 保存数据或执行空运行
+        # 是否实际保存
         if args.dry_run:
-            logger.info("执行空运行模式，不保存到数据库")
-            if fetcher.verbose:
-                logger.debug(f"数据示例：\n{filtered_df.head(3)}")
-            logger.success(f"空运行成功，处理了 {len(filtered_df)} 条数据")
+            logger.info("干运行模式，不保存数据")
             success = True
         else:
-            # 保存到MongoDB
+            # 保存数据到MongoDB
             success = fetcher.save_to_mongodb(filtered_df)
-    else:
-        # 正常运行
-        success = fetcher.run()
-    
-    # 关闭MongoDB连接
-    fetcher.mongo_client.close()
+            # 关闭MongoDB连接
+            fetcher.mongo_client.close()
     
     if success:
-        logger.info("股票基本信息获取并保存到MongoDB成功")
-        return 0
+        logger.success("数据获取和保存成功")
+        sys.exit(0)
     else:
-        logger.error("获取或保存股票基本信息失败")
-        return 1
+        logger.error("数据获取或保存失败")
+        sys.exit(1)
 
-
-if __name__ == '__main__':
-    sys.exit(main())
+if __name__ == "__main__":
+    main()
