@@ -315,8 +315,8 @@ class StockBasicFetcher:
         # 确保symbol列是字符串类型
         df['symbol'] = df['symbol'].astype(str)
         
-        # 提取前两位作为市场代码并过滤
-        df_filtered = df[df['symbol'].str[:2].isin(self.target_market_codes)]
+        # 提取前两位作为市场代码并过滤，并创建显式副本避免SettingWithCopyWarning
+        df_filtered = df[df['symbol'].str[:2].isin(self.target_market_codes)].copy()
         
         # 输出过滤统计信息
         logger.info(f"过滤后股票数量: {len(df_filtered)}")
@@ -390,7 +390,7 @@ class StockBasicFetcher:
                 # 创建索引
                 try:
                     collection = self.mongo_client.get_collection(self.db_name, self.collection_name)
-                    if collection:
+                    if collection is not None:  # 修改为与None比较，避免布尔测试警告
                         # 根据接口配置中的index_fields创建索引
                         index_fields = self.interface_config.get("index_fields", [])
                         if index_fields:
