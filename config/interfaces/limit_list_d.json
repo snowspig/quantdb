@@ -1,0 +1,22 @@
+{
+    "source": "tushare",
+    "id": "limit_list_d",
+    "api_name": "limit_list_d",
+    "enabled": true,
+    "group": "market",
+    "frequency": "daily",
+    "description": "涨跌停列表",
+    "params": {
+      "start_date": "{last_week}",
+      "end_date": "{trade_date}"
+    },
+    "batch_size": 10000,
+    "index_fields": ["ts_code", "trade_date"],
+    "fields_to_store": [
+        "trade_date", "ts_code", "industry", "name", "close", 
+        "pct_chg", "amount", "limit_amount", "float_mv", "total_mv", 
+        "turnover_ratio", "fd_amount", "first_time", "last_time", 
+        "open_times", "up_stat", "limit_times", "limit"
+    ],
+    "wan_mode": 0
+  } 

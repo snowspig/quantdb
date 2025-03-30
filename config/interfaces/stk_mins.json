@@ -1,0 +1,33 @@
+{
+    "description": "股票分钟级行情数据",
+    "api_name": "stk_mins",
+    "fields": [
+        "code", "trade_time", "open", "high", "low", "close", "vol", "amount"
+    ],
+    "params": {
+        "freq": "1min"
+    },
+    "update_frequency": "daily",
+    "update_priority": 5,
+    "time_field": "trade_time",
+    "stock_field": "ts_code",
+    "index_fields": ["ts_code", "trade_time"],
+    "available_fields": [
+        "code", "trade_time", "open", "close", "high", "low", "vol", "amount"
+    ],
+    "freq_order": ["60min", "30min", "15min", "5min", "1min"],
+    "field_mapping": {
+        "ts_code": "code",
+        "trade_time": "trade_time"
+    },
+    "storage_mapping": {
+        "code": "ts_code",
+        "trade_time": "trade_time"
+    },
+    "comments": {
+        "field_mapping": "API调用时的字段映射，将ts_code映射为code",
+        "storage_mapping": "存储数据时的字段映射，将code转换回ts_code",
+        "index_fields": "MongoDB中使用的索引字段，应使用存储后的字段名",
+        "time_field": "时间字段，同样使用存储后的字段名"
+    }
+} 

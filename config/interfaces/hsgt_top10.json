@@ -1,0 +1,20 @@
+{
+    "source": "tushare",
+    "id": "hsgt_top10",
+    "api_name": "hsgt_top10",
+    "enabled": true,
+    "group": "market",
+    "frequency": "daily",
+    "description": "沪深股通十大成交股",
+    "params": {
+      "start_date": "{last_week}",
+      "end_date": "{trade_date}"
+    },
+    "batch_size": 3000,
+    "index_fields": ["ts_code","trade_date"],
+    "fields_to_store": [
+        "trade_date", "ts_code", "name", "close", "change", "rank", 
+        "market_type", "amount", "net_amount", "buy", "sell"
+    ],
+    "wan_mode": 0
+  } 

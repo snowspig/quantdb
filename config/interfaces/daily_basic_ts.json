@@ -1,0 +1,18 @@
+{
+  "description": "每日指标",
+  "api_name": "daily_basic_ts",
+  "fields": [],
+  "params": {
+  },
+  "update_frequency": "daily",
+  "update_priority": 1,
+  "index_fields": [
+      "ts_code","trade_date"
+  ],
+  "available_fields": [
+      "pe_ttm", "circ_mv", "dv_ttm", "udlimit_status", "total_share", 
+      "volume_ratio", "float_share", "ps_ttm", "close", "ps", 
+      "ts_code", "pe", "free_share", "dv_ratio", "trade_date", "total_mv", 
+      "turnover_rate", "pb", "turnover_rate_f"  
+  ]
+} 

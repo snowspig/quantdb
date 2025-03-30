@@ -1,0 +1,16 @@
+{
+  "description": "港股通每日成交统计",
+  "api_name": "ggt_daily",
+  "fields": [],
+  "params": {
+  },
+  "update_frequency": "daily",
+  "update_priority": 1,
+  "index_fields": [
+      "trade_date","markettype"
+  ],
+  "available_fields": [
+      "trade_date", "markettype", "buy_amount", "buy_volume", 
+      "sell_amount", "sell_volume", "fx_buy_price", "fx_sell_price"
+  ]
+} 

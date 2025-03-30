@@ -1,0 +1,17 @@
+{
+  "description": "分红送股信息",
+  "api_name": "div",
+  "fields": [],
+  "params": {
+  },
+  "update_frequency": "daily",
+  "update_priority": 1,
+  "index_fields": [
+      "ts_code","ex_date"
+  ],
+  "available_fields": [
+      "ts_code", "ex_date", "ex_type", "ex_description", "cash_dividend_ratio", 
+      "bonus_share_ratio", "rightsissue_ratio", "rightsissue_price", 
+      "conversed_ratio", "seo_price", "seo_ratio", "consolidate_split_ratio"
+  ]
+} 

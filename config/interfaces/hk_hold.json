@@ -1,0 +1,19 @@
+{
+    "source": "tushare",
+    "id": "hk_hold",
+    "api_name": "hk_hold",
+    "enabled": true,
+    "group": "market",
+    "frequency": "daily",
+    "description": "沪深港股通持股明细",
+    "params": {
+      "start_date": "{last_week}",
+      "end_date": "{trade_date}"
+    },
+    "batch_size": 4000,
+    "index_fields": ["ts_code","trade_date"],
+    "fields_to_store": [
+        "exchange", "ts_code", "trade_date", "name", "ratio", "code", "vol"
+    ],
+    "wan_mode": 0
+  } 

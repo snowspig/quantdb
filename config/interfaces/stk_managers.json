@@ -1,0 +1,12 @@
+{
+    "source": "tushare",
+    "id": "stk_managers",
+    "api_name": "stk_managers",
+    "enabled": true,
+    "group": "basic",
+    "params": {},
+    "batch_size": 4000,
+    "index_fields": ["ts_code", "name", "begin_date", "title", "end_date"],
+    "fields_to_store": ["ts_code", "ann_date", "name", "gender", "lev", "title", "edu", "national", "birthday", "begin_date", "end_date"],  
+    "wan_mode": 0
+  }

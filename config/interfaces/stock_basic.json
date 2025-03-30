@@ -1,0 +1,25 @@
+{
+    "description": "股票基本信息",
+    "api_name": "stock_basic",
+    "fields": [
+        "ts_code","symbol","name","exchange",
+        "list_date","delist_date","comp_name",
+        "comp_name_en","isin_code","list_board",
+        "crncy_code","pinyin","list_board_name",
+        "is_shsc","comp_code"
+    ],
+    "params": {
+    },
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code","symbol"
+    ],
+    "available_fields": [
+        "ts_code","symbol","name","comp_name",
+        "comp_name_en","isin_code","exchange",
+        "list_board","list_date","delist_date",
+        "crncy_code","pinyin","list_board_name",
+        "is_shsc","comp_code"
+    ]
+}

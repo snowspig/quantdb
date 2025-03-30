@@ -1,0 +1,15 @@
+{
+    "description": "股票复权因子数据",
+    "api_name": "adj_factor",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code","trade_date"
+    ],
+    "available_fields": [
+        "ts_code", "trade_date", "adj_factor" 
+    ]
+  } 
