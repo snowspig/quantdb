@@ -257,7 +257,23 @@ class StockBasicFetcher:
             
             # 使用客户端获取数据
             logger.debug(f"API名称: {api_name}, 参数: {params}, 字段: {fields if self.verbose else '...'}")
-            df = self.client.get_data(api_name=api_name, params=params, fields=fields)
+            
+            # 增加超时，设置为120秒
+            self.client.set_timeout(120)
+            logger.info(f"增加API请求超时时间为120秒，提高网络可靠性")
+            
+            # 添加异常捕获，以便更好地调试
+            try:
+                df = self.client.get_data(api_name=api_name, params=params, fields=fields)
+                if df is not None and not df.empty:
+                    logger.success(f"成功获取数据，行数: {len(df)}, 列数: {df.shape[1]}")
+                    if self.verbose:
+                        logger.debug(f"列名: {list(df.columns)}")
+            except Exception as e:
+                import traceback
+                logger.error(f"获取API数据时发生异常: {str(e)}")
+                logger.debug(f"异常详情: {traceback.format_exc()}")
+                return None
             elapsed = time.time() - start_time
             
             if df is None or df.empty:
@@ -451,6 +467,52 @@ class StockBasicFetcher:
         return success
 
 
+def create_mock_data() -> pd.DataFrame:
+    """创建模拟数据用于测试"""
+    logger.info("创建模拟股票基本信息数据用于测试")
+    
+    # 创建模拟数据
+    data = [
+        {'ts_code': '000001.SZ', 'symbol': '000001', 'name': '平安银行', 'exchange': 'SZSE', 'list_date': '19910403'},
+        {'ts_code': '000002.SZ', 'symbol': '000002', 'name': '万科A', 'exchange': 'SZSE', 'list_date': '19910129'},
+        {'ts_code': '000063.SZ', 'symbol': '000063', 'name': '中兴通讯', 'exchange': 'SZSE', 'list_date': '19971118'},
+        {'ts_code': '000338.SZ', 'symbol': '000338', 'name': '潍柴动力', 'exchange': 'SZSE', 'list_date': '20070430'},
+        {'ts_code': '000651.SZ', 'symbol': '000651', 'name': '格力电器', 'exchange': 'SZSE', 'list_date': '19960801'},
+        {'ts_code': '000725.SZ', 'symbol': '000725', 'name': '京东方A', 'exchange': 'SZSE', 'list_date': '19970710'},
+        {'ts_code': '000858.SZ', 'symbol': '000858', 'name': '五粮液', 'exchange': 'SZSE', 'list_date': '19980827'},
+        {'ts_code': '300059.SZ', 'symbol': '300059', 'name': '东方财富', 'exchange': 'SZSE', 'list_date': '20100115'},
+        {'ts_code': '300750.SZ', 'symbol': '300750', 'name': '宁德时代', 'exchange': 'SZSE', 'list_date': '20180611'},
+        {'ts_code': '600000.SH', 'symbol': '600000', 'name': '浦发银行', 'exchange': 'SSE', 'list_date': '19991110'},
+        {'ts_code': '600036.SH', 'symbol': '600036', 'name': '招商银行', 'exchange': 'SSE', 'list_date': '20021109'},
+        {'ts_code': '600276.SH', 'symbol': '600276', 'name': '恒瑞医药', 'exchange': 'SSE', 'list_date': '20001018'},
+        {'ts_code': '600519.SH', 'symbol': '600519', 'name': '贵州茅台', 'exchange': 'SSE', 'list_date': '20010827'},
+        {'ts_code': '600887.SH', 'symbol': '600887', 'name': '伊利股份', 'exchange': 'SSE', 'list_date': '19960403'},
+        {'ts_code': '601318.SH', 'symbol': '601318', 'name': '中国平安', 'exchange': 'SSE', 'list_date': '20070301'},
+        {'ts_code': '601857.SH', 'symbol': '601857', 'name': '中国石油', 'exchange': 'SSE', 'list_date': '20071105'},
+        {'ts_code': '601888.SH', 'symbol': '601888', 'name': '中国中免', 'exchange': 'SSE', 'list_date': '20091026'},
+        {'ts_code': '603288.SH', 'symbol': '603288', 'name': '海天味业', 'exchange': 'SSE', 'list_date': '20140211'},
+        {'ts_code': '603501.SH', 'symbol': '603501', 'name': '韦尔股份', 'exchange': 'SSE', 'list_date': '20170504'},
+        {'ts_code': '688981.SH', 'symbol': '688981', 'name': '中芯国际', 'exchange': 'SSE', 'list_date': '20200716'}
+    ]
+    
+    # 转换为DataFrame
+    df = pd.DataFrame(data)
+    
+    # 添加其他字段，确保与实际API返回的数据结构一致
+    df['delist_date'] = pd.NA
+    df['comp_name'] = df['name']
+    df['comp_name_en'] = ''
+    df['isin_code'] = ''
+    df['list_board'] = ''
+    df['crncy_code'] = 'CNY'
+    df['pinyin'] = ''
+    df['list_board_name'] = ''
+    df['is_shsc'] = 'N'
+    df['comp_code'] = df['symbol']
+    
+    logger.success(f"已创建 {len(df)} 条模拟股票数据")
+    return df
+
 def main():
     """主函数"""
     import argparse
@@ -462,6 +524,8 @@ def main():
     parser.add_argument('--db-name', default='tushare_data', help='MongoDB数据库名称')
     parser.add_argument('--collection-name', default='stock_basic', help='MongoDB集合名称')
     parser.add_argument('--verbose', action='store_true', help='输出详细日志')
+    parser.add_argument('--mock', action='store_true', help='使用模拟数据（当API不可用时）')
+    parser.add_argument('--dry-run', action='store_true', help='仅运行流程，不保存数据')
     args = parser.parse_args()
     
     # 解析市场代码
@@ -477,7 +541,32 @@ def main():
         verbose=args.verbose
     )
     
-    success = fetcher.run()
+    # 如果使用模拟数据模式
+    if args.mock:
+        logger.info("使用模拟数据模式运行")
+        # 创建模拟数据
+        df = create_mock_data()
+        # 过滤数据
+        filtered_df = fetcher.filter_stock_data(df)
+        # 添加更新时间
+        filtered_df['update_time'] = datetime.now().isoformat()
+        
+        # 保存数据或执行空运行
+        if args.dry_run:
+            logger.info("执行空运行模式，不保存到数据库")
+            if fetcher.verbose:
+                logger.debug(f"数据示例：\n{filtered_df.head(3)}")
+            logger.success(f"空运行成功，处理了 {len(filtered_df)} 条数据")
+            success = True
+        else:
+            # 保存到MongoDB
+            success = fetcher.save_to_mongodb(filtered_df)
+    else:
+        # 正常运行
+        success = fetcher.run()
+    
+    # 关闭MongoDB连接
+    fetcher.mongo_client.close()
     
     if success:
         logger.info("股票基本信息获取并保存到MongoDB成功")
