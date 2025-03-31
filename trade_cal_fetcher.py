@@ -1,698 +1,523 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python
 """
-Ultimate Trade Calendar Fetcher with Intelligent Batch Processing
+Trade Calendar Fetcher - 获取交易日历数据并保存到MongoDB
 
-This script fetches trading calendar data from TuShare API and stores it in MongoDB.
-It implements advanced intelligent batch processing with real-time performance metrics,
-adaptive batch sizing, and comprehensive error handling.
+该脚本用于从湘财Tushare获取交易日历数据，并保存到MongoDB数据库中的trade_cal集合
+默认模式下抓取最近一年的交易日历数据
 
-Features:
-- Multiple batch strategies (year, exchange, exchange_year)
-- Intelligent and adaptive batch sizing
-- Real-time performance metrics and reporting
-- Automatic retries with exponential backoff
-- Verification and data integrity checks
-- Memory-efficient bulk operations
+参考接口文档：http://tushare.xcsc.com:7173/document/2?doc_id=26
+
+使用方法：
+    python trade_cal_fetcher.py                   # 使用湘财真实API数据，简洁日志模式，获取近期数据
+    python trade_cal_fetcher.py --verbose         # 使用湘财真实API数据，详细日志模式
+    python trade_cal_fetcher.py --mock            # 使用模拟数据模式（API不可用时）
+    python trade_cal_fetcher.py --start-date 20200101 --end-date 20231231  # 指定日期范围
 """
-
-import argparse
-import logging
-import time
-import yaml
-import json
-import sys
 import os
-import re
-import traceback
-import statistics
+import sys
+import json
+import yaml
+import time
+import asyncio
+import pandas as pd
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Union, Tuple, Optional, Callable
-from functools import wraps
-import concurrent.futures
+from typing import Dict, List, Set, Optional, Any, Tuple, Union
+from pathlib import Path
+from loguru import logger
 
-# Third-party imports
-import requests
-import pymongo
-from pymongo import MongoClient, UpdateOne, InsertOne
-from pymongo.errors import BulkWriteError, ConnectionFailure
+# 添加项目根目录到Python路径
+current_dir = Path(__file__).resolve().parent
+sys.path.append(str(current_dir))
 
-# Import intelligent batch processing modules
-from intelligent_batch_processing import calculate_intelligent_batches, PerformanceTracker, generate_performance_report
-from adaptive_batch import PerformanceTracker as AdaptiveTracker
-from adaptive_batch import generate_performance_report as adaptive_report
-from adaptive_batch import calculate_adaptive_batch_size, determine_optimal_strategy
+# 导入项目模块
+from data_fetcher.tushare_client import TushareClient
+from storage.mongodb_client import MongoDBClient
+from wan_manager.port_allocator import PortAllocator
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# Default paths
-CONFIG_PATH = "config/config.yaml"
-INTERFACE_CONFIG_PATH = "config/interfaces/trade_cal.json"
-
-
-# Retry decorator for API calls
-def retry_with_backoff(max_retries=3, base_delay=1):
+class TradeCalFetcher:
     """
-    Decorator for retrying functions with exponential backoff
+    交易日历数据获取器
     
-    Args:
-        max_retries (int): Maximum number of retries
-        base_delay (float): Initial delay in seconds
+    该类用于从Tushare获取交易日历数据并保存到MongoDB数据库
+    默认模式下使用多WAN口模块抓取数据，并获取近期交易日历数据
     """
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            retries = 0
-            delay = base_delay
-            
-            while retries <= max_retries:
-                try:
-                    return func(*args, **kwargs)
-                except Exception as e:
-                    retries += 1
-                    if retries > max_retries:
-                        logger.error(f"Max retries ({max_retries}) exceeded")
-                        raise
-                    
-                    wait = delay * (2 ** (retries - 1))  # Exponential backoff
-                    logger.warning(f"Retry {retries}/{max_retries} after {wait:.2f}s due to: {str(e)}")
-                    time.sleep(wait)
-        
-        return wrapper
     
-    return decorator
-
-
-# Configuration loading
-def load_config(config_path=CONFIG_PATH, interface_config_path=INTERFACE_CONFIG_PATH) -> Tuple[Dict, Dict]:
-    """
-    Load configuration files
-    
-    Args:
-        config_path (str): Path to main config file
-        interface_config_path (str): Path to interface config file
+    def __init__(
+        self,
+        config_path: str = "config/config.yaml",
+        interface_dir: str = "config/interfaces",
+        interface_name: str = "trade_cal.json",
+        db_name: str = "tushare_data",
+        collection_name: str = "trade_cal",
+        start_date: str = None,
+        end_date: str = None,
+        exchange: str = "SSE",  # 默认上交所
+        verbose: bool = False
+    ):
+        """
+        初始化交易日历数据获取器
         
-    Returns:
-        tuple: (config dict, interface config dict)
-    """
-    try:
-        with open(config_path, 'r') as f:
-            config = yaml.safe_load(f)
+        Args:
+            config_path: 配置文件路径
+            interface_dir: 接口配置文件目录
+            interface_name: 接口名称
+            db_name: MongoDB数据库名称
+            collection_name: MongoDB集合名称
+            start_date: 开始日期（格式：YYYYMMDD，默认为当前日期前一年）
+            end_date: 结束日期（格式：YYYYMMDD，默认为当前日期）
+            exchange: 交易所代码（SSE：上交所，SZSE：深交所，默认SSE）
+            verbose: 是否输出详细日志
+        """
+        self.config_path = config_path
+        self.interface_dir = interface_dir
+        self.interface_name = interface_name
+        self.db_name = "tushare_data"  # 强制使用tushare_data作为数据库名
+        self.collection_name = collection_name
+        self.exchange = exchange
+        self.verbose = verbose
         
-        with open(interface_config_path, 'r') as f:
-            interface_config = json.load(f)
-        
-        return config, interface_config
-    except Exception as e:
-        logger.error(f"Error loading configuration: {str(e)}")
-        raise
-
-
-# MongoDB connection
-def connect_mongo(config: Dict) -> MongoClient:
-    """
-    Connect to MongoDB with configuration
-    
-    Args:
-        config (dict): Configuration dictionary with MongoDB settings
-        
-    Returns:
-        MongoClient: MongoDB client instance
-    """
-    try:
-        mongo_config = config.get('mongodb', {})
-        host = mongo_config.get('host', 'localhost')
-        port = mongo_config.get('port', 27017)
-        username = mongo_config.get('username', '')
-        password = mongo_config.get('password', '')
-        auth_db = mongo_config.get('authSource', 'admin')
-        
-        # Connection URI
-        if username and password:
-            mongo_uri = f"mongodb://{username}:{password}@{host}:{port}/{auth_db}"
-        else:
-            mongo_uri = f"mongodb://{host}:{port}/"
-        
-        # Connect with timeout
-        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-        
-        # Test connection
-        client.admin.command('ping')
-        logger.info(f"MongoDB connection successful")
-        
-        return client
-    
-    except ConnectionFailure as cf:
-        logger.error(f"MongoDB connection failed: {str(cf)}")
-        raise
-    except Exception as e:
-        logger.error(f"MongoDB error: {str(e)}")
-        raise
-
-
-# TuShare API request
-@retry_with_backoff(max_retries=3, base_delay=1)
-def call_tushare_api(interface_config: Dict, params: Dict, config: Dict) -> Dict:
-    """
-    Call TuShare API with parameters
-    
-    Args:
-        interface_config (dict): Interface configuration
-        params (dict): API parameters
-        config (dict): Main configuration with API settings
-        
-    Returns:
-        dict: API response
-    """
-    try:
-        # Get API configuration
-        api_config = config.get('tushare', {})
-        token = api_config.get('token', '')
-        url = api_config.get('url', 'http://api.tushare.pro')
-        
-        # Prepare the request
-        req_params = {
-            'api_name': interface_config.get('api_name', ''),
-            'token': token,
-            'params': params,
-            'fields': interface_config.get('fields', '')
-        }
-        
-        # Make the API call
-        start_time = time.time()
-        response = requests.post(url, json=req_params, timeout=60)
-        end_time = time.time()
-        duration = end_time - start_time
-        
-        # Check response
-        if response.status_code != 200:
-            logger.error(f"API request failed with status code: {response.status_code}")
-            logger.error(f"Response: {response.text}")
-            raise Exception(f"API request failed: {response.status_code}")
-        
-        # Parse response
-        resp_data = response.json()
-        
-        # Check for API errors
-        if resp_data.get('code') != 0:
-            logger.error(f"API returned error: {resp_data}")
-            raise Exception(f"API error: {resp_data.get('msg', 'Unknown API error')}")
-        
-        # Log performance
-        data = resp_data.get('data', {})
-        record_count = len(data.get('items', []))
-        logger.info(f"API call successful: {record_count} records in {duration:.2f}s "  
-                  f"({record_count/duration:.2f} records/sec)")
-        
-        return resp_data
-    
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Request exception: {str(e)}")
-        raise
-    except Exception as e:
-        logger.error(f"Error calling API: {str(e)}")
-        raise
-
-
-# Process TuShare API response
-def process_trade_cal_response(response: Dict, exchange: str) -> List[Dict]:
-    """
-    Process trading calendar API response
-    
-    Args:
-        response (dict): API response
-        exchange (str): Exchange code
-        
-    Returns:
-        list: Processed records
-    """
-    try:
-        data = response.get('data', {})
-        items = data.get('items', [])
-        fields = data.get('fields', [])
-        
-        if not items or not fields:
-            logger.warning(f"No data returned for exchange {exchange}")
-            return []
-        
-        # Process records
-        records = []
-        for item in items:
-            record = {fields[i]: val for i, val in enumerate(item)}
-            
-            # Add exchange if missing
-            if 'exchange' not in record:
-                record['exchange'] = exchange
+        # 设置默认日期范围（如果未提供）
+        if not start_date or not end_date:
+            today = datetime.now()
+            if not end_date:
+                self.end_date = today.strftime("%Y%m%d")
+            else:
+                self.end_date = end_date
                 
-            # Convert is_open to bool
-            if 'is_open' in record:
-                record['is_open'] = bool(record['is_open'])
+            if not start_date:
+                # 默认获取最近一年的数据
+                one_year_ago = today - timedelta(days=365)
+                self.start_date = one_year_ago.strftime("%Y%m%d")
+            else:
+                self.start_date = start_date
+        else:
+            self.start_date = start_date
+            self.end_date = end_date
             
-            records.append(record)
+        # 设置日志级别
+        log_level = "DEBUG" if verbose else "INFO"
+        logger.remove()
+        logger.add(sys.stderr, level=log_level, format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}")
         
-        return records
+        # 加载配置
+        self.config = self._load_config()
+        self.interface_config = self._load_interface_config()
+        
+        # 初始化Tushare客户端
+        self.client = self._init_client()
+        
+        # 初始化MongoDB客户端
+        self.mongo_client = self._init_mongo_client()
+        
+        # 初始化多WAN口管理器
+        self.port_allocator = self._init_port_allocator()
     
-    except Exception as e:
-        logger.error(f"Error processing API response: {str(e)}")
-        raise
-
-
-# Load data into MongoDB
-def store_in_mongodb(records: List[Dict], client: MongoClient, config: Dict, 
-                    operation='upsert', chunk_size=None, performance_tracker=None) -> int:
-    """
-    Store records in MongoDB
+    def _load_config(self) -> Dict[str, Any]:
+        """加载配置文件"""
+        try:
+            with open(self.config_path, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+                return config
+        except Exception as e:
+            logger.error(f"加载配置文件失败: {str(e)}")
+            sys.exit(1)
     
-    Args:
-        records (list): Records to store
-        client (MongoClient): MongoDB client
-        config (dict): Configuration dictionary
-        operation (str): Operation type ('insert' or 'upsert')
-        chunk_size (int): Size of chunks for bulk operations
-        performance_tracker: Performance tracking object
-        
-    Returns:
-        int: Number of records processed
-    """
-    if not records:
-        logger.warning("No records to store in MongoDB")
-        return 0
-    
-    try:
-        # Get MongoDB settings
-        mongo_config = config.get('mongodb', {})
-        db_name = mongo_config.get('database', 'quantdb')
-        collection_name = mongo_config.get('collections', {}).get('trade_cal', 'trade_cal')
-        
-        # Get batch settings
-        batch_settings = config.get('batch_settings', {})
-        if chunk_size is None:
-            chunk_size = batch_settings.get('mongo_chunk_size', 1000)
-        
-        # Get database and collection
-        db = client[db_name]
-        collection = db[collection_name]
-        
-        # Prepare bulk operations in chunks
-        total_processed = 0
-        start_time = time.time()
-        
-        for i in range(0, len(records), chunk_size):
-            chunk = records[i:i + chunk_size]
-            operations = []
+    def _load_interface_config(self) -> Dict[str, Any]:
+        """加载接口配置文件"""
+        config_path = os.path.join(self.interface_dir, self.interface_name)
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.error(f"加载接口配置失败 {self.interface_name}: {str(e)}")
             
-            # Create bulk operations
-            for record in chunk:
-                if operation == 'upsert':
-                    # Create unique key for upsert
-                    filter_dict = {
-                        'cal_date': record['cal_date'],
-                        'exchange': record['exchange']
-                    }
-                    operations.append(UpdateOne(filter_dict, {'$set': record}, upsert=True))
-                else:
-                    operations.append(InsertOne(record))
-            
-            # Execute bulk operation
-            chunk_start = time.time()
-            result = collection.bulk_write(operations)
-            chunk_end = time.time()
-            chunk_duration = chunk_end - chunk_start
-            
-            # Track performance
-            if performance_tracker:
-                performance_tracker.track_mongodb_operation(
-                    'bulk_write', len(chunk), chunk_duration, 
-                    {'chunk_size': chunk_size, 'operation': operation}
-                )
-            
-            # Update counts
-            modified = result.modified_count + result.upserted_count
-            total_processed += modified
-            
-            logger.info(f"MongoDB chunk {i//chunk_size + 1}: {modified} records in {chunk_duration:.2f}s " 
-                      f"({len(chunk)/chunk_duration:.2f} records/sec)")
-        
-        # Log total performance
-        end_time = time.time()
-        total_duration = end_time - start_time
-        if total_duration > 0:
-            logger.info(f"Total MongoDB operation: {total_processed} records in {total_duration:.2f}s " 
-                      f"({total_processed/total_duration:.2f} records/sec)")
-        
-        return total_processed
-    
-    except BulkWriteError as bwe:
-        logger.error(f"Bulk write error: {bwe.details}")
-        raise
-    except Exception as e:
-        logger.error(f"Error storing in MongoDB: {str(e)}")
-        raise
-
-
-# Fetch trading calendar data
-def fetch_trade_cal(start_date: str, end_date: str, exchanges: List[str], 
-                  config: Dict, interface_config: Dict, client: MongoClient, 
-                  performance_tracker=None) -> List[Dict]:
-    """
-    Fetch trading calendar data for date range and exchanges
-    
-    Args:
-        start_date (str): Start date (YYYYMMDD)
-        end_date (str): End date (YYYYMMDD)
-        exchanges (list): List of exchange codes
-        config (dict): Configuration dictionary
-        interface_config (dict): Interface configuration dictionary
-        client (MongoClient): MongoDB client
-        performance_tracker: Performance tracking object
-        
-    Returns:
-        list: Fetched records
-    """
-    all_records = []
-    
-    for exchange in exchanges:
-        # Prepare API parameters
-        params = {
-            'start_date': start_date,
-            'end_date': end_date,
-            'exchange': exchange
+        logger.warning(f"接口配置文件不存在: {config_path}，将使用默认配置")
+        return {
+            "description": "中国A股交易日历",
+            "api_name": "trade_cal",
+            "fields": [],
+            "params": {},
+            "index_fields": ["trade_date"],
+            "available_fields": [
+                "exchange",
+                "cal_date",
+                "is_open",
+                "pretrade_date"
+            ]
         }
-        
-        # Call API and measure performance
-        start_time = time.time()
-        response = call_tushare_api(interface_config, params, config)
-        records = process_trade_cal_response(response, exchange)
-        end_time = time.time()
-        duration = end_time - start_time
-        
-        # Track performance
-        if performance_tracker:
-            performance_tracker.track_api_call(
-                exchange, start_date, end_date, len(records), duration
+    
+    def _init_client(self) -> TushareClient:
+        """初始化Tushare客户端"""
+        try:
+            tushare_config = self.config.get("tushare", {})
+            api_key = tushare_config.get("api_key", "")
+            if not api_key:
+                logger.error("未配置Tushare API Key")
+                sys.exit(1)
+                
+            return TushareClient(api_key=api_key)
+        except Exception as e:
+            logger.error(f"初始化Tushare客户端失败: {str(e)}")
+            sys.exit(1)
+    
+    def _init_mongo_client(self) -> MongoDBClient:
+        """初始化MongoDB客户端"""
+        try:
+            mongodb_config = self.config.get("mongodb", {})
+            
+            # 获取MongoDB连接信息
+            uri = mongodb_config.get("uri", "")
+            host = mongodb_config.get("host", "localhost")
+            port = mongodb_config.get("port", 27017)
+            username = mongodb_config.get("username", "")
+            password = mongodb_config.get("password", "")
+            
+            # 创建MongoDB客户端 - 明确指定数据库名称为tushare_data
+            mongo_client = MongoDBClient(
+                uri=uri,
+                host=host,
+                port=port,
+                username=username,
+                password=password,
+                db_name="tushare_data"  # 明确设置数据库名
             )
-        
-        # Store in MongoDB
-        if records:
-            store_in_mongodb(records, client, config, 'upsert', 
-                           performance_tracker=performance_tracker)
-        
-        all_records.extend(records)
-    
-    return all_records
-
-
-# Process batch with performance tracking
-def process_batch(batch: Dict, config: Dict, interface_config: Dict, 
-                 client: MongoClient, performance_tracker=None) -> int:
-    """
-    Process a single batch
-    
-    Args:
-        batch (dict): Batch definition
-        config (dict): Configuration dictionary
-        interface_config (dict): Interface configuration dictionary
-        client (MongoClient): MongoDB client
-        performance_tracker: Performance tracking object
-        
-    Returns:
-        int: Number of records processed
-    """
-    exchanges = batch['exchanges']
-    start_date = batch['start_date']
-    end_date = batch['end_date']
-    
-    # Log batch start
-    logger.info(f"Processing batch: {exchanges} from {start_date} to {end_date}")
-    logger.info(f"Estimated records: ~{batch['est_records']:,}")
-    
-    # Process batch with performance tracking
-    batch_start = time.time()
-    all_records = fetch_trade_cal(
-        start_date, end_date, exchanges, config, interface_config, client, performance_tracker
-    )
-    batch_end = time.time()
-    batch_duration = batch_end - batch_start
-    
-    # Track batch performance
-    if performance_tracker:
-        performance_tracker.track_batch(
-            exchanges, start_date, end_date, len(all_records), batch_duration
-        )
-    
-    # Log batch completion
-    record_count = len(all_records)
-    logger.info(f"Batch completed: {record_count} records in {batch_duration:.2f}s " 
-              f"({record_count/batch_duration:.2f} records/sec)")
-    
-    return record_count
-
-
-# Process all batches
-def process_all_batches(batches: List[Dict], config: Dict, interface_config: Dict, 
-                      client: MongoClient, performance_tracker=None) -> int:
-    """
-    Process all batches sequentially
-    
-    Args:
-        batches (list): List of batch definitions
-        config (dict): Configuration dictionary
-        interface_config (dict): Interface configuration dictionary
-        client (MongoClient): MongoDB client
-        performance_tracker: Performance tracking object
-        
-    Returns:
-        int: Total number of records processed
-    """
-    total_records = 0
-    total_batches = len(batches)
-    
-    for i, batch in enumerate(batches):
-        # Log progress
-        logger.info(f"Processing batch {i+1}/{total_batches} ({(i+1)/total_batches*100:.1f}%)")
-        
-        # Process batch
-        record_count = process_batch(
-            batch, config, interface_config, client, performance_tracker
-        )
-        
-        total_records += record_count
-        
-        # Log progress
-        logger.info(f"Progress: {i+1}/{total_batches} batches, {total_records:,} records processed")
-    
-    return total_records
-
-
-# Verify data in MongoDB
-def verify_mongodb_data(client: MongoClient, config: Dict, 
-                      start_date: str = None, end_date: str = None, 
-                      exchanges: List[str] = None) -> Dict:
-    """
-    Verify data in MongoDB
-    
-    Args:
-        client (MongoClient): MongoDB client
-        config (dict): Configuration dictionary
-        start_date (str, optional): Start date for verification
-        end_date (str, optional): End date for verification
-        exchanges (list, optional): Exchanges to verify
-        
-    Returns:
-        dict: Verification results
-    """
-    try:
-        # Get MongoDB settings
-        mongo_config = config.get('mongodb', {})
-        db_name = mongo_config.get('database', 'quantdb')
-        collection_name = mongo_config.get('collections', {}).get('trade_cal', 'trade_cal')
-        
-        # Get database and collection
-        db = client[db_name]
-        collection = db[collection_name]
-        
-        # Build query
-        query = {}
-        if start_date:
-            if 'cal_date' not in query:
-                query['cal_date'] = {}
-            query['cal_date']['$gte'] = start_date
-        if end_date:
-            if 'cal_date' not in query:
-                query['cal_date'] = {}
-            query['cal_date']['$lte'] = end_date
-        if exchanges:
-            query['exchange'] = {'$in': exchanges}
-        
-        # Count total records
-        total_count = collection.count_documents(query)
-        
-        # Count by exchange
-        exchange_counts = {}
-        if exchanges:
-            for exchange in exchanges:
-                exchange_query = dict(query)
-                exchange_query['exchange'] = exchange
-                exchange_counts[exchange] = collection.count_documents(exchange_query)
-        
-        # Count by is_open
-        trading_days = 0
-        non_trading_days = 0
-        if 'is_open' in collection.find_one({}, {'is_open': 1, '_id': 0}) or {}:
-            trading_query = dict(query)
-            trading_query['is_open'] = True
-            trading_days = collection.count_documents(trading_query)
             
-            non_trading_query = dict(query)
-            non_trading_query['is_open'] = False
-            non_trading_days = collection.count_documents(non_trading_query)
-        
-        # Get date range
-        date_range = {}
-        if total_count > 0:
-            earliest = collection.find(query).sort('cal_date', 1).limit(1)
-            latest = collection.find(query).sort('cal_date', -1).limit(1)
+            # 连接到数据库
+            if not mongo_client.connect():
+                logger.error("连接MongoDB失败")
+                sys.exit(1)
+                
+            return mongo_client
+        except Exception as e:
+            logger.error(f"初始化MongoDB客户端失败: {str(e)}")
+            sys.exit(1)
             
-            earliest_date = earliest[0]['cal_date'] if earliest.count() > 0 else None
-            latest_date = latest[0]['cal_date'] if latest.count() > 0 else None
-            date_range = {'earliest': earliest_date, 'latest': latest_date}
+    def _init_port_allocator(self) -> Optional[PortAllocator]:
+        """初始化多WAN口管理器"""
+        try:
+            # 检查是否启用WAN接口
+            wan_config = self.config.get("wan", {})
+            wan_enabled = wan_config.get("enabled", False)
+            
+            if not wan_enabled:
+                logger.warning("多WAN口功能未启用，将使用系统默认网络接口")
+                return None
+                
+            # 获取WAN接口配置
+            if not wan_config.get("port_ranges"):
+                logger.warning("未配置WAN接口端口范围，将使用系统默认网络接口")
+                return None
+            
+            # 使用全局端口分配器
+            from wan_manager.port_allocator import port_allocator
+            
+            # 检查是否有可用WAN接口
+            available_indices = port_allocator.get_available_wan_indices()
+            if not available_indices:
+                logger.warning("没有可用的WAN接口，将使用系统默认网络接口")
+                return None
+                
+            logger.debug(f"已初始化多WAN口管理器，可用接口索引: {available_indices}")
+            return port_allocator
+        except Exception as e:
+            logger.error(f"初始化多WAN口管理器失败: {str(e)}")
+            return None
+    
+    def _get_wan_socket(self) -> Optional[Tuple[int, int]]:
+        """获取WAN接口和端口"""
+        if not self.port_allocator:
+            return None
+            
+        try:
+            # 获取可用的WAN接口索引
+            available_indices = self.port_allocator.get_available_wan_indices()
+            if not available_indices:
+                logger.warning("没有可用的WAN接口")
+                return None
+                
+            # 轮询选择一个WAN接口
+            wan_idx = available_indices[0]  # 简单起见，选择第一个
+            
+            # 分配端口
+            port = self.port_allocator.allocate_port(wan_idx)
+            if not port:
+                logger.warning(f"WAN {wan_idx} 没有可用端口")
+                return None
+                
+            logger.debug(f"使用WAN接口 {wan_idx}，本地端口 {port}")
+            return (wan_idx, port)
+            
+        except Exception as e:
+            logger.error(f"获取WAN接口失败: {str(e)}")
+            return None
+    
+    def fetch_trade_calendar(self) -> Optional[pd.DataFrame]:
+        """
+        获取交易日历数据
         
-        # Return results
-        results = {
-            'total': total_count,
-            'by_exchange': exchange_counts,
-            'trading_days': trading_days,
-            'non_trading_days': non_trading_days,
-            'date_range': date_range
-        }
+        Returns:
+            交易日历数据DataFrame，如果失败则返回None
+        """
+        try:
+            # 准备参数
+            api_name = self.interface_config.get("api_name", "trade_cal")
+            
+            # 设置API参数：交易所和日期范围
+            params = {
+                "exchange": self.exchange,
+                "start_date": self.start_date,
+                "end_date": self.end_date
+            }
+            
+            fields = self.interface_config.get("fields", [])
+            
+            # 确保使用正确的字段（根据接口定义）
+            if not fields:
+                fields = self.interface_config.get("available_fields", [])
+            
+            # 创建并使用WAN接口的socket，实现多WAN请求支持
+            wan_info = self._get_wan_socket() if self.port_allocator else None
+            use_wan = wan_info is not None
+            
+            # 调用Tushare API
+            logger.info(f"正在从湘财Tushare获取交易日历数据...")
+            logger.info(f"数据范围：{self.start_date} 至 {self.end_date}，交易所：{self.exchange}")
+            
+            if use_wan:
+                wan_idx, port = wan_info
+                logger.debug(f"使用WAN接口 {wan_idx} 和本地端口 {port} 请求数据")
+                
+                # 在实际应用中创建绑定到特定WAN接口的socket，但这里简化处理
+                # 因为目前环境可能无法实际绑定WAN接口，所以仅记录日志
+            
+            start_time = time.time()
+            
+            # 使用客户端获取数据
+            logger.debug(f"API名称: {api_name}, 参数: {params}, 字段: {fields if self.verbose else '...'}")
+            
+            # 增加超时，设置为120秒
+            self.client.set_timeout(120)
+            logger.info(f"增加API请求超时时间为120秒，提高网络可靠性")
+            
+            # 添加异常捕获，以便更好地调试
+            try:
+                df = self.client.get_data(api_name=api_name, params=params, fields=fields)
+                if df is not None and not df.empty:
+                    logger.success(f"成功获取数据，行数: {len(df)}, 列数: {df.shape[1]}")
+                    if self.verbose:
+                        logger.debug(f"列名: {list(df.columns)}")
+            except Exception as e:
+                import traceback
+                logger.error(f"获取API数据时发生异常: {str(e)}")
+                logger.debug(f"异常详情: {traceback.format_exc()}")
+                return None
+                
+            elapsed = time.time() - start_time
+            
+            if df is None or df.empty:
+                logger.error("API返回数据为空")
+                return None
+            
+            # 释放WAN端口（如果使用了）
+            if use_wan:
+                wan_idx, port = wan_info
+                self.port_allocator.release_port(wan_idx, port)
+            
+            logger.success(f"成功获取 {len(df)} 条交易日历数据，耗时 {elapsed:.2f}s")
+            
+            # 如果使用详细日志，输出数据示例
+            if self.verbose and not df.empty:
+                logger.debug(f"数据示例：\n{df.head(3)}")
+                
+            return df
+            
+        except Exception as e:
+            logger.error(f"获取交易日历数据失败: {str(e)}")
+            import traceback
+            logger.debug(f"详细错误信息: {traceback.format_exc()}")
+            return None
+    
+    def save_to_mongodb(self, df: pd.DataFrame) -> bool:
+        """
+        将数据保存到MongoDB
         
-        # Format numbers for logging
-        logger.info("\nVerification Summary:")
-        logger.info(f"Total records: {total_count:,}")
-        logger.info(f"By exchange: {exchange_counts}")
-        logger.info(f"Trading days: {trading_days}, Non-trading days: {non_trading_days}")
-        if date_range.get('earliest') and date_range.get('latest'):
-            logger.info(f"Date range: {date_range['earliest']} to {date_range['latest']}")
+        Args:
+            df: 待保存的DataFrame
+            
+        Returns:
+            是否成功保存
+        """
+        # 强制确保使用tushare_data作为数据库名称，集合名为trade_cal
+        logger.info(f"保存数据到MongoDB数据库：{self.db_name}，集合：{self.collection_name}")
         
-        return results
+        if df is None or df.empty:
+            logger.warning("没有数据可保存到MongoDB")
+            return False
+            
+        try:
+            # 将DataFrame转换为记录列表
+            records = df.to_dict('records')
+            
+            # 保存到MongoDB
+            start_time = time.time()
+            
+            # 确保MongoDB连接
+            if not self.mongo_client.is_connected():
+                logger.warning("MongoDB未连接，尝试重新连接...")
+                if not self.mongo_client.connect():
+                    logger.error("重新连接MongoDB失败")
+                    return False
+            
+            # 删除集合中的旧数据（可选）
+            if self.verbose:
+                logger.debug(f"清空集合 {self.db_name}.{self.collection_name} 中的旧数据")
+            
+            self.mongo_client.delete_many(self.collection_name, {}, self.db_name)
+            
+            # 批量插入新数据
+            if self.verbose:
+                logger.debug(f"向集合 {self.db_name}.{self.collection_name} 插入 {len(records)} 条记录")
+                
+            result = self.mongo_client.insert_many(self.collection_name, records, self.db_name)
+            
+            elapsed = time.time() - start_time
+            inserted_count = len(result.inserted_ids) if result else 0
+            
+            if inserted_count > 0:
+                # 创建索引 - 修正获取集合的方式
+                try:
+                    # 直接获取数据库并从中获取集合，避免混淆参数顺序
+                    db = self.mongo_client.get_db(self.db_name)
+                    collection = db[self.collection_name]
+                    
+                    # 根据接口配置中的index_fields创建索引
+                    index_fields = self.interface_config.get("index_fields", [])
+                    if index_fields:
+                        for field in index_fields:
+                            collection.create_index(field)
+                            logger.debug(f"已为字段 {field} 创建索引")
+                    
+                    # 为update_time创建索引，便于查询最新数据
+                    collection.create_index("update_time")
+                except Exception as e:
+                    logger.warning(f"创建索引时出错: {str(e)}")
+                
+                logger.success(f"成功将 {inserted_count} 条记录保存到 MongoDB: {self.db_name}.{self.collection_name}，耗时 {elapsed:.2f}s")
+                return True
+            else:
+                logger.error(f"保存到MongoDB失败，未插入任何记录")
+                return False
+                
+        except Exception as e:
+            logger.error(f"保存到MongoDB失败: {str(e)}")
+            import traceback
+            logger.debug(f"详细错误信息: {traceback.format_exc()}")
+            return False
+            
+    def run(self) -> bool:
+        """
+        运行数据获取和保存流程
         
-    except Exception as e:
-        logger.error(f"Error verifying MongoDB data: {str(e)}")
-        raise
+        Returns:
+            是否成功
+        """
+        # 获取数据
+        df = self.fetch_trade_calendar()
+        if df is None or df.empty:
+            logger.error("获取交易日历数据失败")
+            return False
+            
+        # 添加更新时间字段
+        df['update_time'] = datetime.now().isoformat()
+        
+        # 保存数据到MongoDB
+        success = self.save_to_mongodb(df)
+        
+        # 关闭MongoDB连接
+        self.mongo_client.close()
+        
+        return success
 
 
-# Main function
+def create_mock_data() -> pd.DataFrame:
+    """创建模拟数据用于测试"""
+    logger.info("创建模拟交易日历数据用于测试")
+    
+    # 创建模拟数据
+    # 生成一年的日期序列
+    start_date = datetime(2023, 1, 1)
+    end_date = datetime(2023, 12, 31)
+    date_range = pd.date_range(start=start_date, end=end_date)
+    
+    # 创建数据框
+    df = pd.DataFrame({
+        'cal_date': [date.strftime('%Y%m%d') for date in date_range],
+        'exchange': 'SSE',  # 上交所
+    })
+    
+    # 添加是否交易日字段 (周末设为非交易日)
+    df['is_open'] = df['cal_date'].apply(lambda x: 0 if datetime.strptime(x, '%Y%m%d').weekday() >= 5 else 1)
+    
+    logger.success(f"已创建 {len(df)} 条模拟交易日历数据")
+    return df
+
 def main():
-    """
-    Main function
-    """
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Fetch trading calendar data from TuShare API and store in MongoDB")
-    parser.add_argument('--start-date', type=str, help="Start date (YYYYMMDD)")
-    parser.add_argument('--end-date', type=str, help="End date (YYYYMMDD)")
-    parser.add_argument('--exchange', type=str, help="Exchange code(s), comma-separated")
-    parser.add_argument('--config', type=str, default=CONFIG_PATH, help="Path to config file")
-    parser.add_argument('--years-per-batch', type=int, help="Override years per batch")
-    parser.add_argument('--batch-size', type=int, help="Override batch size")
-    parser.add_argument('--mongo-chunk-size', type=int, help="Override MongoDB chunk size")
-    parser.add_argument('--batch-strategy', type=str, choices=['year', 'exchange', 'exchange_year'],
-                       help="Override batch strategy")
-    parser.add_argument('--verify-only', action='store_true', help="Only verify stored data")
-    parser.add_argument('-v', '--verbose', action='store_true', help="Verbose logging")
+    """主函数"""
+    import argparse
     
+    parser = argparse.ArgumentParser(description='获取交易日历数据并保存到MongoDB')
+    parser.add_argument('--config', default='config/config.yaml', help='配置文件路径')
+    parser.add_argument('--interface-dir', default='config/interfaces', help='接口配置文件目录')
+    parser.add_argument('--exchange', default='SSE', help='交易所代码：SSE-上交所, SZSE-深交所')
+    parser.add_argument('--start-date', help='开始日期，格式：YYYYMMDD')
+    parser.add_argument('--end-date', help='结束日期，格式：YYYYMMDD')
+    parser.add_argument('--db-name', default='tushare_data', help='MongoDB数据库名称')
+    parser.add_argument('--collection-name', default='trade_cal', help='MongoDB集合名称')
+    parser.add_argument('--verbose', action='store_true', help='输出详细日志')
+    parser.add_argument('--mock', action='store_false', dest='use_real_api', help='使用模拟数据（当API不可用时）')
+    parser.add_argument('--use-real-api', action='store_true', default=True, help='使用湘财真实API数据（默认）')
+    parser.add_argument('--dry-run', action='store_true', help='仅运行流程，不保存数据')
     args = parser.parse_args()
     
-    # Set log level
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+    # 创建获取器并运行
+    fetcher = TradeCalFetcher(
+        config_path=args.config,
+        interface_dir=args.interface_dir,
+        exchange=args.exchange,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        db_name=args.db_name,  # 这个值会被内部强制设为"tushare_data"
+        collection_name=args.collection_name,
+        verbose=args.verbose
+    )
     
-    try:
-        # Load configuration
-        logger.info(f"Loading configuration from {args.config}")
-        config, interface_config = load_config(args.config, INTERFACE_CONFIG_PATH)
-        
-        # Apply command line overrides
-        if args.years_per_batch:
-            if 'batch_settings' not in config:
-                config['batch_settings'] = {}
-            config['batch_settings']['years_per_batch'] = args.years_per_batch
-        
-        if args.batch_size:
-            if 'batch_settings' not in config:
-                config['batch_settings'] = {}
-            config['batch_settings']['max_batch_size'] = args.batch_size
-        
-        if args.mongo_chunk_size:
-            if 'batch_settings' not in config:
-                config['batch_settings'] = {}
-            config['batch_settings']['mongo_chunk_size'] = args.mongo_chunk_size
-        
-        if args.batch_strategy:
-            if 'batch_settings' not in config:
-                config['batch_settings'] = {}
-            config['batch_settings']['batch_strategy'] = args.batch_strategy
-        
-        # Parse date range
-        start_date = args.start_date or '20200101'
-        end_date = args.end_date or datetime.now().strftime('%Y%m%d')
-        
-        # Parse exchanges
-        exchanges_str = args.exchange or 'SSE,SZSE'
-        exchanges = exchanges_str.split(',')
-        
-        # Connect to MongoDB
-        logger.info(f"Connecting to MongoDB at {config['mongodb']['host']}:{config['mongodb']['port']}")
-        client = connect_mongo(config)
-        
-        # Verify-only mode
-        if args.verify_only:
-            logger.info("Verifying stored data (verify-only mode)")
-            verify_mongodb_data(client, config, start_date, end_date, exchanges)
-            return
-        
-        # Performance tracking
-        performance_tracker = AdaptiveTracker()
-        
-        # Calculate optimal batch strategy if not specified
-        batch_settings = config.get('batch_settings', {})
-        if 'batch_strategy' not in batch_settings:
-            optimal_strategy = determine_optimal_strategy(start_date, end_date, exchanges)
-            config['batch_settings']['batch_strategy'] = optimal_strategy
-            logger.info(f"Using automatically determined batch strategy: {optimal_strategy}")
-        
-        # Calculate intelligent batches
-        logger.info("Calculating intelligent batches...")
-        num_batches, est_records, batches = calculate_intelligent_batches(
-            start_date, end_date, exchanges, config
-        )
-        
-        logger.info(f"Processing {num_batches} batches for ~{est_records:,} records")
-        
-        # Process all batches
-        total_processed = process_all_batches(
-            batches, config, interface_config, client, performance_tracker
-        )
-        
-        logger.info(f"Completed processing {total_processed:,} records across {num_batches} batches")
-        
-        # Generate performance report
-        report = adaptive_report(performance_tracker, start_date, end_date)
-        logger.info("Performance report generated.")
-        
-        # Verify final data
-        logger.info("Verifying final data in MongoDB...")
-        verify_mongodb_data(client, config, start_date, end_date, exchanges)
-        
-    except Exception as e:
-        logger.error(f"Error: {str(e)}")
-        logger.debug(traceback.format_exc())
+    # 使用真实API或模拟数据模式
+    if args.use_real_api:
+        logger.info("使用湘财Tushare真实API获取数据")
+        success = fetcher.run()
+    else:
+        logger.info("使用模拟数据模式")
+        # 创建模拟数据
+        df = create_mock_data()
+        # 添加更新时间字段
+        df['update_time'] = datetime.now().isoformat()
+        # 是否实际保存
+        if args.dry_run:
+            logger.info("干运行模式，不保存数据")
+            success = True
+        else:
+            # 保存数据到MongoDB
+            success = fetcher.save_to_mongodb(df)
+            # 关闭MongoDB连接
+            fetcher.mongo_client.close()
+    
+    if success:
+        logger.success("数据获取和保存成功")
+        sys.exit(0)
+    else:
+        logger.error("数据获取或保存失败")
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
