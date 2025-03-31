@@ -2,43 +2,43 @@
   {
     "wan_idx": 0,
     "success": true,
-    "elapsed": 0.04204988479614258,
+    "elapsed": 0.03998684883117676,
     "status_code": 200,
     "server_response": {
       "message": "请求已记录",
-      "request_count": 167,
+      "request_count": 123,
       "success": true,
-      "timestamp": "2025-03-31 08:55:06",
-      "your_ip": "220.196.192.79"
+      "timestamp": "2025-03-31 06:23:54",
+      "your_ip": "220.196.192.7"
     },
-    "timestamp": 1743382506.303867
+    "timestamp": 1743373434.0877812
   },
   {
     "wan_idx": 1,
     "success": true,
-    "elapsed": 0.04204893112182617,
+    "elapsed": 0.03753232955932617,
     "status_code": 200,
     "server_response": {
       "message": "请求已记录",
-      "request_count": 168,
+      "request_count": 124,
       "success": true,
-      "timestamp": "2025-03-31 08:55:07",
-      "your_ip": "220.196.193.225"
+      "timestamp": "2025-03-31 06:23:55",
+      "your_ip": "220.196.192.7"
     },
-    "timestamp": 1743382507.3493366
+    "timestamp": 1743373435.1303148
   },
   {
     "wan_idx": 2,
     "success": true,
-    "elapsed": 0.057068824768066406,
+    "elapsed": 0.04188990592956543,
     "status_code": 200,
     "server_response": {
       "message": "请求已记录",
-      "request_count": 169,
+      "request_count": 125,
       "success": true,
-      "timestamp": "2025-03-31 08:55:08",
-      "your_ip": "220.196.193.150"
+      "timestamp": "2025-03-31 06:23:56",
+      "your_ip": "220.196.192.7"
     },
-    "timestamp": 1743382508.4101365
+    "timestamp": 1743373436.1769316
   }
 ]

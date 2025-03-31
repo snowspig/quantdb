@@ -54,7 +54,7 @@ tushare:
 
 ## Usage
 
-Basic usage:
+Basic usage (using Xiangcai Tushare real API data):
 
 ```bash
 python stock_basic_fetcher.py
@@ -67,7 +67,13 @@ python stock_basic_fetcher.py \
   --verbose \
   --db-name tushare_data \
   --collection-name stock_basic \
-  --market-codes SS,SZ
+  --market-codes 00,30,60,68
+```
+
+Using mock data (when API is unavailable):
+
+```bash
+python stock_basic_fetcher.py --mock
 ```
 
 ### Command Line Arguments
@@ -75,18 +81,27 @@ python stock_basic_fetcher.py \
 - `--verbose`: Enable detailed logging
 - `--db-name`: Specify MongoDB database name (default: tushare_data)
 - `--collection-name`: Specify MongoDB collection name (default: stock_basic)
-- `--market-codes`: Filter stocks by market codes (comma-separated, e.g., SS,SZ)
+- `--market-codes`: Filter stocks by market codes (comma-separated, e.g., 00,30,60,68)
 - `--config`: Path to config file (default: config/config.yaml)
 - `--interface-dir`: Path to interface definitions (default: config/interfaces)
+- `--use-real-api`: Use real data from Xiangcai Tushare API (default behavior)
+- `--mock`: Use mock data (useful when API is unavailable)
+- `--dry-run`: Execute the process without saving data to MongoDB
 
 ## Example
 
 ```bash
-# Fetch all stocks from Shanghai and Shenzhen exchanges with verbose logging
-python stock_basic_fetcher.py --verbose --market-codes SS,SZ
+# Fetch all stocks with verbose logging using real API data (default)
+python stock_basic_fetcher.py --verbose
+
+# Use mock data when API is unavailable
+python stock_basic_fetcher.py --mock
 
 # Store in a specific database and collection
-python stock_basic_fetcher.py --db-name finance_data --collection-name stocks --market-codes SS
+python stock_basic_fetcher.py --db-name finance_data --collection-name stocks --market-codes 00,60
+
+# Dry run without saving to database (for testing)
+python stock_basic_fetcher.py --use-real-api --dry-run
 ```
 
 ## Data Structure

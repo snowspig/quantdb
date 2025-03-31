@@ -75,15 +75,15 @@ class TushareClient:
     Tushare API客户端类,处理与Tushare API的通信
     """
     
-    def __init__(self, api_key: str = None, api_url: str = None):
+    def __init__(self, token: str = None, api_url: str = None):
         """
         初始化Tushare客户端
         
         Args:
-            api_key: Tushare API密钥,如果为None则从配置中获取
+            token: Tushare API密钥,如果为None则从配置中获取
             api_url: Tushare API URL,如果为None则从配置中获取
         """
-        self.api_key = api_key or config_manager.get_tushare_api_key()
+        self.token = token or config_manager.get_tushare_token()
         self.api_url = api_url or config_manager.get_tushare_api_url()
         self.timeout = config_manager.get('tushare', 'timeout', 60)
         self.max_retries = config_manager.get('tushare', 'max_retries', 3)
@@ -207,7 +207,7 @@ class TushareClient:
         # 准备请求数据
         request_data = {
             "api_name": api_name,
-            "token": self.api_key,
+            "token": self.token,
             "params": params
         }
         

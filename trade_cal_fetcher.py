@@ -1,15 +1,17 @@
 #!/usr/bin/env python
 """
-Stock Basic Fetcher - 获取股票基本信息并保存到MongoDB
+Trade Calendar Fetcher - 获取交易日历数据并保存到MongoDB
 
-该脚本用于从湘财Tushare获取股票基本信息，并保存到MongoDB数据库中，仅保留00、30、60、68板块的股票
+该脚本用于从湘财Tushare获取交易日历数据，并保存到MongoDB数据库中的trade_cal集合
+默认模式下抓取最近一年的交易日历数据
 
-参考接口文档：http://tushare.xcsc.com:7173/document/2?doc_id=25
+参考接口文档：http://tushare.xcsc.com:7173/document/2?doc_id=26
 
 使用方法：
-    python stock_basic_fetcher.py              # 使用湘财真实API数据，简洁日志模式
-    python stock_basic_fetcher.py --verbose     # 使用湘财真实API数据，详细日志模式
-    python stock_basic_fetcher.py --mock        # 使用模拟数据模式（API不可用时）
+    python trade_cal_fetcher.py                   # 使用湘财真实API数据，简洁日志模式，获取近期数据
+    python trade_cal_fetcher.py --verbose         # 使用湘财真实API数据，详细日志模式
+    python trade_cal_fetcher.py --mock            # 使用模拟数据模式（API不可用时）
+    python trade_cal_fetcher.py --start-date 20200101 --end-date 20231231  # 指定日期范围
 """
 import os
 import sys
@@ -18,7 +20,7 @@ import yaml
 import time
 import asyncio
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Set, Optional, Any, Tuple, Union
 from pathlib import Path
 from loguru import logger
@@ -32,48 +34,71 @@ from data_fetcher.tushare_client import TushareClient
 from storage.mongodb_client import MongoDBClient
 from wan_manager.port_allocator import PortAllocator
 
-class StockBasicFetcher:
+class TradeCalFetcher:
     """
-    股票基本信息获取器
-
-    该类用于从Tushare获取股票基本信息并保存到MongoDB数据库，支持按市场代码过滤
+    交易日历数据获取器
+    
+    该类用于从Tushare获取交易日历数据并保存到MongoDB数据库
+    默认模式下使用多WAN口模块抓取数据，并获取近期交易日历数据
     """
-
+    
     def __init__(
         self,
         config_path: str = "config/config.yaml",
         interface_dir: str = "config/interfaces",
-        interface_name: str = "stock_basic.json",
-        target_market_codes: Set[str] = {"00", "30", "60", "68"},
+        interface_name: str = "trade_cal.json",
         db_name: str = "tushare_data",
-        collection_name: str = "stock_basic",
+        collection_name: str = "trade_cal",
+        start_date: str = None,
+        end_date: str = None,
+        exchange: str = "SSE",  # 默认上交所
         verbose: bool = False
     ):
         """
-        初始化股票基本信息获取器
+        初始化交易日历数据获取器
         
         Args:
             config_path: 配置文件路径
             interface_dir: 接口配置文件目录
             interface_name: 接口名称
-            target_market_codes: 目标市场代码集合
             db_name: MongoDB数据库名称
             collection_name: MongoDB集合名称
+            start_date: 开始日期（格式：YYYYMMDD，默认为当前日期前一年）
+            end_date: 结束日期（格式：YYYYMMDD，默认为当前日期）
+            exchange: 交易所代码（SSE：上交所，SZSE：深交所，默认SSE）
             verbose: 是否输出详细日志
         """
         self.config_path = config_path
         self.interface_dir = interface_dir
         self.interface_name = interface_name
-        self.target_market_codes = target_market_codes
         self.db_name = "tushare_data"  # 强制使用tushare_data作为数据库名
         self.collection_name = collection_name
+        self.exchange = exchange
         self.verbose = verbose
-
+        
+        # 设置默认日期范围（如果未提供）
+        if not start_date or not end_date:
+            today = datetime.now()
+            if not end_date:
+                self.end_date = today.strftime("%Y%m%d")
+            else:
+                self.end_date = end_date
+                
+            if not start_date:
+                # 默认获取最近一年的数据
+                one_year_ago = today - timedelta(days=365)
+                self.start_date = one_year_ago.strftime("%Y%m%d")
+            else:
+                self.start_date = start_date
+        else:
+            self.start_date = start_date
+            self.end_date = end_date
+            
         # 设置日志级别
         log_level = "DEBUG" if verbose else "INFO"
         logger.remove()
         logger.add(sys.stderr, level=log_level, format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}")
-
+        
         # 加载配置
         self.config = self._load_config()
         self.interface_config = self._load_interface_config()
@@ -86,8 +111,7 @@ class StockBasicFetcher:
         
         # 初始化多WAN口管理器
         self.port_allocator = self._init_port_allocator()
-
-
+    
     def _load_config(self) -> Dict[str, Any]:
         """加载配置文件"""
         try:
@@ -97,7 +121,7 @@ class StockBasicFetcher:
         except Exception as e:
             logger.error(f"加载配置文件失败: {str(e)}")
             sys.exit(1)
-
+    
     def _load_interface_config(self) -> Dict[str, Any]:
         """加载接口配置文件"""
         config_path = os.path.join(self.interface_dir, self.interface_name)
@@ -106,35 +130,37 @@ class StockBasicFetcher:
                 with open(config_path, 'r', encoding='utf-8') as f:
                     return json.load(f)
         except Exception as e:
-                logger.error(f"加载接口配置失败 {self.interface_name}: {str(e)}")
-        
+            logger.error(f"加载接口配置失败 {self.interface_name}: {str(e)}")
+            
         logger.warning(f"接口配置文件不存在: {config_path}，将使用默认配置")
         return {
-            "description": "股票基本信息",
-            "api_name": "stock_basic",
+            "description": "中国A股交易日历",
+            "api_name": "trade_cal",
             "fields": [],
             "params": {},
+            "index_fields": ["trade_date"],
             "available_fields": [
-                "ts_code", "symbol", "name", "area", "industry", "fullname", 
-                "enname", "cnspell", "market", "exchange", "curr_type", 
-                "list_status", "list_date", "delist_date", "is_hs"
+                "exchange",
+                "cal_date",
+                "is_open",
+                "pretrade_date"
             ]
         }
-
+    
     def _init_client(self) -> TushareClient:
         """初始化Tushare客户端"""
         try:
             tushare_config = self.config.get("tushare", {})
             token = tushare_config.get("token", "")
             if not token:
-                logger.error("未配置Tushare API Key")
+                logger.error("未配置Tushare API Token")
                 sys.exit(1)
                 
             return TushareClient(token=token)
         except Exception as e:
             logger.error(f"初始化Tushare客户端失败: {str(e)}")
             sys.exit(1)
-
+    
     def _init_mongo_client(self) -> MongoDBClient:
         """初始化MongoDB客户端"""
         try:
@@ -197,7 +223,7 @@ class StockBasicFetcher:
         except Exception as e:
             logger.error(f"初始化多WAN口管理器失败: {str(e)}")
             return None
-
+    
     def _get_wan_socket(self) -> Optional[Tuple[int, int]]:
         """获取WAN接口和端口"""
         if not self.port_allocator:
@@ -225,18 +251,25 @@ class StockBasicFetcher:
         except Exception as e:
             logger.error(f"获取WAN接口失败: {str(e)}")
             return None
-
-    def fetch_stock_basic(self) -> Optional[pd.DataFrame]:
+    
+    def fetch_trade_calendar(self) -> Optional[pd.DataFrame]:
         """
-        获取股票基本信息
+        获取交易日历数据
         
         Returns:
-            股票基本信息DataFrame，如果失败则返回None
+            交易日历数据DataFrame，如果失败则返回None
         """
         try:
             # 准备参数
-            api_name = self.interface_config.get("api_name", "stock_basic")
-            params = self.interface_config.get("params", {})
+            api_name = self.interface_config.get("api_name", "trade_cal")
+            
+            # 设置API参数：交易所和日期范围
+            params = {
+                "exchange": self.exchange,
+                "start_date": self.start_date,
+                "end_date": self.end_date
+            }
+            
             fields = self.interface_config.get("fields", [])
             
             # 确保使用正确的字段（根据接口定义）
@@ -248,7 +281,9 @@ class StockBasicFetcher:
             use_wan = wan_info is not None
             
             # 调用Tushare API
-            logger.info(f"正在从湘财Tushare获取股票基本信息...")
+            logger.info(f"正在从湘财Tushare获取交易日历数据...")
+            logger.info(f"数据范围：{self.start_date} 至 {self.end_date}，交易所：{self.exchange}")
+            
             if use_wan:
                 wan_idx, port = wan_info
                 logger.debug(f"使用WAN接口 {wan_idx} 和本地端口 {port} 请求数据")
@@ -277,6 +312,7 @@ class StockBasicFetcher:
                 logger.error(f"获取API数据时发生异常: {str(e)}")
                 logger.debug(f"异常详情: {traceback.format_exc()}")
                 return None
+                
             elapsed = time.time() - start_time
             
             if df is None or df.empty:
@@ -288,7 +324,7 @@ class StockBasicFetcher:
                 wan_idx, port = wan_info
                 self.port_allocator.release_port(wan_idx, port)
             
-            logger.success(f"成功获取 {len(df)} 条股票基本信息，耗时 {elapsed:.2f}s")
+            logger.success(f"成功获取 {len(df)} 条交易日历数据，耗时 {elapsed:.2f}s")
             
             # 如果使用详细日志，输出数据示例
             if self.verbose and not df.empty:
@@ -297,70 +333,10 @@ class StockBasicFetcher:
             return df
             
         except Exception as e:
-            logger.error(f"获取股票基本信息失败: {str(e)}")
+            logger.error(f"获取交易日历数据失败: {str(e)}")
             import traceback
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return None
-
-    def filter_stock_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        过滤股票数据，只保留00、30、60和68板块的股票
-        
-        Args:
-            df: 股票基本信息数据
-        
-        Returns:
-            过滤后的数据
-        """
-        if df is None or df.empty:
-            logger.warning("没有股票数据可过滤")
-            return pd.DataFrame()
-        
-        logger.info(f"过滤前股票数量: {len(df)}")
-        
-        # 确保symbol列存在
-        if 'symbol' not in df.columns:
-            logger.error("数据中没有symbol列，无法按市场代码过滤")
-            
-            # 尝试使用ts_code列提取symbol
-            if 'ts_code' in df.columns:
-                logger.info("尝试从ts_code列提取symbol信息")
-                # ts_code格式通常是'000001.SZ'，我们提取前6位
-                df['symbol'] = df['ts_code'].str.split('.').str[0]
-            else:
-                logger.error("数据中既没有symbol也没有ts_code列，无法过滤")
-                return df
-            
-        # 确保symbol列是字符串类型
-        df['symbol'] = df['symbol'].astype(str)
-        
-        # 提取前两位作为市场代码并过滤，并创建显式副本避免SettingWithCopyWarning
-        df_filtered = df[df['symbol'].str[:2].isin(self.target_market_codes)].copy()
-        
-        # 输出过滤统计信息
-        logger.info(f"过滤后股票数量: {len(df_filtered)}")
-        
-        # 详细统计信息
-        if self.verbose:
-            # 统计各市场代码股票数量
-            market_codes = df['symbol'].str[:2].value_counts().to_dict()
-            logger.debug("原始数据市场代码分布:")
-            for code, count in sorted(market_codes.items()):
-                in_target = "✓" if code in self.target_market_codes else "✗"
-                logger.debug(f"  {code}: {count} 股票 {in_target}")
-            
-            # 统计保留的市场代码
-            filtered_codes = df_filtered['symbol'].str[:2].value_counts().to_dict()
-            logger.debug("保留的市场代码分布:")
-            for code, count in sorted(filtered_codes.items()):
-                logger.debug(f"  {code}: {count} 股票")
-            
-            # 检查是否有目标市场代码未出现在数据中
-            missing_codes = self.target_market_codes - set(market_codes.keys())
-            if missing_codes:
-                logger.warning(f"数据中缺少以下目标市场代码: {missing_codes}")
-        
-        return df_filtered
     
     def save_to_mongodb(self, df: pd.DataFrame) -> bool:
         """
@@ -372,7 +348,7 @@ class StockBasicFetcher:
         Returns:
             是否成功保存
         """
-        # 强制确保使用tushare_data作为数据库名称
+        # 强制确保使用tushare_data作为数据库名称，集合名为trade_cal
         logger.info(f"保存数据到MongoDB数据库：{self.db_name}，集合：{self.collection_name}")
         
         if df is None or df.empty:
@@ -407,7 +383,6 @@ class StockBasicFetcher:
             
             elapsed = time.time() - start_time
             inserted_count = len(result.inserted_ids) if result else 0
-
             
             if inserted_count > 0:
                 # 创建索引 - 修正获取集合的方式
@@ -422,12 +397,7 @@ class StockBasicFetcher:
                         for field in index_fields:
                             collection.create_index(field)
                             logger.debug(f"已为字段 {field} 创建索引")
-                    else:
-                        # 默认为ts_code和symbol创建索引
-                        collection.create_index("ts_code")
-                        collection.create_index("symbol")
-                        logger.debug("已为默认字段创建索引")
-                        
+                    
                     # 为update_time创建索引，便于查询最新数据
                     collection.create_index("update_time")
                 except Exception as e:
@@ -453,22 +423,16 @@ class StockBasicFetcher:
             是否成功
         """
         # 获取数据
-        df = self.fetch_stock_basic()
+        df = self.fetch_trade_calendar()
         if df is None or df.empty:
-            logger.error("获取股票基本信息失败")
-            return False
-            
-        # 过滤数据
-        filtered_df = self.filter_stock_data(df)
-        if filtered_df.empty:
-            logger.warning("过滤后没有符合条件的股票数据")
+            logger.error("获取交易日历数据失败")
             return False
             
         # 添加更新时间字段
-        filtered_df['update_time'] = datetime.now().isoformat()
+        df['update_time'] = datetime.now().isoformat()
         
         # 保存数据到MongoDB
-        success = self.save_to_mongodb(filtered_df)
+        success = self.save_to_mongodb(df)
         
         # 关闭MongoDB连接
         self.mongo_client.close()
@@ -478,75 +442,51 @@ class StockBasicFetcher:
 
 def create_mock_data() -> pd.DataFrame:
     """创建模拟数据用于测试"""
-    logger.info("创建模拟股票基本信息数据用于测试")
+    logger.info("创建模拟交易日历数据用于测试")
     
     # 创建模拟数据
-    data = [
-        {'ts_code': '000001.SZ', 'symbol': '000001', 'name': '平安银行', 'exchange': 'SZSE', 'list_date': '19910403'},
-        {'ts_code': '000002.SZ', 'symbol': '000002', 'name': '万科A', 'exchange': 'SZSE', 'list_date': '19910129'},
-        {'ts_code': '000063.SZ', 'symbol': '000063', 'name': '中兴通讯', 'exchange': 'SZSE', 'list_date': '19971118'},
-        {'ts_code': '000338.SZ', 'symbol': '000338', 'name': '潍柴动力', 'exchange': 'SZSE', 'list_date': '20070430'},
-        {'ts_code': '000651.SZ', 'symbol': '000651', 'name': '格力电器', 'exchange': 'SZSE', 'list_date': '19960801'},
-        {'ts_code': '000725.SZ', 'symbol': '000725', 'name': '京东方A', 'exchange': 'SZSE', 'list_date': '19970710'},
-        {'ts_code': '000858.SZ', 'symbol': '000858', 'name': '五粮液', 'exchange': 'SZSE', 'list_date': '19980827'},
-        {'ts_code': '300059.SZ', 'symbol': '300059', 'name': '东方财富', 'exchange': 'SZSE', 'list_date': '20100115'},
-        {'ts_code': '300750.SZ', 'symbol': '300750', 'name': '宁德时代', 'exchange': 'SZSE', 'list_date': '20180611'},
-        {'ts_code': '600000.SH', 'symbol': '600000', 'name': '浦发银行', 'exchange': 'SSE', 'list_date': '19991110'},
-        {'ts_code': '600036.SH', 'symbol': '600036', 'name': '招商银行', 'exchange': 'SSE', 'list_date': '20021109'},
-        {'ts_code': '600276.SH', 'symbol': '600276', 'name': '恒瑞医药', 'exchange': 'SSE', 'list_date': '20001018'},
-        {'ts_code': '600519.SH', 'symbol': '600519', 'name': '贵州茅台', 'exchange': 'SSE', 'list_date': '20010827'},
-        {'ts_code': '600887.SH', 'symbol': '600887', 'name': '伊利股份', 'exchange': 'SSE', 'list_date': '19960403'},
-        {'ts_code': '601318.SH', 'symbol': '601318', 'name': '中国平安', 'exchange': 'SSE', 'list_date': '20070301'},
-        {'ts_code': '601857.SH', 'symbol': '601857', 'name': '中国石油', 'exchange': 'SSE', 'list_date': '20071105'},
-        {'ts_code': '601888.SH', 'symbol': '601888', 'name': '中国中免', 'exchange': 'SSE', 'list_date': '20091026'},
-        {'ts_code': '603288.SH', 'symbol': '603288', 'name': '海天味业', 'exchange': 'SSE', 'list_date': '20140211'},
-        {'ts_code': '603501.SH', 'symbol': '603501', 'name': '韦尔股份', 'exchange': 'SSE', 'list_date': '20170504'},
-        {'ts_code': '688981.SH', 'symbol': '688981', 'name': '中芯国际', 'exchange': 'SSE', 'list_date': '20200716'}
-    ]
-
+    # 生成一年的日期序列
+    start_date = datetime(2023, 1, 1)
+    end_date = datetime(2023, 12, 31)
+    date_range = pd.date_range(start=start_date, end=end_date)
     
-    # 转换为DataFrame
-    df = pd.DataFrame(data)
+    # 创建数据框
+    df = pd.DataFrame({
+        'cal_date': [date.strftime('%Y%m%d') for date in date_range],
+        'exchange': 'SSE',  # 上交所
+    })
     
-    # 添加其他字段，确保与实际API返回的数据结构一致
-    df['delist_date'] = pd.NA
-    df['comp_name'] = df['name']
-    df['comp_name_en'] = ''
-    df['isin_code'] = ''
-    df['list_board'] = ''
-    df['crncy_code'] = 'CNY'
-    df['pinyin'] = ''
-    df['list_board_name'] = ''
-    df['is_shsc'] = 'N'
-    df['comp_code'] = df['symbol']
+    # 添加是否交易日字段 (周末设为非交易日)
+    df['is_open'] = df['cal_date'].apply(lambda x: 0 if datetime.strptime(x, '%Y%m%d').weekday() >= 5 else 1)
     
-    logger.success(f"已创建 {len(df)} 条模拟股票数据")
+    logger.success(f"已创建 {len(df)} 条模拟交易日历数据")
     return df
 
 def main():
     """主函数"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='获取股票基本信息并保存到MongoDB')
+    parser = argparse.ArgumentParser(description='获取交易日历数据并保存到MongoDB')
     parser.add_argument('--config', default='config/config.yaml', help='配置文件路径')
     parser.add_argument('--interface-dir', default='config/interfaces', help='接口配置文件目录')
-    parser.add_argument('--market-codes', default='00,30,60,68', help='目标市场代码，用逗号分隔')
+    parser.add_argument('--exchange', default='SSE', help='交易所代码：SSE-上交所, SZSE-深交所')
+    parser.add_argument('--start-date', help='开始日期，格式：YYYYMMDD')
+    parser.add_argument('--end-date', help='结束日期，格式：YYYYMMDD')
     parser.add_argument('--db-name', default='tushare_data', help='MongoDB数据库名称')
-    parser.add_argument('--collection-name', default='stock_basic', help='MongoDB集合名称')
+    parser.add_argument('--collection-name', default='trade_cal', help='MongoDB集合名称')
     parser.add_argument('--verbose', action='store_true', help='输出详细日志')
     parser.add_argument('--mock', action='store_false', dest='use_real_api', help='使用模拟数据（当API不可用时）')
     parser.add_argument('--use-real-api', action='store_true', default=True, help='使用湘财真实API数据（默认）')
     parser.add_argument('--dry-run', action='store_true', help='仅运行流程，不保存数据')
     args = parser.parse_args()
     
-    # 解析市场代码
-    target_market_codes = set(args.market_codes.split(','))
-    
     # 创建获取器并运行
-    fetcher = StockBasicFetcher(
+    fetcher = TradeCalFetcher(
         config_path=args.config,
         interface_dir=args.interface_dir,
-        target_market_codes=target_market_codes,
+        exchange=args.exchange,
+        start_date=args.start_date,
+        end_date=args.end_date,
         db_name=args.db_name,  # 这个值会被内部强制设为"tushare_data"
         collection_name=args.collection_name,
         verbose=args.verbose
@@ -560,20 +500,15 @@ def main():
         logger.info("使用模拟数据模式")
         # 创建模拟数据
         df = create_mock_data()
-        # 过滤数据
-        filtered_df = fetcher.filter_stock_data(df)
-        if filtered_df.empty:
-            logger.warning("过滤后没有符合条件的股票数据")
-            sys.exit(1)
         # 添加更新时间字段
-        filtered_df['update_time'] = datetime.now().isoformat()
+        df['update_time'] = datetime.now().isoformat()
         # 是否实际保存
         if args.dry_run:
             logger.info("干运行模式，不保存数据")
             success = True
         else:
             # 保存数据到MongoDB
-            success = fetcher.save_to_mongodb(filtered_df)
+            success = fetcher.save_to_mongodb(df)
             # 关闭MongoDB连接
             fetcher.mongo_client.close()
     
