@@ -224,29 +224,50 @@ class StockPreviousNameFetcher:
             logger.error(f"获取WAN接口失败: {str(e)}")
             return None
 
-    def fetch_previous_name(self) -> Optional[pd.DataFrame]:
+    def fetch_previous_name_by_period(self, start_date: str, end_date: str, wan_idx: int = None, port: int = None) -> Optional[pd.DataFrame]:
         """
-        获取股票曾用名信息
+        按时间段获取股票曾用名信息
         
+        Args:
+            start_date: 开始日期，格式为 YYYYMMDD
+            end_date: 结束日期，格式为 YYYYMMDD
+            wan_idx: WAN接口索引，如果为None则获取新的WAN接口
+            port: WAN接口端口，如果为None则分配新的端口
+            
         Returns:
             股票曾用名信息DataFrame，如果失败则返回None
         """
         try:
             # 准备参数
             api_name = self.interface_config.get("api_name", "previous_name")
-            params = self.interface_config.get("params", {})
+            params = self.interface_config.get("params", {}).copy()  # 创建参数的副本，避免修改原始参数
             fields = self.interface_config.get("fields", [])
+            
+            # 添加日期范围参数
+            params.update({
+                "start_date": start_date,
+                "end_date": end_date
+            })
             
             # 确保使用正确的字段（根据接口定义）
             if not fields:
                 fields = self.interface_config.get("available_fields", [])
             
-            # 创建并使用WAN接口的socket，实现多WAN请求支持
-            wan_info = self._get_wan_socket() if self.port_allocator else None
-            use_wan = wan_info is not None
+            # 确定是否使用现有的WAN接口或获取新的
+            use_wan = False
+            wan_info = None
+            
+            if wan_idx is not None and port is not None:
+                # 使用传入的WAN接口和端口
+                wan_info = (wan_idx, port)
+                use_wan = True
+            elif self.port_allocator:
+                # 获取新的WAN接口和端口
+                wan_info = self._get_wan_socket()
+                use_wan = wan_info is not None
             
             # 调用Tushare API
-            logger.info(f"正在从湘财Tushare获取股票曾用名信息...")
+            logger.info(f"正在从湘财Tushare获取 {start_date} 至 {end_date} 期间的股票曾用名信息...")
             if use_wan:
                 wan_idx, port = wan_info
                 logger.debug(f"使用WAN接口 {wan_idx} 和本地端口 {port} 请求数据")
@@ -258,32 +279,26 @@ class StockPreviousNameFetcher:
             
             # 增加超时，设置为120秒
             self.client.set_timeout(120)
-            logger.info(f"增加API请求超时时间为120秒，提高网络可靠性")
             
             # 添加异常捕获，以便更好地调试
             try:
                 df = self.client.get_data(api_name=api_name, params=params, fields=fields)
                 if df is not None and not df.empty:
-                    logger.success(f"成功获取数据，行数: {len(df)}, 列数: {df.shape[1]}")
+                    logger.success(f"成功获取 {start_date} 至 {end_date} 期间数据，行数: {len(df)}, 列数: {df.shape[1]}")
                     if self.verbose:
                         logger.debug(f"列名: {list(df.columns)}")
             except Exception as e:
                 import traceback
-                logger.error(f"获取API数据时发生异常: {str(e)}")
+                logger.error(f"获取 {start_date} 至 {end_date} 期间API数据时发生异常: {str(e)}")
                 logger.debug(f"异常详情: {traceback.format_exc()}")
                 return None
             elapsed = time.time() - start_time
             
             if df is None or df.empty:
-                logger.error("API返回数据为空")
-                return None
+                logger.warning(f"API返回 {start_date} 至 {end_date} 期间数据为空")
+                return pd.DataFrame()
             
-            # 释放WAN端口（如果使用了）
-            if use_wan:
-                wan_idx, port = wan_info
-                self.port_allocator.release_port(wan_idx, port)
-            
-            logger.success(f"成功获取 {len(df)} 条股票曾用名信息，耗时 {elapsed:.2f}s")
+            logger.success(f"成功获取 {start_date} 至 {end_date} 期间 {len(df)} 条股票曾用名信息，耗时 {elapsed:.2f}s")
             
             # 如果使用详细日志，输出数据示例
             if self.verbose and not df.empty:
@@ -292,7 +307,99 @@ class StockPreviousNameFetcher:
             return df
             
         except Exception as e:
-            logger.error(f"获取股票曾用名信息失败: {str(e)}")
+            logger.error(f"获取 {start_date} 至 {end_date} 期间股票曾用名信息失败: {str(e)}")
+            import traceback
+            logger.debug(f"详细错误信息: {traceback.format_exc()}")
+            return None
+            
+    def fetch_previous_name(self) -> Optional[pd.DataFrame]:
+        """
+        获取股票曾用名信息，根据数据量分段获取
+        
+        Returns:
+            股票曾用名信息DataFrame，如果失败则返回None
+        """
+        try:
+            # 定义时间段，每5年为一个区间，从1990年开始
+            date_ranges = [
+                ("19900101", "19941231"),
+                ("19950101", "19991231"),
+                ("20000101", "20041231"),
+                ("20050101", "20091231"),
+                ("20100101", "20141231"),
+                ("20150101", "20191231"),
+                ("20200101", "20241231"),
+                ("20250101", "20291231")  # 预留未来5年的数据区间
+            ]
+            
+            all_data = []
+            
+            # 如果有多WAN接口支持，创建接口池
+            wan_pool = []
+            if self.port_allocator:
+                # 获取所有可用的WAN接口索引
+                indices = self.port_allocator.get_available_wan_indices()
+                if indices:
+                    for idx in indices:
+                        # 为每个WAN接口分配一个端口
+                        port = self.port_allocator.allocate_port(idx)
+                        if port:
+                            wan_pool.append((idx, port))
+                            logger.info(f"WAN池添加接口 {idx}，端口 {port}")
+            
+            # 确定是否可以使用多WAN接口
+            use_wan_pool = len(wan_pool) > 0
+            
+            # 并行或串行获取各时间段的数据
+            start_time = time.time()
+            logger.info(f"开始分段获取股票曾用名数据，共 {len(date_ranges)} 个时间段")
+            
+            for i, (start_date, end_date) in enumerate(date_ranges):
+                # 如果有WAN池，轮询使用不同的WAN接口
+                if use_wan_pool:
+                    wan_idx, port = wan_pool[i % len(wan_pool)]
+                    logger.info(f"使用WAN池中的接口 {wan_idx}，端口 {port} 获取 {start_date} 至 {end_date} 期间数据")
+                    df = self.fetch_previous_name_by_period(start_date, end_date, wan_idx, port)
+                else:
+                    # 不使用WAN池，每次请求都获取新的WAN接口（如果可用）
+                    df = self.fetch_previous_name_by_period(start_date, end_date)
+                
+                # 添加到结果列表
+                if df is not None and not df.empty:
+                    all_data.append(df)
+                    logger.info(f"成功获取 {start_date} 至 {end_date} 期间数据，共 {len(df)} 条记录")
+                
+                # 适当休眠，避免请求过于频繁
+                time.sleep(1)
+            
+            # 释放WAN端口池
+            if use_wan_pool:
+                for wan_idx, port in wan_pool:
+                    self.port_allocator.release_port(wan_idx, port)
+                    logger.debug(f"释放WAN接口 {wan_idx}，端口 {port}")
+            
+            # 合并所有数据
+            if not all_data:
+                logger.error("所有时间段均未获取到数据")
+                return None
+            
+            # 合并所有DataFrame
+            df_combined = pd.concat(all_data, ignore_index=True)
+            
+            # 删除可能的重复记录
+            if not df_combined.empty:
+                # 确定去重的列，通常是主键字段
+                if "ts_code" in df_combined.columns and "begindate" in df_combined.columns:
+                    df_combined = df_combined.drop_duplicates(subset=["ts_code", "begindate"])
+                    logger.info(f"去重后数据条数: {len(df_combined)}")
+            
+            elapsed = time.time() - start_time
+            logger.success(f"成功获取所有时间段的股票曾用名信息，共 {len(df_combined)} 条记录，总耗时 {elapsed:.2f}s")
+            
+            return df_combined
+            
+        except Exception as e:
+            logger.error(f"分段获取股票曾用名信息失败: {str(e)}")
             import traceback
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return None
@@ -485,26 +592,52 @@ class StockPreviousNameFetcher:
             logger.error("未能从stock_basic集合获取目标股票代码")
             return False
             
-        # 获取股票曾用名信息数据
+        logger.info(f"开始分批获取股票曾用名数据，将按5年为单位分段处理，避免超过10000条数据限制")
+        
+        # 分段获取股票曾用名信息数据
         df = self.fetch_previous_name()
         if df is None or df.empty:
             logger.error("获取股票曾用名信息失败")
             return False
             
+        logger.info(f"成功获取到 {len(df)} 条曾用名数据，开始进行过滤处理")
+        
         # 过滤数据，只保留目标股票
         filtered_df = self.filter_previous_name_data(df, target_ts_codes)
         if filtered_df.empty:
             logger.warning("过滤后没有符合条件的股票曾用名数据")
             return False
+        
+        logger.info(f"过滤后保留了 {len(filtered_df)} 条曾用名数据")
             
         # 添加更新时间字段
         filtered_df['update_time'] = datetime.now().isoformat()
         
+        # 确保时间字段格式统一
+        if 'begindate' in filtered_df.columns:
+            logger.info("处理begindate字段的格式")
+            # 确保begindate是字符串格式且为8位数字格式 YYYYMMDD
+            filtered_df['begindate'] = filtered_df['begindate'].astype(str)
+            filtered_df['begindate'] = filtered_df['begindate'].str.replace('-', '')
+        
+        if 'enddate' in filtered_df.columns:
+            logger.info("处理enddate字段的格式")
+            # 处理enddate字段，可能包含None值
+            filtered_df['enddate'] = filtered_df['enddate'].astype(str)
+            filtered_df['enddate'] = filtered_df['enddate'].str.replace('-', '')
+            filtered_df['enddate'] = filtered_df['enddate'].replace('None', None)
+        
         # 保存数据到MongoDB
+        logger.info(f"开始保存 {len(filtered_df)} 条数据到MongoDB")
         success = self.save_to_mongodb(filtered_df)
         
         # 关闭MongoDB连接
         self.mongo_client.close()
+        
+        if success:
+            logger.success(f"成功完成股票曾用名数据的分段获取和保存，共处理 {len(filtered_df)} 条记录")
+        else:
+            logger.error("保存股票曾用名数据到MongoDB失败")
         
         return success
 
