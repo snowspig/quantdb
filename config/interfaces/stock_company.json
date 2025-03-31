@@ -1,19 +1,23 @@
 {
-    "source": "tushare",
-    "id": "stock_company",
-    "api_name": "stock_company",
-    "enabled": true,
-    "group": "basic",
-    "frequency": "daily",
     "description": "股票公司信息",
-    "params": {},
-    "batch_size": 10000,
-    "index_fields": ["ts_code"],
-    "fields_to_store": [
-      "ts_code", "province", "city", "chairman", "president", 
-      "bd_secretary", "reg_capital", "found_date", "chinese_introduction", 
-      "comp_type", "website", "email", "office", "ann_date", "country", 
-      "business_scope", "company_type", "total_employees", "main_business"
-    ],  
-    "wan_mode": 0
-  }
+    "api_name": "stock_company",
+    "fields": [
+        "ts_code", "province", "city", "chairman", "president", 
+        "bd_secretary", "reg_capital", "found_date", "chinese_introduction", 
+        "comp_type", "website", "email", "office", "ann_date", "country", 
+        "business_scope", "company_type", "total_employees", "main_business"
+    ],
+    "params": {
+    },
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code"
+    ],
+    "available_fields": [
+        "ts_code", "province", "city", "chairman", "president", 
+        "bd_secretary", "reg_capital", "found_date", "chinese_introduction", 
+        "comp_type", "website", "email", "office", "ann_date", "country", 
+        "business_scope", "company_type", "total_employees", "main_business"
+    ]
+}
