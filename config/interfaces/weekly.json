@@ -1,20 +1,16 @@
 {
-    "source": "tushare",
-    "id": "weekly",
-    "api_name": "weekly",
-    "enabled": true,
-    "group": "market",
-    "frequency": "weekly",
-    "description": "股票周线行情数据",
-    "params": {
-      "start_date": "{last_month}",
-      "end_date": "{trade_date}"
-    },
-    "batch_size": 3000,
-    "index_fields": ["ts_code", "trade_date"],
-    "fields_to_store": [
+  "description": "股票周线行情数据",
+  "api_name": "weekly",
+  "fields": [],
+  "params": {
+  },
+  "update_frequency": "weekly",
+  "update_priority": 1,
+  "index_fields": [
+      "ts_code", "trade_date"
+  ],
+  "available_fields": [
       "trade_date", "change", "pre_close", "ts_code", 
       "high", "amount", "vol", "low", "close", "open", "pct_chg"
-    ],
-    "wan_mode": 0
-  } 
+  ]
+}

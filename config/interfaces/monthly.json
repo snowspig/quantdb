@@ -1,20 +1,16 @@
 {
-  "source": "tushare",
-  "id": "monthly",
-  "api_name": "monthly",
-  "enabled": true,
-  "group": "market",
-  "frequency": "monthly",
   "description": "股票月线行情数据",
+  "api_name": "monthly",
+  "fields": [],
   "params": {
-    "start_date": "{last_month}",
-    "end_date": "{trade_date}"
   },
-  "batch_size": 3000,
-  "index_fields": ["ts_code", "trade_date"],
-  "fields_to_store": [
+  "update_frequency": "monthly",
+  "update_priority": 1,
+  "index_fields": [
+      "ts_code", "trade_date"
+  ],
+  "available_fields": [
     "amount", "low", "close", "pre_close", "high", 
     "pct_chg", "vol", "trade_date", "ts_code", "open", "change"
-  ],
-  "wan_mode": 0
-} 
+  ]
+}

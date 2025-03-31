@@ -1,19 +1,15 @@
 {
-  "source": "tushare",
-  "id": "income",
-  "api_name": "income",
-  "enabled": true,
-  "group": "finance",
-  "frequency": "quarterly",
   "description": "利润表（季度频率）",
+  "api_name": "income",
+  "fields": [],
   "params": {
-    "start_date": "{last_year}",
-    "end_date": "{trade_date}"
   },
-  "auto_ts_code": true,
-  "batch_size": 5000,
-  "index_fields": ["ts_code", "ann_date", "f_ann_date", "end_date"],
-  "fields_to_store": [
+  "update_frequency": "quarterly",
+  "update_priority": 1,
+  "index_fields": [
+      "ts_code", "ann_date", "f_ann_date", "end_date"
+  ],
+  "available_fields": [
     "ts_code", "ann_date", "f_ann_date", "end_date", "report_type", "comp_type",
     "basic_eps", "diluted_eps", "total_revenue", "revenue", "int_income",
     "prem_earned", "comm_income", "n_commis_income", "n_oth_income",
@@ -34,6 +30,5 @@
     "withdra_biz_devfund", "withdra_rese_fund", "withdra_oth_ersu",
     "workers_welfare", "distr_profit_shrhlder", "prfshare_payable_dvd",
     "common_stock_dvd", "capital_comstock_div", "update_flag"
-  ],
-  "wan_mode": 0
-} 
+  ]
+}

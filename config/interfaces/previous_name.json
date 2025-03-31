@@ -1,14 +1,15 @@
 {
-    "source": "tushare",
-    "id": "previous_name",
-    "api_name": "previous_name",
-    "enabled": true,
-    "group": "basic", 
-    "frequency": "daily",
-    "description": "股票更名信息",
-    "params": {},
-    "batch_size": 10000,
-    "index_fields": ["ts_code"],
-    "fields_to_store": ["ts_code", "begindate", "enddate", "ann_dt", "s_info_name", "changereason"],  
-    "wan_mode": 0
-  }
+  "description": "股票更名信息",
+  "api_name": "previous_name",
+  "fields": [],
+  "params": {
+  },
+  "update_frequency": "daily",
+  "update_priority": 1,
+  "index_fields": [
+      "ts_code"
+  ],
+  "available_fields": [
+      "ts_code", "begindate", "enddate", "ann_dt", "s_info_name", "changereason"
+  ]
+}
