@@ -1,7 +1,12 @@
 {
     "description": "股票公司信息",
     "api_name": "stock_company",
-    "fields": [],
+    "fields": [
+        "ts_code", "province", "city", "chairman", "president", 
+        "bd_secretary", "reg_capital", "found_date", "chinese_introduction", 
+        "comp_type", "website", "email", "office", "ann_date", "country", 
+        "business_scope", "company_type", "total_employees", "main_business"
+    ],
     "params": {
     },
     "update_frequency": "daily",
