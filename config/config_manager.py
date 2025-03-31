@@ -92,14 +92,14 @@ class ConfigManager:
         """
         return self.get('mongodb', 'db')
     
-    def get_tushare_api_key(self) -> str:
+    def get_tushare_token(self) -> str:
         """
         获取Tushare API密钥
         
         Returns:
             Tushare API密钥
         """
-        return self.get('tushare', 'api_key')
+        return self.get('tushare', 'token')
     
     def get_tushare_api_url(self) -> str:
         """

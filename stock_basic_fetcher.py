@@ -125,12 +125,12 @@ class StockBasicFetcher:
         """初始化Tushare客户端"""
         try:
             tushare_config = self.config.get("tushare", {})
-            api_key = tushare_config.get("api_key", "")
-            if not api_key:
+            token = tushare_config.get("token", "")
+            if not token:
                 logger.error("未配置Tushare API Key")
                 sys.exit(1)
                 
-            return TushareClient(api_key=api_key)
+            return TushareClient(token=token)
         except Exception as e:
             logger.error(f"初始化Tushare客户端失败: {str(e)}")
             sys.exit(1)
