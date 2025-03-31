@@ -151,9 +151,9 @@ class TradeCalFetcher:
         """初始化Tushare客户端"""
         try:
             tushare_config = self.config.get("tushare", {})
-            api_key = tushare_config.get("api_key", "")
+            api_key = tushare_config.get("token", "")
             if not api_key:
-                logger.error("未配置Tushare API Key")
+                logger.error("未配置Tushare API Token")
                 sys.exit(1)
                 
             return TushareClient(api_key=api_key)
