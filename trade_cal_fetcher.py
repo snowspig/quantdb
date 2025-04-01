@@ -406,8 +406,7 @@ class TradeCalFetcher:
                             collection.create_index(field)
                             logger.debug(f"已为字段 {field} 创建索引")
                     
-                    # 为update_time创建索引，便于查询最新数据
-                    collection.create_index("update_time")
+                    # Removed update_time index creation to prevent duplicate data
                 except Exception as e:
                     logger.warning(f"创建索引时出错: {str(e)}")
                 
@@ -436,8 +435,7 @@ class TradeCalFetcher:
             logger.error("获取交易日历数据失败")
             return False
             
-        # 添加更新时间字段
-        df['update_time'] = datetime.now().isoformat()
+        # Removed update_time field to prevent duplicate data
         
         # 保存数据到MongoDB
         success = self.save_to_mongodb(df)
@@ -508,8 +506,7 @@ def main():
         logger.info("使用模拟数据模式")
         # 创建模拟数据
         df = create_mock_data()
-        # 添加更新时间字段
-        df['update_time'] = datetime.now().isoformat()
+        # Removed update_time field to prevent duplicate data
         # 是否实际保存
         if args.dry_run:
             logger.info("干运行模式，不保存数据")

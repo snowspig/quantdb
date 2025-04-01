@@ -428,8 +428,7 @@ class StockBasicFetcher:
                         collection.create_index("symbol")
                         logger.debug("已为默认字段创建索引")
                         
-                    # 为update_time创建索引，便于查询最新数据
-                    collection.create_index("update_time")
+                    # Removed update_time index creation to prevent duplicate data
                 except Exception as e:
                     logger.warning(f"创建索引时出错: {str(e)}")
                 
@@ -464,8 +463,7 @@ class StockBasicFetcher:
             logger.warning("过滤后没有符合条件的股票数据")
             return False
             
-        # 添加更新时间字段
-        filtered_df['update_time'] = datetime.now().isoformat()
+        # Removed update_time field to prevent duplicate data
         
         # 保存数据到MongoDB
         success = self.save_to_mongodb(filtered_df)
@@ -565,8 +563,7 @@ def main():
         if filtered_df.empty:
             logger.warning("过滤后没有符合条件的股票数据")
             sys.exit(1)
-        # 添加更新时间字段
-        filtered_df['update_time'] = datetime.now().isoformat()
+        # Removed update_time field to prevent duplicate data
         # 是否实际保存
         if args.dry_run:
             logger.info("干运行模式，不保存数据")
