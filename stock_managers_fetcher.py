@@ -876,6 +876,7 @@ def main():
     parser.add_argument("--end-date", type=str, help="结束日期，格式为YYYYMMDD，如20201231")
     parser.add_argument("--recent", action="store_true", help="仅获取最近一周的数据更新（默认模式）")
     parser.add_argument("--full", action="store_true", help="获取完整历史数据而非默认的最近一周数据")
+    parser.add_argument("--ts-code", type=str, help="指定股票代码，例如600000.SH")
     args = parser.parse_args()
     
     # 创建获取器
@@ -898,6 +899,9 @@ def main():
             start_date = (today - timedelta(days=7)).strftime('%Y%m%d')  # 一周前
             logger.info(f"使用recent模式：获取最近一周 {start_date} 至 {end_date} 期间的数据更新")
 
+        # 如果指定了股票代码，优先使用股票代码
+        ts_code = args.ts_code
+        
         # 如果指定了日期范围，使用按日期获取数据的方式
         if start_date and end_date:
             # 生成日期范围
@@ -941,7 +945,7 @@ def main():
                     wan_info = None
                 
                 # 提交任务到线程池
-                future = fetcher.executor.submit(fetcher._fetch_data_for_date_range, date_range, wan_info, None)
+                future = fetcher.executor.submit(fetcher._fetch_data_for_date_range, date_range, wan_info, ts_code)
                 futures.append(future)
             
             # 收集结果
