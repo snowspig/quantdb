@@ -11,6 +11,7 @@
     python stock_previous_name_fetcher_optimized.py              # 使用湘财真实API数据，简洁日志模式
     python stock_previous_name_fetcher_optimized.py --verbose     # 使用湘财真实API数据，详细日志模式
     python stock_previous_name_fetcher_optimized.py --mock        # 使用模拟数据模式（API不可用时）
+    python stock_previous_name_fetcher_optimized.py --start-date 20100101 --end-date 20201231  # 指定日期范围获取数据
 """
 import os
 import sys
@@ -353,18 +354,30 @@ class StockPreviousNameFetcher:
         # 所有重试都失败
         return None
 
-    def _generate_date_ranges(self, start_year=1990, end_year=None) -> List[Tuple[str, str]]:
+    def _generate_date_ranges(self, start_date=None, end_date=None, start_year=1990, end_year=None) -> List[Tuple[str, str]]:
         """
         生成5年为一个区间的日期范围列表
         
         Args:
-            start_year: 开始年份
-            end_year: 结束年份，默认为当前年份
+            start_date: 开始日期，格式为 YYYYMMDD，优先级高于start_year
+            end_date: 结束日期，格式为 YYYYMMDD，优先级高于end_year
+            start_year: 开始年份，当start_date未指定时使用
+            end_year: 结束年份，当end_date未指定时使用，默认为当前年份
             
         Returns:
             日期范围列表，每个元素为(start_date, end_date)元组
         """
-        if end_year is None:
+        # 处理日期参数
+        if start_date:
+            # 从日期字符串中提取年份
+            if len(start_date) >= 4:
+                start_year = int(start_date[:4])
+        
+        if end_date:
+            # 从日期字符串中提取年份
+            if len(end_date) >= 4:
+                end_year = int(end_date[:4])
+        elif end_year is None:
             end_year = datetime.now().year
             
         date_ranges = []
@@ -374,11 +387,23 @@ class StockPreviousNameFetcher:
             # 计算5年后的年份，但不超过end_year
             next_year = min(current_year + 4, end_year)
             
-            # 格式化日期范围
-            start_date = f"{current_year}0101"  # 1月1日
-            end_date = f"{next_year}1231"     # 12月31日
+            # 确定当前区间的开始日期
+            if start_date and current_year == start_year:
+                # 使用用户指定的开始日期
+                period_start_date = start_date
+            else:
+                # 使用年份的第一天
+                period_start_date = f"{current_year}0101"  # 1月1日
             
-            date_ranges.append((start_date, end_date))
+            # 确定当前区间的结束日期
+            if end_date and next_year == end_year:
+                # 使用用户指定的结束日期
+                period_end_date = end_date
+            else:
+                # 使用年份的最后一天
+                period_end_date = f"{next_year}1231"  # 12月31日
+            
+            date_ranges.append((period_start_date, period_end_date))
             
             # 更新下一个5年起始年份
             current_year = next_year + 1
@@ -404,16 +429,24 @@ class StockPreviousNameFetcher:
         else:
             return self.fetch_previous_name_by_period(start_date, end_date)
 
-    def fetch_previous_name(self) -> Optional[pd.DataFrame]:
+    def fetch_previous_name(self, start_date=None, end_date=None) -> Optional[pd.DataFrame]:
         """
         获取股票曾用名信息，根据数据量分段获取
+        
+        Args:
+            start_date: 开始日期，格式为 YYYYMMDD，默认为1990年1月1日
+            end_date: 结束日期，格式为 YYYYMMDD，默认为当前年份的12月31日
         
         Returns:
             股票曾用名信息DataFrame，如果失败则返回None
         """
         try:
-            # 生成日期范围，每5年为一个区间，从1990年开始到当前年份
-            date_ranges = self._generate_date_ranges()
+            # 生成日期范围，每5年为一个区间
+            date_ranges = self._generate_date_ranges(start_date=start_date, end_date=end_date)
+            
+            # 打印日期范围信息
+            logger.info(f"开始获取股票曾用名数据，日期范围: {start_date or '1990年起'} 至 {end_date or '当前'}")
+            logger.debug(f"共分为 {len(date_ranges)} 个时间区间: {date_ranges}")
             
             all_data = []
             
@@ -647,6 +680,8 @@ def main():
     parser = argparse.ArgumentParser(description="股票曾用名数据获取工具 (优化版)")
     parser.add_argument("--verbose", action="store_true", help="输出详细日志")
     parser.add_argument("--mock", action="store_true", help="使用模拟数据模式（API不可用时）")
+    parser.add_argument("--start-date", type=str, help="开始日期，格式为YYYYMMDD，如20100101")
+    parser.add_argument("--end-date", type=str, help="结束日期，格式为YYYYMMDD，如20201231")
     args = parser.parse_args()
     
     # 创建获取器
@@ -657,8 +692,8 @@ def main():
         logger.warning("使用模拟数据模式，生成随机的股票曾用名信息")
         # 使用mock数据的逻辑（暂未实现）
     else:
-        # 获取所有股票曾用名数据
-        df = fetcher.fetch_previous_name()
+        # 获取所有股票曾用名数据，支持指定日期范围
+        df = fetcher.fetch_previous_name(start_date=args.start_date, end_date=args.end_date)
         
         if df is not None and not df.empty:
             # 从stock_basic获取目标股票代码
