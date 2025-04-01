@@ -7,7 +7,7 @@
   "update_frequency": "daily",
   "update_priority": 1,
   "index_fields": [
-      "ts_code","ex_date"
+      "ts_code","ex_date","ex_type"
   ],
   "available_fields": [
       "ts_code", "ex_date", "ex_type", "ex_description", "cash_dividend_ratio", 

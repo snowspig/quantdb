@@ -580,7 +580,18 @@ class DividendFetcher:
             logger.warning(f"未获取到 {start_date} 至 {end_date} 期间的数据")
             return pd.DataFrame()
             
-        combined_df = pd.concat(all_data_frames, ignore_index=True)
+        # 过滤掉空的DataFrame，解决concat警告
+        non_empty_frames = [df for df in all_data_frames if not df.empty]
+        if not non_empty_frames:
+            logger.warning(f"所有获取到的DataFrame都为空")
+            return pd.DataFrame()
+            
+        # 处理全NA列的问题
+        for i in range(len(non_empty_frames)):
+            # 删除全是NA的列
+            non_empty_frames[i] = non_empty_frames[i].dropna(axis=1, how='all')
+            
+        combined_df = pd.concat(non_empty_frames, ignore_index=True)
         logger.success(f"成功获取 {start_date} 至 {end_date} 期间总计 {len(combined_df)} 条A股除权除息记录")
         
         return combined_df
@@ -765,22 +776,22 @@ class DividendFetcher:
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return None
 
-    def save_to_mongodb(self, df: pd.DataFrame) -> bool:
+    def save_to_mongodb(self, df: pd.DataFrame) -> int:
         """
-        将数据保存到MongoDB，仅保存target_market_codes中指定板块的股票数据
+        高效地将数据保存到MongoDB，使用ts_code、ex_date和ex_type的复合索引防止重复
         
         Args:
             df: 待保存的DataFrame
             
         Returns:
-            是否成功保存
+            实际插入的记录数
         """
         # 强制确保使用tushare_data作为数据库名称
         logger.info(f"保存数据到MongoDB数据库：{self.db_name}，集合：{self.collection_name}")
         
         if df is None or df.empty:
             logger.warning("没有数据可保存到MongoDB")
-            return False
+            return 0
             
         # 确保只保存目标板块的股票数据
         if "ts_code" in df.columns and self.target_market_codes:
@@ -804,118 +815,158 @@ class DividendFetcher:
             
             if df.empty:
                 logger.warning("过滤后没有数据可保存到MongoDB")
-                return False
+                return 0
         
         try:
-            # 将DataFrame转换为记录列表
-            records = df.to_dict('records')
-            
             # 确保MongoDB连接
             if not self.mongo_client.is_connected():
                 logger.warning("MongoDB未连接，尝试重新连接...")
                 if not self.mongo_client.connect():
                     logger.error("重新连接MongoDB失败")
-                    return False
+                    return 0
             
             # 直接获取数据库和集合
             db = self.mongo_client.get_db(self.db_name)
             collection = db[self.collection_name]
             
-            # 统计计数器
-            inserted_count = 0
-            skipped_count = 0
+            # 检查重要字段是否存在
+            required_fields = ["ts_code", "ex_date"]
+            if not all(field in df.columns for field in required_fields):
+                logger.warning(f"数据中缺少必要字段: {[f for f in required_fields if f not in df.columns]}")
+                if "ts_code" not in df.columns:
+                    logger.error("数据中没有ts_code字段，无法继续处理")
+                    return 0
+            
+            # 检查是否有ex_type字段
+            has_ex_type = "ex_type" in df.columns
+            if not has_ex_type:
+                logger.warning("数据中没有ex_type字段，将仅使用ts_code和ex_date作为复合索引")
             
             start_time = time.time()
             
-            # 逐条检查记录是否存在，只插入不存在的记录
+            # 1. 确定索引名称和字段
+            index_fields = [("ts_code", 1), ("ex_date", 1)]
+            if has_ex_type:
+                index_fields.append(("ex_type", 1))
+                index_name = "ts_code_1_ex_date_1_ex_type_1"
+            else:
+                index_name = "ts_code_1_ex_date_1"
+            
+            # 检查索引是否存在
+            logger.info(f"检查复合索引: {index_name}...")
+            existing_indexes = collection.index_information()
+            has_compound_index = index_name in existing_indexes
+            
+            if not has_compound_index:
+                # 创建复合索引(非唯一索引)
+                logger.info(f"正在创建复合索引: {index_name}...")
+                try:
+                    collection.create_index(index_fields, background=True)
+                    logger.success(f"成功创建复合索引: {index_name}")
+                except Exception as e:
+                    logger.warning(f"创建复合索引时出错: {str(e)}")
+            else:
+                logger.info(f"复合索引已存在: {index_name}")
+            
+            # 2. 获取已存在记录的唯一键
+            logger.info("获取现有记录的唯一键组合...")
+            existing_keys = set()
+            
+            # 查询字段
+            projection = {"ts_code": 1, "ex_date": 1, "_id": 0}
+            if has_ex_type:
+                projection["ex_type"] = 1
+                
+            cursor = collection.find({}, projection)
+            
+            for doc in cursor:
+                if "ts_code" in doc and "ex_date" in doc and doc["ex_date"]:  # 确保ex_date不为空
+                    if has_ex_type and "ex_type" in doc:
+                        key = (doc["ts_code"], doc["ex_date"], doc.get("ex_type"))
+                    else:
+                        key = (doc["ts_code"], doc["ex_date"])
+                    existing_keys.add(key)
+            
+            logger.info(f"已获取 {len(existing_keys)} 条现有记录的唯一键组合")
+            
+            # 3. 过滤出新记录
+            records = df.to_dict('records')
+            new_records = []
+            skipped_count = 0
+            batch_keys = set()  # 用于检测批次内部的重复
+            
             for record in records:
-                # 构建查询条件：使用ts_code和ann_date作为唯一标识
-                query = {}
-                
-                # 根据可用字段构建查询条件
-                if all(field in record for field in ["ts_code", "ann_date"]):
-                    query = {
-                        "ts_code": record["ts_code"],
-                        "ann_date": record["ann_date"]
-                    }
-                elif "ts_code" in record:
-                    # 只有ts_code可用时，使用所有可用字段组合查询
-                    query = {"ts_code": record["ts_code"]}
-                    # 添加其他可能的字段
-                    for field in ["end_date", "ex_date", "pay_date"]:
-                        if field in record and record[field]:
-                            query[field] = record[field]
-                
-                # 检查记录是否存在
-                if query and collection.find_one(query):
-                    # 记录已存在，跳过
-                    skipped_count += 1
+                # 必须有ts_code字段
+                if "ts_code" not in record:
                     continue
+                    
+                # 如果ex_date字段存在且不为空
+                if "ex_date" in record and record["ex_date"]:
+                    # 构建唯一键
+                    if has_ex_type and "ex_type" in record:
+                        key = (record["ts_code"], record["ex_date"], record.get("ex_type"))
+                    else:
+                        key = (record["ts_code"], record["ex_date"])
+                    
+                    # 检查是否在现有记录中或者批次内重复
+                    if key in existing_keys or key in batch_keys:
+                        skipped_count += 1
+                        continue
+                    
+                    # 添加到批次键集合
+                    batch_keys.add(key)
+                else:
+                    # 如果没有ex_date，使用ts_code和其他可用字段检查
+                    has_match = False
+                    for doc in cursor:
+                        if "ts_code" in doc and doc["ts_code"] == record["ts_code"]:
+                            # 检查其他关键字段是否匹配
+                            fields_match = True
+                            for field in ["ann_date", "pay_date", "div_proc"]:
+                                if field in record and field in doc and record[field] == doc[field]:
+                                    continue
+                                else:
+                                    fields_match = False
+                                    break
+                            
+                            if fields_match:
+                                has_match = True
+                                break
+                    
+                    if has_match:
+                        skipped_count += 1
+                        continue
                 
-                # 记录不存在，插入新记录
-                collection.insert_one(record)
-                inserted_count += 1
+                new_records.append(record)
+            
+            # 4. 批量插入新记录
+            inserted_count = 0
+            if new_records:
+                logger.info(f"开始批量插入 {len(new_records)} 条新记录...")
+                
+                # 使用批量插入提高效率，每批5000条
+                batch_size = 5000
+                for i in range(0, len(new_records), batch_size):
+                    batch = new_records[i:i+batch_size]
+                    if batch:
+                        try:
+                            result = collection.insert_many(batch, ordered=False)
+                            inserted_this_batch = len(result.inserted_ids) if hasattr(result, 'inserted_ids') else 0
+                            inserted_count += inserted_this_batch
+                            logger.info(f"已插入 {i+len(batch)}/{len(new_records)} 条记录，本批次成功: {inserted_this_batch}")
+                        except Exception as e:
+                            # 可能会有部分记录重复导致异常，但ordered=False会继续处理其他记录
+                            logger.warning(f"批量插入遇到错误 (部分记录可能已插入): {str(e)}")
             
             elapsed = time.time() - start_time
-            
-            # 创建索引 - 使用复合索引确保唯一性
-            try:
-                # 检查是否应该使用ex_date作为唯一性保证
-                # 由于ann_date可能为空，改用ex_date和ts_code作为唯一索引
-                # 检查索引是否已存在
-                existing_indexes = collection.index_information()
-                compound_index_exists = False
-                for idx_name, idx_info in existing_indexes.items():
-                    if 'key' in idx_info and len(idx_info['key']) >= 2:
-                        # 检查是否存在ts_code和ex_date的组合索引
-                        keys = [k[0] for k in idx_info['key']]
-                        if 'ts_code' in keys and 'ex_date' in keys:
-                            compound_index_exists = True
-                            logger.info(f"复合索引已存在: {idx_name}，包含字段: {keys}")
-                            break
-                
-                if not compound_index_exists:
-                    # 创建复合唯一索引 - 使用ex_date而非ann_date，因为前者不会为null
-                    collection.create_index(
-                        [("ts_code", 1), ("ex_date", 1)], 
-                        unique=True, 
-                        background=True,
-                        name="ts_code_ex_date_unique"
-                    )
-                    logger.success(f"已为字段组合 (ts_code, ex_date) 创建唯一复合索引")
-                
-                # 检查并创建基本索引
-                existing_indexes = collection.index_information()
-                
-                # 确保ts_code有索引
-                if not any('ts_code' in idx_info.get('key', []) for idx_name, idx_info in existing_indexes.items() 
-                          if len(idx_info.get('key', [])) == 1 and idx_info.get('key', [])[0][0] == 'ts_code'):
-                    collection.create_index("ts_code", background=True)
-                    logger.debug(f"已为字段 ts_code 创建索引")
-                    
-                # 为其他常用字段创建索引
-                for field in ["ex_date", "pay_date"]:
-                    if field in df.columns:
-                        field_has_index = False
-                        for idx_name, idx_info in existing_indexes.items():
-                            if len(idx_info.get('key', [])) == 1 and idx_info.get('key', [])[0][0] == field:
-                                field_has_index = True
-                                break
-                        if not field_has_index:
-                            collection.create_index(field, background=True)
-                            logger.debug(f"已为字段 {field} 创建索引")
-            except Exception as e:
-                logger.warning(f"创建索引时出错: {str(e)}")
-            
-            total_processed = inserted_count + skipped_count
-            logger.success(f"数据处理完成: 新插入 {inserted_count} 条记录，跳过 {skipped_count} 条重复记录，共处理 {total_processed} 条记录，耗时 {elapsed:.2f}s")
-            return inserted_count > 0 or skipped_count > 0
+            logger.success(f"数据处理完成: 新插入 {inserted_count} 条记录，跳过 {skipped_count} 条重复记录，耗时 {elapsed:.2f}s")
+            return inserted_count
                 
         except Exception as e:
             logger.error(f"保存数据到MongoDB失败: {str(e)}")
             import traceback
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
-            return False
+            return 0
 
 
 def main():
@@ -967,69 +1018,28 @@ def main():
             logger.info(f"开始获取A股除权除息记录，日期范围: {start_date or '1990年起'} 至 {end_date or '当前'}")
             logger.debug(f"共分为 {len(date_ranges)} 个时间区间: {date_ranges}")
             
-            all_data = []
+            # 预先获取目标股票代码，避免重复查询
+            ts_codes = fetcher.get_target_ts_codes_from_stock_basic()
+            total_saved_records = 0
             
-            # 如果有多WAN接口支持，创建接口池
-            wan_pool = []
-            if fetcher.port_allocator:
-                # 获取所有可用的WAN接口索引
-                indices = fetcher.port_allocator.get_available_wan_indices()
-                if indices:
-                    for idx in indices:
-                        # 为每个WAN接口分配一个端口
-                        port = fetcher.port_allocator.allocate_port(idx)
-                        if port:
-                            wan_pool.append((idx, port))
-                            logger.info(f"WAN池添加接口 {idx}，端口 {port}")
-            
-            # 确定是否可以使用多WAN接口
-            use_wan_pool = len(wan_pool) > 0
-            
-            # 并行获取各时间段的数据
-            start_time = time.time()
-            logger.info(f"开始分段获取A股除权除息记录，共 {len(date_ranges)} 个时间段")
-            
-            # 准备提交并行任务
-            futures = []
-            
-            for i, date_range in enumerate(date_ranges):
-                # 如果有WAN池，轮询使用不同的WAN接口
-                if use_wan_pool:
-                    wan_info = wan_pool[i % len(wan_pool)]
-                    logger.info(f"使用WAN池中的接口 {wan_info[0]}，端口 {wan_info[1]} 获取 {date_range[0]} 至 {date_range[1]} 期间数据")
-                else:
-                    wan_info = None
-                
-                # 提交任务到线程池
-                future = fetcher.executor.submit(fetcher._fetch_data_for_date_range, date_range, wan_info, ts_code)
-                futures.append(future)
-            
-            # 收集结果
-            for future in futures:
-                df = future.result()  # 等待任务完成并获取结果
+            # 分段处理并保存数据，减少内存压力
+            for date_range in date_ranges:
+                # 不传入wan_info，让函数内部自动处理
+                df = fetcher._fetch_data_for_date_range(date_range, None, ts_code)
                 if df is not None and not df.empty:
-                    all_data.append(df)
+                    # 立即过滤和保存这一批数据
+                    if ts_codes and 'ts_code' in df.columns:
+                        df_filtered = df[df['ts_code'].isin(ts_codes)].copy()
+                    else:
+                        df_filtered = df
+                    
+                    if not df_filtered.empty:
+                        # 修改：使用实际插入的记录数而非DataFrame长度
+                        inserted_count = fetcher.save_to_mongodb(df_filtered)
+                        total_saved_records += inserted_count
+                        logger.success(f"当前已保存总计 {total_saved_records} 条记录")
             
-            # 释放WAN端口池
-            if use_wan_pool:
-                for wan_idx, port in wan_pool:
-                    fetcher.port_allocator.release_port(wan_idx, port)
-                    logger.debug(f"释放WAN接口 {wan_idx}，端口 {port}")
-            
-            # 合并所有数据
-            if not all_data:
-                logger.error("所有时间段均未获取到数据")
-                return
-            
-            # 合并所有DataFrame
-            df = pd.concat(all_data, ignore_index=True)
-            
-            # 删除可能的重复记录
-            if not df.empty:
-                # 确定去重的列，针对除权除息数据，可能的主键是ts_code和ann_date的组合
-                if all(col in df.columns for col in ["ts_code", "ann_date"]):
-                    df = df.drop_duplicates(subset=["ts_code", "ann_date"])
-                    logger.info(f"去重后数据条数: {len(df)}")
+            logger.success(f"所有日期段处理完成，总计保存 {total_saved_records} 条记录")
         else:
             # 如果没有指定日期范围，按股票代码逐个获取全部数据
             # 从stock_basic获取目标股票代码
@@ -1048,26 +1058,23 @@ def main():
             # 获取A股除权除息记录
             df = fetcher.fetch_dividend(ts_codes)
         
-        # 保存获取到的数据
-        if df is not None and not df.empty:
-            # 从stock_basic获取目标股票代码，用于过滤
-            ts_codes = fetcher.get_target_ts_codes_from_stock_basic()
-            
-            # 过滤目标股票数据
-            if ts_codes and 'ts_code' in df.columns:
-                df_filtered = df[df['ts_code'].isin(ts_codes)].copy()
-                logger.info(f"过滤后数据条数: {len(df_filtered)}")
+            # 保存获取到的数据
+            if df is not None and not df.empty:
+                # 过滤目标股票数据
+                if ts_codes and 'ts_code' in df.columns:
+                    df_filtered = df[df['ts_code'].isin(ts_codes)].copy()
+                    logger.info(f"过滤后数据条数: {len(df_filtered)}")
+                else:
+                    logger.warning("未找到目标股票代码或数据不包含ts_code列，将使用所有获取到的数据")
+                    df_filtered = df
+                
+                # 保存到MongoDB
+                if not df_filtered.empty:
+                    fetcher.save_to_mongodb(df_filtered)
+                else:
+                    logger.error("没有符合条件的A股除权除息记录可保存")
             else:
-                logger.warning("未找到目标股票代码或数据不包含ts_code列，将使用所有获取到的数据")
-                df_filtered = df
-            
-            # 保存到MongoDB
-            if not df_filtered.empty:
-                fetcher.save_to_mongodb(df_filtered)
-            else:
-                logger.error("没有符合条件的A股除权除息记录可保存")
-        else:
-            logger.error("未获取到A股除权除息记录")
+                logger.error("未获取到A股除权除息记录")
 
 
 if __name__ == "__main__":
