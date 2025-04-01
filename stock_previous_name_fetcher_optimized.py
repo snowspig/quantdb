@@ -658,7 +658,7 @@ class StockPreviousNameFetcher:
             
             elapsed = time.time() - start_time
             
-            if result and len(result) > 0:
+            if result and hasattr(result, 'inserted_ids'):
                 logger.success(f"成功保存 {len(records)} 条记录到MongoDB，耗时 {elapsed:.2f}s")
                 return True
             else:
