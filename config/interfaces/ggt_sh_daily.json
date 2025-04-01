@@ -1,19 +1,15 @@
 {
-    "source": "tushare",
-    "id": "ggt_sh_daily",
-    "api_name": "ggt_sh_daily",
-    "enabled": true,
-    "group": "market",
-    "frequency": "daily",
-    "description": "港股通(沪)每日成交",
-    "params": {
-      "start_date": "{last_week}",
-      "end_date": "{trade_date}"
-    },
-    "batch_size": 10000,
-    "index_fields": ["trade_date"],
-    "fields_to_store": [
-        "trade_date", "buy_amount", "buy_volume", "sell_amount", "sell_volume"
-    ],
-    "wan_mode": 0
-  } 
+  "description": "港股通(沪)每日成交",
+  "api_name": "ggt_sh_daily",
+  "fields": [],
+  "params": {
+  },
+  "update_frequency": "daily",
+  "update_priority": 1,
+  "index_fields": [
+      "trade_date"
+  ],
+  "available_fields": [
+    "trade_date", "buy_amount", "buy_volume", "sell_amount", "sell_volume" 
+  ]
+}

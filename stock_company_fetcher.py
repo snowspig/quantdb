@@ -1,15 +1,15 @@
 #!/usr/bin/env python
 """
-Stock Basic Fetcher - 获取股票基本信息并保存到MongoDB
+股票公司信息获取器 - 获取股票公司信息并保存到MongoDB
 
-该脚本用于从湘财Tushare获取股票基本信息，并保存到MongoDB数据库中，仅保留00、30、60、68板块的股票
+该脚本用于从湘财Tushare获取股票公司信息，并保存到MongoDB数据库中，仅保留00、30、60、68板块的股票
 
-参考接口文档：http://tushare.xcsc.com:7173/document/2?doc_id=25
+参考接口文档：http://tushare.xcsc.com:7173/document/2?doc_id=112
 
 使用方法：
-    python stock_basic_fetcher.py              # 使用湘财真实API数据，简洁日志模式
-    python stock_basic_fetcher.py --verbose     # 使用湘财真实API数据，详细日志模式
-    python stock_basic_fetcher.py --mock        # 使用模拟数据模式（API不可用时）
+    python stock_company_fetcher.py              # 使用湘财真实API数据，简洁日志模式
+    python stock_company_fetcher.py --verbose     # 使用湘财真实API数据，详细日志模式
+    python stock_company_fetcher.py --mock        # 使用模拟数据模式（API不可用时）
 """
 import os
 import sys
@@ -32,25 +32,25 @@ from data_fetcher.tushare_client import TushareClient
 from storage.mongodb_client import MongoDBClient
 from wan_manager.port_allocator import PortAllocator
 
-class StockBasicFetcher:
+class StockCompanyFetcher:
     """
-    股票基本信息获取器
-
-    该类用于从Tushare获取股票基本信息并保存到MongoDB数据库，支持按市场代码过滤
+    股票公司信息获取器
+    
+    该类用于从Tushare获取股票公司信息并保存到MongoDB数据库，支持按市场代码过滤
     """
 
     def __init__(
         self,
         config_path: str = "config/config.yaml",
         interface_dir: str = "config/interfaces",
-        interface_name: str = "stock_basic.json",
+        interface_name: str = "stock_company.json",
         target_market_codes: Set[str] = {"00", "30", "60", "68"},
         db_name: str = "tushare_data",
-        collection_name: str = "stock_basic",
+        collection_name: str = "stock_company",
         verbose: bool = False
     ):
         """
-        初始化股票基本信息获取器
+        初始化股票公司信息获取器
         
         Args:
             config_path: 配置文件路径
@@ -110,14 +110,15 @@ class StockBasicFetcher:
         
         logger.warning(f"接口配置文件不存在: {config_path}，将使用默认配置")
         return {
-            "description": "股票基本信息",
-            "api_name": "stock_basic",
+            "description": "股票公司信息",
+            "api_name": "stock_company",
             "fields": [],
             "params": {},
             "available_fields": [
-                "ts_code", "symbol", "name", "area", "industry", "fullname", 
-                "enname", "cnspell", "market", "exchange", "curr_type", 
-                "list_status", "list_date", "delist_date", "is_hs"
+                "ts_code", "province", "city", "chairman", "president", 
+                "bd_secretary", "reg_capital", "found_date", "chinese_introduction", 
+                "comp_type", "website", "email", "office", "ann_date", "country", 
+                "business_scope", "company_type", "total_employees", "main_business"
             ]
         }
 
@@ -226,16 +227,16 @@ class StockBasicFetcher:
             logger.error(f"获取WAN接口失败: {str(e)}")
             return None
 
-    def fetch_stock_basic(self) -> Optional[pd.DataFrame]:
+    def fetch_stock_company(self) -> Optional[pd.DataFrame]:
         """
-        获取股票基本信息
+        获取股票公司信息
         
         Returns:
-            股票基本信息DataFrame，如果失败则返回None
+            股票公司信息DataFrame，如果失败则返回None
         """
         try:
             # 准备参数
-            api_name = self.interface_config.get("api_name", "stock_basic")
+            api_name = self.interface_config.get("api_name", "stock_company")
             params = self.interface_config.get("params", {})
             fields = self.interface_config.get("fields", [])
             
@@ -248,13 +249,10 @@ class StockBasicFetcher:
             use_wan = wan_info is not None
             
             # 调用Tushare API
-            logger.info(f"正在从湘财Tushare获取股票基本信息...")
+            logger.info(f"正在从湘财Tushare获取股票公司信息...")
             if use_wan:
                 wan_idx, port = wan_info
                 logger.debug(f"使用WAN接口 {wan_idx} 和本地端口 {port} 请求数据")
-                
-                # 在实际应用中创建绑定到特定WAN接口的socket，但这里简化处理
-                # 因为目前环境可能无法实际绑定WAN接口，所以仅记录日志
             
             start_time = time.time()
             
@@ -288,7 +286,7 @@ class StockBasicFetcher:
                 wan_idx, port = wan_info
                 self.port_allocator.release_port(wan_idx, port)
             
-            logger.success(f"成功获取 {len(df)} 条股票基本信息，耗时 {elapsed:.2f}s")
+            logger.success(f"成功获取 {len(df)} 条股票公司信息，耗时 {elapsed:.2f}s")
             
             # 如果使用详细日志，输出数据示例
             if self.verbose and not df.empty:
@@ -297,68 +295,101 @@ class StockBasicFetcher:
             return df
             
         except Exception as e:
-            logger.error(f"获取股票基本信息失败: {str(e)}")
+            logger.error(f"获取股票公司信息失败: {str(e)}")
             import traceback
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return None
 
-    def filter_stock_data(self, df: pd.DataFrame) -> pd.DataFrame:
+    def get_target_ts_codes_from_stock_basic(self) -> Set[str]:
         """
-        过滤股票数据，只保留00、30、60和68板块的股票
+        从stock_basic集合中获取目标板块的股票代码
+        
+        Returns:
+            目标板块股票代码集合
+        """
+        try:
+            # 确保MongoDB连接
+            if not self.mongo_client.is_connected():
+                logger.warning("MongoDB未连接，尝试重新连接...")
+                if not self.mongo_client.connect():
+                    logger.error("重新连接MongoDB失败")
+                    return set()
+                
+            # 查询stock_basic集合中符合条件的股票代码
+            logger.info(f"从stock_basic集合查询目标板块 {self.target_market_codes} 的股票代码")
+            
+            # 构建查询条件：symbol前两位在target_market_codes中
+            query_conditions = []
+            for market_code in self.target_market_codes:
+                # 使用正则表达式匹配symbol前两位
+                query_conditions.append({"symbol": {"$regex": f"^{market_code}"}})
+                
+            # 使用$or操作符组合多个条件
+            query = {"$or": query_conditions} if query_conditions else {}
+            
+            # 只查询ts_code字段
+            result = self.mongo_client.find("stock_basic", query, projection={"ts_code": 1, "_id": 0})
+            
+            # 提取ts_code集合
+            ts_codes = set()
+            for doc in result:
+                if "ts_code" in doc:
+                    ts_codes.add(doc["ts_code"])
+            
+            logger.success(f"从stock_basic集合获取到 {len(ts_codes)} 个目标股票代码")
+            
+            # 输出详细日志
+            if self.verbose:
+                sample_codes = list(ts_codes)[:5] if ts_codes else []
+                logger.debug(f"样例股票代码: {sample_codes}")
+                
+            return ts_codes
+            
+        except Exception as e:
+            logger.error(f"查询stock_basic集合失败: {str(e)}")
+            import traceback
+            logger.debug(f"详细错误信息: {traceback.format_exc()}")
+            return set()
+
+    def filter_stock_company_data(self, df: pd.DataFrame, target_ts_codes: Set[str]) -> pd.DataFrame:
+        """
+        根据目标股票代码集合过滤公司数据
         
         Args:
-            df: 股票基本信息数据
+            df: 股票公司信息数据
+            target_ts_codes: 目标股票代码集合
         
         Returns:
             过滤后的数据
         """
         if df is None or df.empty:
-            logger.warning("没有股票数据可过滤")
+            logger.warning("没有股票公司数据可过滤")
             return pd.DataFrame()
         
-        logger.info(f"过滤前股票数量: {len(df)}")
+        logger.info(f"过滤前股票公司数量: {len(df)}")
         
-        # 确保symbol列存在
-        if 'symbol' not in df.columns:
-            logger.error("数据中没有symbol列，无法按市场代码过滤")
-            
-            # 尝试使用ts_code列提取symbol
-            if 'ts_code' in df.columns:
-                logger.info("尝试从ts_code列提取symbol信息")
-                # ts_code格式通常是'000001.SZ'，我们提取前6位
-                df['symbol'] = df['ts_code'].str.split('.').str[0]
-            else:
-                logger.error("数据中既没有symbol也没有ts_code列，无法过滤")
-                return df
-            
-        # 确保symbol列是字符串类型
-        df['symbol'] = df['symbol'].astype(str)
+        # 确保ts_code列存在
+        if 'ts_code' not in df.columns:
+            logger.error("数据中没有ts_code列，无法按股票代码过滤")
+            return df
         
-        # 提取前两位作为市场代码并过滤，并创建显式副本避免SettingWithCopyWarning
-        df_filtered = df[df['symbol'].str[:2].isin(self.target_market_codes)].copy()
+        # 过滤数据
+        df_filtered = df[df['ts_code'].isin(target_ts_codes)].copy()
         
         # 输出过滤统计信息
-        logger.info(f"过滤后股票数量: {len(df_filtered)}")
+        logger.info(f"过滤后股票公司数量: {len(df_filtered)}")
         
         # 详细统计信息
         if self.verbose:
-            # 统计各市场代码股票数量
-            market_codes = df['symbol'].str[:2].value_counts().to_dict()
-            logger.debug("原始数据市场代码分布:")
-            for code, count in sorted(market_codes.items()):
-                in_target = "✓" if code in self.target_market_codes else "✗"
-                logger.debug(f"  {code}: {count} 股票 {in_target}")
-            
-            # 统计保留的市场代码
-            filtered_codes = df_filtered['symbol'].str[:2].value_counts().to_dict()
-            logger.debug("保留的市场代码分布:")
-            for code, count in sorted(filtered_codes.items()):
-                logger.debug(f"  {code}: {count} 股票")
-            
-            # 检查是否有目标市场代码未出现在数据中
-            missing_codes = self.target_market_codes - set(market_codes.keys())
-            if missing_codes:
-                logger.warning(f"数据中缺少以下目标市场代码: {missing_codes}")
+            # 统计各市场的股票数量
+            if not df_filtered.empty and 'ts_code' in df_filtered.columns:
+                # 从ts_code提取市场代码
+                df_filtered['market_code'] = df_filtered['ts_code'].str[:6].str[:2]
+                market_stats = df_filtered['market_code'].value_counts().to_dict()
+                
+                logger.debug("过滤后各市场代码分布:")
+                for code, count in sorted(market_stats.items()):
+                    logger.debug(f"  {code}: {count} 公司")
         
         return df_filtered
     
@@ -419,31 +450,30 @@ class StockBasicFetcher:
                     # 根据接口配置中的index_fields创建索引
                     index_fields = self.interface_config.get("index_fields", [])
                     if index_fields:
-                        # 检查是否包含ts_code和symbol作为索引字段
-                        if "ts_code" in index_fields and "symbol" in index_fields:
-                            # 创建唯一复合索引防止重复
+                        # 检查是否有ts_code作为唯一标识
+                        if "ts_code" in index_fields:
+                            # 创建唯一索引以防止重复数据
                             collection.create_index(
-                                [("ts_code", 1), ("symbol", 1)],
+                                [("ts_code", 1)],
                                 unique=True,
                                 background=True
                             )
-                            logger.debug("已为字段组合 (ts_code, symbol) 创建唯一复合索引")
+                            logger.debug("已为字段 ts_code 创建唯一索引")
                             
-                            # 移除已处理的字段，避免重复创建索引
-                            remaining_fields = [f for f in index_fields if f not in ["ts_code", "symbol"]]
+                            # 为其他字段创建普通索引
+                            remaining_fields = [f for f in index_fields if f != "ts_code"]
                             for field in remaining_fields:
                                 collection.create_index(field)
                                 logger.debug(f"已为字段 {field} 创建索引")
                         else:
-                            # 单独为每个字段创建索引
+                            # 为所有字段创建常规索引
                             for field in index_fields:
-                                collection.create_index(field, unique=(field in ["ts_code", "symbol"]))
-                                logger.debug(f"已为字段 {field} 创建{'唯一' if field in ['ts_code', 'symbol'] else ''}索引")
+                                collection.create_index(field)
+                                logger.debug(f"已为字段 {field} 创建索引")
                     else:
-                        # 默认为ts_code和symbol创建唯一索引
+                        # 默认为ts_code创建唯一索引
                         collection.create_index("ts_code", unique=True)
-                        collection.create_index("symbol")
-                        logger.debug("已为默认字段创建索引，ts_code设置为唯一索引")
+                        logger.debug("已为默认字段ts_code创建唯一索引")
                 except Exception as e:
                     logger.warning(f"创建索引时出错: {str(e)}")
                 
@@ -466,16 +496,22 @@ class StockBasicFetcher:
         Returns:
             是否成功
         """
-        # 获取数据
-        df = self.fetch_stock_basic()
-        if df is None or df.empty:
-            logger.error("获取股票基本信息失败")
+        # 从stock_basic集合获取目标股票代码
+        target_ts_codes = self.get_target_ts_codes_from_stock_basic()
+        if not target_ts_codes:
+            logger.error("未能从stock_basic集合获取目标股票代码")
             return False
             
-        # 过滤数据
-        filtered_df = self.filter_stock_data(df)
+        # 获取股票公司信息数据
+        df = self.fetch_stock_company()
+        if df is None or df.empty:
+            logger.error("获取股票公司信息失败")
+            return False
+            
+        # 过滤数据，只保留目标股票
+        filtered_df = self.filter_stock_company_data(df, target_ts_codes)
         if filtered_df.empty:
-            logger.warning("过滤后没有符合条件的股票数据")
+            logger.warning("过滤后没有符合条件的股票公司数据")
             return False
             
         # Removed update_time field to prevent duplicate data
@@ -491,61 +527,48 @@ class StockBasicFetcher:
 
 def create_mock_data() -> pd.DataFrame:
     """创建模拟数据用于测试"""
-    logger.info("创建模拟股票基本信息数据用于测试")
+    logger.info("创建模拟股票公司信息数据用于测试")
     
     # 创建模拟数据
     data = [
-        {'ts_code': '000001.SZ', 'symbol': '000001', 'name': '平安银行', 'exchange': 'SZSE', 'list_date': '19910403'},
-        {'ts_code': '000002.SZ', 'symbol': '000002', 'name': '万科A', 'exchange': 'SZSE', 'list_date': '19910129'},
-        {'ts_code': '000063.SZ', 'symbol': '000063', 'name': '中兴通讯', 'exchange': 'SZSE', 'list_date': '19971118'},
-        {'ts_code': '000338.SZ', 'symbol': '000338', 'name': '潍柴动力', 'exchange': 'SZSE', 'list_date': '20070430'},
-        {'ts_code': '000651.SZ', 'symbol': '000651', 'name': '格力电器', 'exchange': 'SZSE', 'list_date': '19960801'},
-        {'ts_code': '000725.SZ', 'symbol': '000725', 'name': '京东方A', 'exchange': 'SZSE', 'list_date': '19970710'},
-        {'ts_code': '000858.SZ', 'symbol': '000858', 'name': '五粮液', 'exchange': 'SZSE', 'list_date': '19980827'},
-        {'ts_code': '300059.SZ', 'symbol': '300059', 'name': '东方财富', 'exchange': 'SZSE', 'list_date': '20100115'},
-        {'ts_code': '300750.SZ', 'symbol': '300750', 'name': '宁德时代', 'exchange': 'SZSE', 'list_date': '20180611'},
-        {'ts_code': '600000.SH', 'symbol': '600000', 'name': '浦发银行', 'exchange': 'SSE', 'list_date': '19991110'},
-        {'ts_code': '600036.SH', 'symbol': '600036', 'name': '招商银行', 'exchange': 'SSE', 'list_date': '20021109'},
-        {'ts_code': '600276.SH', 'symbol': '600276', 'name': '恒瑞医药', 'exchange': 'SSE', 'list_date': '20001018'},
-        {'ts_code': '600519.SH', 'symbol': '600519', 'name': '贵州茅台', 'exchange': 'SSE', 'list_date': '20010827'},
-        {'ts_code': '600887.SH', 'symbol': '600887', 'name': '伊利股份', 'exchange': 'SSE', 'list_date': '19960403'},
-        {'ts_code': '601318.SH', 'symbol': '601318', 'name': '中国平安', 'exchange': 'SSE', 'list_date': '20070301'},
-        {'ts_code': '601857.SH', 'symbol': '601857', 'name': '中国石油', 'exchange': 'SSE', 'list_date': '20071105'},
-        {'ts_code': '601888.SH', 'symbol': '601888', 'name': '中国中免', 'exchange': 'SSE', 'list_date': '20091026'},
-        {'ts_code': '603288.SH', 'symbol': '603288', 'name': '海天味业', 'exchange': 'SSE', 'list_date': '20140211'},
-        {'ts_code': '603501.SH', 'symbol': '603501', 'name': '韦尔股份', 'exchange': 'SSE', 'list_date': '20170504'},
-        {'ts_code': '688981.SH', 'symbol': '688981', 'name': '中芯国际', 'exchange': 'SSE', 'list_date': '20200716'}
+        {'ts_code': '000001.SZ', 'province': '广东', 'city': '深圳', 'chairman': '谢永林', 'reg_capital': '194.05亿', 'found_date': '19870922', 'website': 'www.bank.pingan.com', 'main_business': '货币银行服务'},
+        {'ts_code': '000002.SZ', 'province': '广东', 'city': '深圳', 'chairman': '郁亮', 'reg_capital': '115.25亿', 'found_date': '19840530', 'website': 'www.vanke.com', 'main_business': '房地产开发'},
+        {'ts_code': '300059.SZ', 'province': '上海', 'city': '上海', 'chairman': '其实', 'reg_capital': '87.13亿', 'found_date': '20050518', 'website': 'www.eastmoney.com', 'main_business': '互联网信息服务'},
+        {'ts_code': '300750.SZ', 'province': '福建', 'city': '宁德', 'chairman': '曾毓群', 'reg_capital': '23.29亿', 'found_date': '20110915', 'website': 'www.catl.com', 'main_business': '锂离子电池制造'},
+        {'ts_code': '600000.SH', 'province': '上海', 'city': '上海', 'chairman': '郑杨', 'reg_capital': '293.52亿', 'found_date': '19920809', 'website': 'www.spdb.com.cn', 'main_business': '货币银行服务'},
+        {'ts_code': '600519.SH', 'province': '贵州', 'city': '贵阳', 'chairman': '丁雄军', 'reg_capital': '125.56亿', 'found_date': '19990901', 'website': 'www.moutaichina.com', 'main_business': '白酒生产'},
+        {'ts_code': '688981.SH', 'province': '上海', 'city': '上海', 'chairman': '高永岗', 'reg_capital': '45.28亿', 'found_date': '20151217', 'website': 'www.smics.com', 'main_business': '集成电路芯片制造'}
     ]
-
     
     # 转换为DataFrame
     df = pd.DataFrame(data)
     
     # 添加其他字段，确保与实际API返回的数据结构一致
-    df['delist_date'] = pd.NA
-    df['comp_name'] = df['name']
-    df['comp_name_en'] = ''
-    df['isin_code'] = ''
-    df['list_board'] = ''
-    df['crncy_code'] = 'CNY'
-    df['pinyin'] = ''
-    df['list_board_name'] = ''
-    df['is_shsc'] = 'N'
-    df['comp_code'] = df['symbol']
+    df['president'] = ''
+    df['bd_secretary'] = ''
+    df['chinese_introduction'] = '这是一个模拟的公司简介'
+    df['comp_type'] = '1'
+    df['email'] = 'contact@example.com'
+    df['office'] = ''
+    df['ann_date'] = datetime.now().strftime('%Y%m%d')
+    df['country'] = '中国'
+    df['business_scope'] = '这是一个模拟的经营范围描述'
+    df['company_type'] = '1'
+    df['total_employees'] = '1000'
     
-    logger.success(f"已创建 {len(df)} 条模拟股票数据")
+    logger.success(f"已创建 {len(df)} 条模拟股票公司数据")
     return df
 
 def main():
     """主函数"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='获取股票基本信息并保存到MongoDB')
+    parser = argparse.ArgumentParser(description='获取股票公司信息并保存到MongoDB')
     parser.add_argument('--config', default='config/config.yaml', help='配置文件路径')
     parser.add_argument('--interface-dir', default='config/interfaces', help='接口配置文件目录')
     parser.add_argument('--market-codes', default='00,30,60,68', help='目标市场代码，用逗号分隔')
     parser.add_argument('--db-name', default='tushare_data', help='MongoDB数据库名称')
-    parser.add_argument('--collection-name', default='stock_basic', help='MongoDB集合名称')
+    parser.add_argument('--collection-name', default='stock_company', help='MongoDB集合名称')
     parser.add_argument('--verbose', action='store_true', help='输出详细日志')
     parser.add_argument('--mock', action='store_false', dest='use_real_api', help='使用模拟数据（当API不可用时）')
     parser.add_argument('--use-real-api', action='store_true', default=True, help='使用湘财真实API数据（默认）')
@@ -556,7 +579,7 @@ def main():
     target_market_codes = set(args.market_codes.split(','))
     
     # 创建获取器并运行
-    fetcher = StockBasicFetcher(
+    fetcher = StockCompanyFetcher(
         config_path=args.config,
         interface_dir=args.interface_dir,
         target_market_codes=target_market_codes,
@@ -573,10 +596,16 @@ def main():
         logger.info("使用模拟数据模式")
         # 创建模拟数据
         df = create_mock_data()
+        # 获取目标股票代码
+        target_ts_codes = fetcher.get_target_ts_codes_from_stock_basic()
+        if not target_ts_codes:
+            # 模拟模式下，如果无法获取真实股票代码，使用模拟数据中的所有代码
+            target_ts_codes = set(df['ts_code'].tolist())
+            logger.warning("无法从数据库获取股票代码，使用模拟数据中的所有代码")
         # 过滤数据
-        filtered_df = fetcher.filter_stock_data(df)
+        filtered_df = fetcher.filter_stock_company_data(df, target_ts_codes)
         if filtered_df.empty:
-            logger.warning("过滤后没有符合条件的股票数据")
+            logger.warning("过滤后没有符合条件的股票公司数据")
             sys.exit(1)
         # Removed update_time field to prevent duplicate data
         # 是否实际保存

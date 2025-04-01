@@ -1,17 +1,16 @@
 {
-    "source": "tushare",
-    "id": "suspend",
-    "api_name": "suspend",
-    "enabled": true,
-    "group": "market",
-    "frequency": "daily",
     "description": "股票停牌数据",
-    "params": {},
-    "batch_size": 10000,
-    "index_fields": ["ts_code", "suspend_date"],
-    "fields_to_store": [
+    "api_name": "suspend",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code", "suspend_date"
+    ],
+    "available_fields": [
         "ts_code", "suspend_date", "suspend_type", "resump_date", 
         "change_reason", "suspend_time", "change_reason_type"
-    ],
-    "wan_mode": 0
-  } 
+    ]
+}
