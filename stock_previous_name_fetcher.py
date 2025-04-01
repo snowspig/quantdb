@@ -624,7 +624,7 @@ class StockPreviousNameFetcher:
         
         Args:
             df: 待保存的DataFrame
-            replace_existing: 是否替换现有数据，默认为True
+            replace_existing: 是否替换现有数据，此参数已不再使用，保留是为了向后兼容
             
         Returns:
             是否成功保存
@@ -640,9 +640,6 @@ class StockPreviousNameFetcher:
             # 将DataFrame转换为记录列表
             records = df.to_dict('records')
             
-            # 保存到MongoDB
-            start_time = time.time()
-            
             # 确保MongoDB连接
             if not self.mongo_client.is_connected():
                 logger.warning("MongoDB未连接，尝试重新连接...")
@@ -650,65 +647,64 @@ class StockPreviousNameFetcher:
                     logger.error("重新连接MongoDB失败")
                     return False
             
-            # 如果需要替换现有数据，只删除与当前数据相同时间段的数据
-            if replace_existing:
-                # 获取数据的日期范围
-                min_date = None
-                max_date = None
-                
-                # 检查是否有begindate字段作为日期判断
-                if 'begindate' in df.columns:
-                    min_date = df['begindate'].min() if not df.empty else None
-                    max_date = df['begindate'].max() if not df.empty else None
-                # 如果没有begindate，尝试查找ann_dt字段
-                elif 'ann_dt' in df.columns:
-                    min_date = df['ann_dt'].min() if not df.empty else None
-                    max_date = df['ann_dt'].max() if not df.empty else None
-                
-                if min_date and max_date:
-                    # 构建查询条件，删除日期范围内的记录
-                    query = {}
-                    if 'begindate' in df.columns:
-                        query = {
-                            "begindate": {
-                                "$gte": min_date,
-                                "$lte": max_date
-                            }
-                        }
-                    elif 'ann_dt' in df.columns:
-                        query = {
-                            "ann_dt": {
-                                "$gte": min_date,
-                                "$lte": max_date
-                            }
-                        }
-                    
-                    # 只删除日期范围内的数据
-                    self.mongo_client.delete_many(self.collection_name, query)
-                    logger.info(f"已删除集合 {self.collection_name} 中日期范围 {min_date} 至 {max_date} 的现有数据")
-                else:
-                    # 如果无法确定日期范围，则不删除数据，改为直接更新
-                    logger.warning("无法确定数据日期范围，将直接插入数据而不删除现有数据")
+            # 直接获取数据库和集合
+            db = self.mongo_client.get_db(self.db_name)
+            collection = db[self.collection_name]
             
-            # 插入新数据
-            result = self.mongo_client.insert_many(self.collection_name, records)
+            # 统计计数器
+            inserted_count = 0
+            skipped_count = 0
+            
+            start_time = time.time()
+            
+            # 逐条检查记录是否存在，只插入不存在的记录
+            for record in records:
+                # 构建查询条件：使用ts_code和begindate作为唯一标识
+                query = {}
+                
+                # 根据可用字段构建查询条件
+                if "ts_code" in record and "begindate" in record:
+                    query = {
+                        "ts_code": record["ts_code"],
+                        "begindate": record["begindate"]
+                    }
+                elif "ts_code" in record and "ann_dt" in record:
+                    query = {
+                        "ts_code": record["ts_code"],
+                        "ann_dt": record["ann_dt"]
+                    }
+                elif "ts_code" in record:
+                    # 只有ts_code可用时，使用所有可用字段组合查询
+                    query = {"ts_code": record["ts_code"]}
+                    # 添加其他可能的字段
+                    for field in ["s_info_name", "enddate"]:
+                        if field in record and record[field]:
+                            query[field] = record[field]
+                
+                # 检查记录是否存在
+                if query and collection.find_one(query):
+                    # 记录已存在，跳过
+                    skipped_count += 1
+                    continue
+                
+                # 记录不存在，插入新记录
+                collection.insert_one(record)
+                inserted_count += 1
             
             elapsed = time.time() - start_time
             
-            if result and hasattr(result, 'inserted_ids'):
-                # 创建索引 - 使用接口配置的index_fields
-                try:
-                    # 直接获取数据库并从中获取集合
-                    db = self.mongo_client.get_db(self.db_name)
-                    collection = db[self.collection_name]
-                    
-                    # 根据接口配置中的index_fields创建索引
-                    index_fields = self.interface_config.get("index_fields", [])
-                    if index_fields:
-                        for field in index_fields:
-                            # 为ts_code和begindate创建复合唯一索引
-                            if field in ["ts_code", "begindate"]:
-                                if all(f in df.columns for f in ["ts_code", "begindate"]):
+            # 创建索引 - 使用接口配置的index_fields
+            try:
+                # 根据接口配置中的index_fields创建索引
+                index_fields = self.interface_config.get("index_fields", [])
+                if index_fields:
+                    for field in index_fields:
+                        # 为ts_code和begindate创建复合唯一索引
+                        if field in ["ts_code", "begindate"]:
+                            if all(f in df.columns for f in ["ts_code", "begindate"]):
+                                # 检查索引是否已存在
+                                existing_indexes = collection.index_information()
+                                if "ts_code_1_begindate_1" not in existing_indexes:
                                     # 创建复合唯一索引
                                     collection.create_index(
                                         [("ts_code", 1), ("begindate", 1)],
@@ -716,25 +712,24 @@ class StockPreviousNameFetcher:
                                         background=True
                                     )
                                     logger.debug(f"已为字段组合 (ts_code, begindate) 创建唯一复合索引")
-                                    break  # 因为两个字段都处理了，所以跳出循环
-                                else:
-                                    # 如果缺少某些字段，则为现有的字段创建普通索引
-                                    collection.create_index([(field, 1)])
-                                    logger.debug(f"已为字段 {field} 创建索引")
+                                break  # 因为两个字段都处理了，所以跳出循环
                             else:
+                                # 如果缺少某些字段，则为现有的字段创建普通索引
                                 collection.create_index([(field, 1)])
                                 logger.debug(f"已为字段 {field} 创建索引")
-                    else:
-                        # 默认为ts_code创建索引
-                        collection.create_index("ts_code")
-                        logger.debug("已为默认字段ts_code创建索引")
-                except Exception as e:
-                    logger.warning(f"创建索引时出错: {str(e)}")
-                logger.success(f"成功保存 {len(records)} 条记录到MongoDB，耗时 {elapsed:.2f}s")
-                return True
-            else:
-                logger.error("保存数据到MongoDB失败")
-                return False
+                        else:
+                            collection.create_index([(field, 1)])
+                            logger.debug(f"已为字段 {field} 创建索引")
+                else:
+                    # 默认为ts_code创建索引
+                    collection.create_index("ts_code")
+                    logger.debug("已为默认字段ts_code创建索引")
+            except Exception as e:
+                logger.warning(f"创建索引时出错: {str(e)}")
+            
+            total_processed = inserted_count + skipped_count
+            logger.success(f"数据处理完成: 新插入 {inserted_count} 条记录，跳过 {skipped_count} 条重复记录，共处理 {total_processed} 条记录，耗时 {elapsed:.2f}s")
+            return inserted_count > 0 or skipped_count > 0
                 
         except Exception as e:
             logger.error(f"保存数据到MongoDB失败: {str(e)}")

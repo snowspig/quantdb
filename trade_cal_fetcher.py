@@ -359,9 +359,6 @@ class TradeCalFetcher:
             # 将DataFrame转换为记录列表
             records = df.to_dict('records')
             
-            # 保存到MongoDB
-            start_time = time.time()
-            
             # 确保MongoDB连接
             if not self.mongo_client.is_connected():
                 logger.warning("MongoDB未连接，尝试重新连接...")
@@ -373,71 +370,55 @@ class TradeCalFetcher:
             if self.verbose:
                 logger.debug(f"删除集合 {self.db_name}.{self.collection_name} 中与当前日期范围重叠的数据")
             
-            # 生成重叠条件：cal_date 在当前日期范围内
-            # 注意：假设数据中有cal_date字段表示日期
+            # 生成重叠条件：trade_date 在当前日期范围内
             overlap_query = {
-                "cal_date": {
+                "trade_date": {
                     "$gte": self.start_date,
                     "$lte": self.end_date
                 }
             }
+            
+            # 先删除重叠的日期记录
             self.mongo_client.delete_many(self.collection_name, overlap_query, self.db_name)
             
             # 批量插入新数据
             if self.verbose:
                 logger.debug(f"向集合 {self.db_name}.{self.collection_name} 插入 {len(records)} 条记录")
                 
+            start_time = time.time()
             result = self.mongo_client.insert_many(self.collection_name, records, self.db_name)
             
             elapsed = time.time() - start_time
-            inserted_count = len(result.inserted_ids) if result else 0
+            inserted_count = len(result.inserted_ids) if result and hasattr(result, 'inserted_ids') else 0
             
             if inserted_count > 0:
-                # 创建索引 - 修正获取集合的方式
+                logger.success(f"成功保存 {inserted_count} 条记录到 MongoDB: {self.db_name}.{self.collection_name}，耗时 {elapsed:.2f}s")
+                
+                # 确保索引存在
                 try:
-                    # 直接获取数据库并从中获取集合，避免混淆参数顺序
+                    # 直接获取数据库并从中获取集合
                     db = self.mongo_client.get_db(self.db_name)
                     collection = db[self.collection_name]
                     
-                    # 根据接口配置中的index_fields创建索引
-                    index_fields = self.interface_config.get("index_fields", [])
-                    if index_fields:
-                        # 对于交易日历，cal_date和exchange的组合应该是唯一的
-                        if "cal_date" in index_fields or "trade_date" in index_fields:
-                            date_field = "cal_date" if "cal_date" in index_fields else "trade_date"
-                            # 创建复合唯一索引
-                            collection.create_index(
-                                [(date_field, 1), ("exchange", 1)],
-                                unique=True,
-                                background=True
-                            )
-                            logger.debug(f"已为字段组合 ({date_field}, exchange) 创建唯一复合索引")
-                            
-                            # 为其他字段创建普通索引
-                            remaining_fields = [f for f in index_fields if f != date_field and f != "exchange"]
-                            for field in remaining_fields:
-                                collection.create_index(field)
-                                logger.debug(f"已为字段 {field} 创建索引")
-                        else:
-                            # 没有日期字段时，为所有字段创建普通索引
-                            for field in index_fields:
-                                collection.create_index(field)
-                                logger.debug(f"已为字段 {field} 创建索引")
-                    else:
-                        # 默认为cal_date和exchange创建唯一复合索引
+                    # 使用listIndexes检查索引是否已存在
+                    existing_indexes = collection.index_information()
+                    if "trade_date_1_exchange_1" not in existing_indexes:
+                        # 创建复合唯一索引
                         collection.create_index(
-                            [("cal_date", 1), ("exchange", 1)],
+                            [("trade_date", 1), ("exchange", 1)],
                             unique=True,
                             background=True
                         )
-                        logger.debug("已为默认字段组合 (cal_date, exchange) 创建唯一复合索引")
+                        logger.debug("已为字段组合 (trade_date, exchange) 创建唯一复合索引")
+                    else:
+                        logger.debug("索引 trade_date_1_exchange_1 已存在，无需创建")
+                    
                 except Exception as e:
-                    logger.warning(f"创建索引时出错: {str(e)}")
+                    logger.warning(f"检查或创建索引时出错: {str(e)}")
                 
-                logger.success(f"成功将 {inserted_count} 条记录保存到 MongoDB: {self.db_name}.{self.collection_name}，耗时 {elapsed:.2f}s")
                 return True
             else:
-                logger.error(f"保存到MongoDB失败，未插入任何记录")
+                logger.error(f"保存到MongoDB失败，未成功保存任何记录")
                 return False
                 
         except Exception as e:

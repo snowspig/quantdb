@@ -758,95 +758,6 @@ class StockManagersFetcher:
             import traceback
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return None
-        try:
-            # 如果未提供股票代码集合，从stock_basic获取
-            if ts_codes is None:
-                ts_codes = self.get_target_ts_codes_from_stock_basic()
-                
-            if not ts_codes:
-                logger.error("未获取到股票代码，无法获取上市公司管理层信息")
-                return None
-                
-            # 打印股票代码数量
-            logger.info(f"开始获取 {len(ts_codes)} 只股票的上市公司管理层数据")
-            
-            all_data = []
-            
-            # 如果有多WAN接口支持，创建接口池
-            wan_pool = []
-            if self.port_allocator:
-                # 获取所有可用的WAN接口索引
-                indices = self.port_allocator.get_available_wan_indices()
-                if indices:
-                    for idx in indices:
-                        # 为每个WAN接口分配一个端口
-                        port = self.port_allocator.allocate_port(idx)
-                        if port:
-                            wan_pool.append((idx, port))
-                            logger.info(f"WAN池添加接口 {idx}，端口 {port}")
-            
-            # 确定是否可以使用多WAN接口
-            use_wan_pool = len(wan_pool) > 0
-            
-            # 并行获取各股票的数据
-            start_time = time.time()
-            logger.info(f"开始并行获取上市公司管理层数据，共 {len(ts_codes)} 只股票")
-            
-            # 准备提交并行任务
-            futures = []
-            
-            # 将股票代码列表转为列表并排序，确保每次执行结果一致
-            ts_code_list = sorted(list(ts_codes))
-            
-            for i, ts_code in enumerate(ts_code_list):
-                # 如果有WAN池，轮询使用不同的WAN接口
-                if use_wan_pool:
-                    wan_info = wan_pool[i % len(wan_pool)]
-                    logger.info(f"使用WAN池中的接口 {wan_info[0]}，端口 {wan_info[1]} 获取股票 {ts_code} 的数据")
-                else:
-                    wan_info = None
-                
-                # 提交任务到线程池
-                future = self.executor.submit(self._fetch_data_for_code, ts_code, wan_info)
-                futures.append(future)
-            
-            # 收集结果
-            for future in futures:
-                df = future.result()  # 等待任务完成并获取结果
-                if df is not None and not df.empty:
-                    all_data.append(df)
-            
-            # 释放WAN端口池
-            if use_wan_pool:
-                for wan_idx, port in wan_pool:
-                    self.port_allocator.release_port(wan_idx, port)
-                    logger.debug(f"释放WAN接口 {wan_idx}，端口 {port}")
-            
-            # 合并所有数据
-            if not all_data:
-                logger.error("所有股票均未获取到数据")
-                return None
-            
-            # 合并所有DataFrame
-            df_combined = pd.concat(all_data, ignore_index=True)
-            
-            # 删除可能的重复记录
-            if not df_combined.empty:
-                # 确定去重的列，针对管理层数据，可能的主键是ts_code, name和begin_date的组合
-                if all(col in df_combined.columns for col in ["ts_code", "name", "begin_date"]):
-                    df_combined = df_combined.drop_duplicates(subset=["ts_code", "name", "begin_date"])
-                    logger.info(f"去重后数据条数: {len(df_combined)}")
-            
-            elapsed = time.time() - start_time
-            logger.success(f"成功获取所有股票的上市公司管理层信息，共 {len(df_combined)} 条记录，总耗时 {elapsed:.2f}s")
-            
-            return df_combined
-            
-        except Exception as e:
-            logger.error(f"获取上市公司管理层信息失败: {str(e)}")
-            import traceback
-            logger.debug(f"详细错误信息: {traceback.format_exc()}")
-            return None
 
     def save_to_mongodb(self, df: pd.DataFrame, replace_existing=True) -> bool:
         """
@@ -854,7 +765,7 @@ class StockManagersFetcher:
         
         Args:
             df: 待保存的DataFrame
-            replace_existing: 是否替换现有数据，默认为True
+            replace_existing: 是否替换现有数据，此参数已不再使用，保留是为了向后兼容
             
         Returns:
             是否成功保存
@@ -894,9 +805,6 @@ class StockManagersFetcher:
             # 将DataFrame转换为记录列表
             records = df.to_dict('records')
             
-            # 保存到MongoDB
-            start_time = time.time()
-            
             # 确保MongoDB连接
             if not self.mongo_client.is_connected():
                 logger.warning("MongoDB未连接，尝试重新连接...")
@@ -904,31 +812,66 @@ class StockManagersFetcher:
                     logger.error("重新连接MongoDB失败")
                     return False
             
-            # 如果需要替换现有数据，则先删除集合
-            if replace_existing:
-                self.mongo_client.delete_many(self.collection_name, {})
-                logger.info(f"已清空集合 {self.collection_name} 的现有数据")
+            # 直接获取数据库和集合
+            db = self.mongo_client.get_db(self.db_name)
+            collection = db[self.collection_name]
             
-            # 插入新数据
-            result = self.mongo_client.insert_many(self.collection_name, records)
+            # 统计计数器
+            inserted_count = 0
+            skipped_count = 0
+            
+            start_time = time.time()
+            
+            # 逐条检查记录是否存在，只插入不存在的记录
+            for record in records:
+                # 构建查询条件：使用ts_code、name和begin_date作为唯一标识
+                query = {}
+                
+                # 根据可用字段构建查询条件
+                if all(field in record for field in ["ts_code", "name", "begin_date"]):
+                    query = {
+                        "ts_code": record["ts_code"],
+                        "name": record["name"],
+                        "begin_date": record["begin_date"]
+                    }
+                elif all(field in record for field in ["ts_code", "name"]):
+                    query = {
+                        "ts_code": record["ts_code"],
+                        "name": record["name"]
+                    }
+                elif "ts_code" in record:
+                    # 只有ts_code可用时，使用所有可用字段组合查询
+                    query = {"ts_code": record["ts_code"]}
+                    # 添加其他可能的字段
+                    for field in ["title", "gender", "edu", "end_date"]:
+                        if field in record and record[field]:
+                            query[field] = record[field]
+                
+                # 检查记录是否存在
+                if query and collection.find_one(query):
+                    # 记录已存在，跳过
+                    skipped_count += 1
+                    continue
+                
+                # 记录不存在，插入新记录
+                collection.insert_one(record)
+                inserted_count += 1
             
             elapsed = time.time() - start_time
             
-            if result and hasattr(result, 'inserted_ids'):
-                # 创建索引 - 使用接口配置的index_fields
-                try:
-                    # 直接获取数据库并从中获取集合
-                    db = self.mongo_client.get_db(self.db_name)
-                    collection = db[self.collection_name]
-                    
-                    # 根据接口配置中的index_fields创建索引
-                    index_fields = self.interface_config.get("index_fields", [])
-                    if index_fields:
-                        for field in index_fields:
-                            # 为字段创建索引，对于复合主键使用unique索引
-                            if field in ["ts_code", "name", "begin_date", "title", "end_date"]:
-                                # 创建unique索引进行去重
-                                if all(f in df.columns for f in ["ts_code", "name", "begin_date"]):
+            # 创建索引 - 使用接口配置的index_fields
+            try:
+                # 根据接口配置中的index_fields创建索引
+                index_fields = self.interface_config.get("index_fields", [])
+                if index_fields:
+                    for field in index_fields:
+                        # 为字段创建索引，对于复合主键使用unique索引
+                        if field in ["ts_code", "name", "begin_date", "title", "end_date"]:
+                            # 创建unique索引进行去重
+                            if all(f in df.columns for f in ["ts_code", "name", "begin_date"]):
+                                # 检查索引是否已存在
+                                existing_indexes = collection.index_information()
+                                if "ts_code_1_name_1_begin_date_1" not in existing_indexes:
                                     # 创建复合唯一索引
                                     collection.create_index(
                                         [("ts_code", 1), ("name", 1), ("begin_date", 1)], 
@@ -936,24 +879,23 @@ class StockManagersFetcher:
                                         background=True
                                     )
                                     logger.debug(f"已为字段组合 (ts_code, name, begin_date) 创建唯一复合索引")
-                                else:
-                                    # 如果缺少某些字段，则为现有的字段创建普通索引
-                                    collection.create_index([(field, 1)])
-                                    logger.debug(f"已为字段 {field} 创建索引")
                             else:
+                                # 如果缺少某些字段，则为现有的字段创建普通索引
                                 collection.create_index([(field, 1)])
                                 logger.debug(f"已为字段 {field} 创建索引")
-                    else:
-                        # 默认为ts_code创建索引
-                        collection.create_index("ts_code")
-                        logger.debug("已为默认字段ts_code创建索引")
-                except Exception as e:
-                    logger.warning(f"创建索引时出错: {str(e)}")
-                logger.success(f"成功保存 {len(records)} 条记录到MongoDB，耗时 {elapsed:.2f}s")
-                return True
-            else:
-                logger.error("保存数据到MongoDB失败")
-                return False
+                        else:
+                            collection.create_index([(field, 1)])
+                            logger.debug(f"已为字段 {field} 创建索引")
+                else:
+                    # 默认为ts_code创建索引
+                    collection.create_index("ts_code")
+                    logger.debug("已为默认字段ts_code创建索引")
+            except Exception as e:
+                logger.warning(f"创建索引时出错: {str(e)}")
+            
+            total_processed = inserted_count + skipped_count
+            logger.success(f"数据处理完成: 新插入 {inserted_count} 条记录，跳过 {skipped_count} 条重复记录，共处理 {total_processed} 条记录，耗时 {elapsed:.2f}s")
+            return inserted_count > 0 or skipped_count > 0
                 
         except Exception as e:
             logger.error(f"保存数据到MongoDB失败: {str(e)}")
