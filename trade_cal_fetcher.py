@@ -402,11 +402,35 @@ class TradeCalFetcher:
                     # 根据接口配置中的index_fields创建索引
                     index_fields = self.interface_config.get("index_fields", [])
                     if index_fields:
-                        for field in index_fields:
-                            collection.create_index(field)
-                            logger.debug(f"已为字段 {field} 创建索引")
-                    
-                    # Removed update_time index creation to prevent duplicate data
+                        # 对于交易日历，cal_date和exchange的组合应该是唯一的
+                        if "cal_date" in index_fields or "trade_date" in index_fields:
+                            date_field = "cal_date" if "cal_date" in index_fields else "trade_date"
+                            # 创建复合唯一索引
+                            collection.create_index(
+                                [(date_field, 1), ("exchange", 1)],
+                                unique=True,
+                                background=True
+                            )
+                            logger.debug(f"已为字段组合 ({date_field}, exchange) 创建唯一复合索引")
+                            
+                            # 为其他字段创建普通索引
+                            remaining_fields = [f for f in index_fields if f != date_field and f != "exchange"]
+                            for field in remaining_fields:
+                                collection.create_index(field)
+                                logger.debug(f"已为字段 {field} 创建索引")
+                        else:
+                            # 没有日期字段时，为所有字段创建普通索引
+                            for field in index_fields:
+                                collection.create_index(field)
+                                logger.debug(f"已为字段 {field} 创建索引")
+                    else:
+                        # 默认为cal_date和exchange创建唯一复合索引
+                        collection.create_index(
+                            [("cal_date", 1), ("exchange", 1)],
+                            unique=True,
+                            background=True
+                        )
+                        logger.debug("已为默认字段组合 (cal_date, exchange) 创建唯一复合索引")
                 except Exception as e:
                     logger.warning(f"创建索引时出错: {str(e)}")
                 

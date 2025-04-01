@@ -915,6 +915,40 @@ class StockManagersFetcher:
             elapsed = time.time() - start_time
             
             if result and hasattr(result, 'inserted_ids'):
+                # 创建索引 - 使用接口配置的index_fields
+                try:
+                    # 直接获取数据库并从中获取集合
+                    db = self.mongo_client.get_db(self.db_name)
+                    collection = db[self.collection_name]
+                    
+                    # 根据接口配置中的index_fields创建索引
+                    index_fields = self.interface_config.get("index_fields", [])
+                    if index_fields:
+                        for field in index_fields:
+                            # 为字段创建索引，对于复合主键使用unique索引
+                            if field in ["ts_code", "name", "begin_date", "title", "end_date"]:
+                                # 创建unique索引进行去重
+                                if all(f in df.columns for f in ["ts_code", "name", "begin_date"]):
+                                    # 创建复合唯一索引
+                                    collection.create_index(
+                                        [("ts_code", 1), ("name", 1), ("begin_date", 1)], 
+                                        unique=True, 
+                                        background=True
+                                    )
+                                    logger.debug(f"已为字段组合 (ts_code, name, begin_date) 创建唯一复合索引")
+                                else:
+                                    # 如果缺少某些字段，则为现有的字段创建普通索引
+                                    collection.create_index([(field, 1)])
+                                    logger.debug(f"已为字段 {field} 创建索引")
+                            else:
+                                collection.create_index([(field, 1)])
+                                logger.debug(f"已为字段 {field} 创建索引")
+                    else:
+                        # 默认为ts_code创建索引
+                        collection.create_index("ts_code")
+                        logger.debug("已为默认字段ts_code创建索引")
+                except Exception as e:
+                    logger.warning(f"创建索引时出错: {str(e)}")
                 logger.success(f"成功保存 {len(records)} 条记录到MongoDB，耗时 {elapsed:.2f}s")
                 return True
             else:

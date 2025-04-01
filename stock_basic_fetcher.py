@@ -419,16 +419,31 @@ class StockBasicFetcher:
                     # 根据接口配置中的index_fields创建索引
                     index_fields = self.interface_config.get("index_fields", [])
                     if index_fields:
-                        for field in index_fields:
-                            collection.create_index(field)
-                            logger.debug(f"已为字段 {field} 创建索引")
+                        # 检查是否包含ts_code和symbol作为索引字段
+                        if "ts_code" in index_fields and "symbol" in index_fields:
+                            # 创建唯一复合索引防止重复
+                            collection.create_index(
+                                [("ts_code", 1), ("symbol", 1)],
+                                unique=True,
+                                background=True
+                            )
+                            logger.debug("已为字段组合 (ts_code, symbol) 创建唯一复合索引")
+                            
+                            # 移除已处理的字段，避免重复创建索引
+                            remaining_fields = [f for f in index_fields if f not in ["ts_code", "symbol"]]
+                            for field in remaining_fields:
+                                collection.create_index(field)
+                                logger.debug(f"已为字段 {field} 创建索引")
+                        else:
+                            # 单独为每个字段创建索引
+                            for field in index_fields:
+                                collection.create_index(field, unique=(field in ["ts_code", "symbol"]))
+                                logger.debug(f"已为字段 {field} 创建{'唯一' if field in ['ts_code', 'symbol'] else ''}索引")
                     else:
-                        # 默认为ts_code和symbol创建索引
-                        collection.create_index("ts_code")
+                        # 默认为ts_code和symbol创建唯一索引
+                        collection.create_index("ts_code", unique=True)
                         collection.create_index("symbol")
-                        logger.debug("已为默认字段创建索引")
-                        
-                    # Removed update_time index creation to prevent duplicate data
+                        logger.debug("已为默认字段创建索引，ts_code设置为唯一索引")
                 except Exception as e:
                     logger.warning(f"创建索引时出错: {str(e)}")
                 

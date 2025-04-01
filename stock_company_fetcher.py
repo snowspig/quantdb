@@ -450,15 +450,30 @@ class StockCompanyFetcher:
                     # 根据接口配置中的index_fields创建索引
                     index_fields = self.interface_config.get("index_fields", [])
                     if index_fields:
-                        for field in index_fields:
-                            collection.create_index(field)
-                            logger.debug(f"已为字段 {field} 创建索引")
+                        # 检查是否有ts_code作为唯一标识
+                        if "ts_code" in index_fields:
+                            # 创建唯一索引以防止重复数据
+                            collection.create_index(
+                                [("ts_code", 1)],
+                                unique=True,
+                                background=True
+                            )
+                            logger.debug("已为字段 ts_code 创建唯一索引")
+                            
+                            # 为其他字段创建普通索引
+                            remaining_fields = [f for f in index_fields if f != "ts_code"]
+                            for field in remaining_fields:
+                                collection.create_index(field)
+                                logger.debug(f"已为字段 {field} 创建索引")
+                        else:
+                            # 为所有字段创建常规索引
+                            for field in index_fields:
+                                collection.create_index(field)
+                                logger.debug(f"已为字段 {field} 创建索引")
                     else:
-                        # 默认为ts_code创建索引
-                        collection.create_index("ts_code")
-                        logger.debug("已为默认字段ts_code创建索引")
-                        
-                    # Removed update_time index creation to prevent duplicate data
+                        # 默认为ts_code创建唯一索引
+                        collection.create_index("ts_code", unique=True)
+                        logger.debug("已为默认字段ts_code创建唯一索引")
                 except Exception as e:
                     logger.warning(f"创建索引时出错: {str(e)}")
                 
