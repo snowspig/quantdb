@@ -650,10 +650,45 @@ class StockPreviousNameFetcher:
                     logger.error("重新连接MongoDB失败")
                     return False
             
-            # 如果需要替换现有数据，则先删除集合
+            # 如果需要替换现有数据，只删除与当前数据相同时间段的数据
             if replace_existing:
-                self.mongo_client.delete_many(self.collection_name, {})
-                logger.info(f"已清空集合 {self.collection_name} 的现有数据")
+                # 获取数据的日期范围
+                min_date = None
+                max_date = None
+                
+                # 检查是否有begindate字段作为日期判断
+                if 'begindate' in df.columns:
+                    min_date = df['begindate'].min() if not df.empty else None
+                    max_date = df['begindate'].max() if not df.empty else None
+                # 如果没有begindate，尝试查找ann_dt字段
+                elif 'ann_dt' in df.columns:
+                    min_date = df['ann_dt'].min() if not df.empty else None
+                    max_date = df['ann_dt'].max() if not df.empty else None
+                
+                if min_date and max_date:
+                    # 构建查询条件，删除日期范围内的记录
+                    query = {}
+                    if 'begindate' in df.columns:
+                        query = {
+                            "begindate": {
+                                "$gte": min_date,
+                                "$lte": max_date
+                            }
+                        }
+                    elif 'ann_dt' in df.columns:
+                        query = {
+                            "ann_dt": {
+                                "$gte": min_date,
+                                "$lte": max_date
+                            }
+                        }
+                    
+                    # 只删除日期范围内的数据
+                    self.mongo_client.delete_many(self.collection_name, query)
+                    logger.info(f"已删除集合 {self.collection_name} 中日期范围 {min_date} 至 {max_date} 的现有数据")
+                else:
+                    # 如果无法确定日期范围，则不删除数据，改为直接更新
+                    logger.warning("无法确定数据日期范围，将直接插入数据而不删除现有数据")
             
             # 插入新数据
             result = self.mongo_client.insert_many(self.collection_name, records)

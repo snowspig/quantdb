@@ -369,11 +369,19 @@ class TradeCalFetcher:
                     logger.error("重新连接MongoDB失败")
                     return False
             
-            # 删除集合中的旧数据（可选）
+            # 只删除与当前日期范围重叠的数据，而不是所有数据
             if self.verbose:
-                logger.debug(f"清空集合 {self.db_name}.{self.collection_name} 中的旧数据")
+                logger.debug(f"删除集合 {self.db_name}.{self.collection_name} 中与当前日期范围重叠的数据")
             
-            self.mongo_client.delete_many(self.collection_name, {}, self.db_name)
+            # 生成重叠条件：cal_date 在当前日期范围内
+            # 注意：假设数据中有cal_date字段表示日期
+            overlap_query = {
+                "cal_date": {
+                    "$gte": self.start_date,
+                    "$lte": self.end_date
+                }
+            }
+            self.mongo_client.delete_many(self.collection_name, overlap_query, self.db_name)
             
             # 批量插入新数据
             if self.verbose:
