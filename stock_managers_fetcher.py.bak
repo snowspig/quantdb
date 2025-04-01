@@ -580,6 +580,22 @@ class StockManagersFetcher:
         logger.success(f"成功获取 {start_date} 至 {end_date} 期间总计 {len(combined_df)} 条上市公司管理层信息")
         
         return combined_df
+                
+            except Exception as e:
+                logger.error(f"获取 {start_date} 至 {end_date} 期间上市公司管理层信息失败: {str(e)}")
+                import traceback
+                logger.debug(f"详细错误信息: {traceback.format_exc()}")
+                
+                # 如果不是最后一次重试，则休眠后重试
+                if retry < self.retry_count:
+                    delay = self.retry_delay * (retry + 1)  # 递增延迟
+                    logger.info(f"将在 {delay} 秒后重试...")
+                    time.sleep(delay)
+                else:
+                    return None
+        
+        # 所有重试都失败
+        return None
         
     def _generate_date_ranges(self, start_date=None, end_date=None, start_year=1990, end_year=None) -> List[Tuple[str, str]]:
         """
