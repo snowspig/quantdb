@@ -8,10 +8,12 @@
 参考接口文档：http://tushare.xcsc.com:7173/document/2?doc_id=10248
 
 使用方法：
-    python stock_previous_name_fetcher_optimized.py              # 使用湘财真实API数据，简洁日志模式
+    python stock_previous_name_fetcher_optimized.py              # 默认使用recent模式获取最近一周的数据更新
+    python stock_previous_name_fetcher_optimized.py --full        # 获取完整历史数据而非默认的最近一周数据
     python stock_previous_name_fetcher_optimized.py --verbose     # 使用湘财真实API数据，详细日志模式
     python stock_previous_name_fetcher_optimized.py --mock        # 使用模拟数据模式（API不可用时）
     python stock_previous_name_fetcher_optimized.py --start-date 20100101 --end-date 20201231  # 指定日期范围获取数据
+    python stock_previous_name_fetcher_optimized.py --recent      # 显式指定recent模式（最近一周数据更新，默认模式）
 """
 import os
 import sys
@@ -675,6 +677,7 @@ class StockPreviousNameFetcher:
 def main():
     """主函数"""
     import argparse
+    from datetime import datetime, timedelta
     
     # 解析命令行参数
     parser = argparse.ArgumentParser(description="股票曾用名数据获取工具 (优化版)")
@@ -682,6 +685,8 @@ def main():
     parser.add_argument("--mock", action="store_true", help="使用模拟数据模式（API不可用时）")
     parser.add_argument("--start-date", type=str, help="开始日期，格式为YYYYMMDD，如20100101")
     parser.add_argument("--end-date", type=str, help="结束日期，格式为YYYYMMDD，如20201231")
+    parser.add_argument("--recent", action="store_true", help="仅获取最近一周的数据更新（默认模式）")
+    parser.add_argument("--full", action="store_true", help="获取完整历史数据而非默认的最近一周数据")
     args = parser.parse_args()
     
     # 创建获取器
@@ -692,8 +697,20 @@ def main():
         logger.warning("使用模拟数据模式，生成随机的股票曾用名信息")
         # 使用mock数据的逻辑（暂未实现）
     else:
-        # 获取所有股票曾用名数据，支持指定日期范围
-        df = fetcher.fetch_previous_name(start_date=args.start_date, end_date=args.end_date)
+        # 设置日期范围
+        start_date = args.start_date
+        end_date = args.end_date
+        
+        # 如果没有指定日期范围且未设置full参数，默认使用recent模式（最近一周）
+        if (not start_date or not end_date) and not args.full:
+            # 使用recent模式（无论--recent是否被明确指定）
+            today = datetime.now()
+            end_date = today.strftime('%Y%m%d')  # 今天
+            start_date = (today - timedelta(days=7)).strftime('%Y%m%d')  # 一周前
+            logger.info(f"使用recent模式：获取最近一周 {start_date} 至 {end_date} 期间的数据更新")
+        
+        # 获取股票曾用名数据，支持指定日期范围
+        df = fetcher.fetch_previous_name(start_date=start_date, end_date=end_date)
         
         if df is not None and not df.empty:
             # 从stock_basic获取目标股票代码
