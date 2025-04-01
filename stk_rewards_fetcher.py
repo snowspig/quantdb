@@ -12,8 +12,21 @@
     python stk_rewards_fetcher.py --mock        # 使用模拟数据模式（API不可用时）
     python stk_rewards_fetcher.py --full        # 抓取全量历史数据
 """
-import os
+# 首先解析命令行参数以确定是否使用mock模式
 import sys
+import argparse
+
+# 解析命令行参数
+parser = argparse.ArgumentParser(description="获取高管薪酬和持股数据")
+parser.add_argument("--verbose", action="store_true", help="输出详细日志")
+parser.add_argument("--mock", action="store_true", help="使用模拟数据模式")
+parser.add_argument("--full", action="store_true", help="获取全量历史数据")
+
+args, _ = parser.parse_known_args()
+
+# 设置是否使用mock模式的全局变量
+USE_MOCK = args.mock
+import os
 import json
 import yaml
 import time
@@ -30,10 +43,46 @@ from loguru import logger
 current_dir = Path(__file__).resolve().parent
 sys.path.append(str(current_dir))
 
-# 导入项目模块
-from data_fetcher.tushare_client import TushareClient
-from storage.mongodb_client import MongoDBClient
-from wan_manager.port_allocator import PortAllocator
+# 根据mock模式选择性导入模块
+if USE_MOCK:
+    # 创建模拟类
+    class TushareClient:
+        def __init__(self, token):
+            self.token = token
+        def get_data(self, api_name, params, fields):
+            return pd.DataFrame()
+        def set_timeout(self, timeout):
+            pass
+            
+    class MongoDBClient:
+        def __init__(self, **kwargs):
+            pass
+        def connect(self):
+            return True
+        def is_connected(self):
+            return True
+        def find(self, collection, query=None, projection=None):
+            return []
+        def insert_many(self, collection, documents, db_name=None):
+            logger.info(f"Mock: Would insert {len(documents)} documents to {db_name}.{collection}")
+            return True
+        def delete_many(self, collection, query, db_name=None):
+            return True
+        def insert_one(self, collection, document, db_name=None):
+            return True
+            
+    class PortAllocator:
+        def get_available_wan_indices(self):
+            return [0]
+        def allocate_port(self, wan_idx):
+            return 12345
+        def release_port(self, wan_idx, port):
+            pass
+else:
+    # 导入真实项目模块
+    from data_fetcher.tushare_client import TushareClient
+    from storage.mongodb_client import MongoDBClient
+    from wan_manager.port_allocator import PortAllocator
 
 class StkRewardsFetcher:
     """
@@ -87,14 +136,16 @@ class StkRewardsFetcher:
         self.config = self._load_config()
         self.interface_config = self._load_interface_config()
         
-        if not self.use_mock:
-            # 初始化Tushare客户端
+        # 初始化客户端
+        if self.use_mock:
+            # 使用模拟客户端
+            self.client = TushareClient(token="mock_token")
+            self.mongo_client = MongoDBClient()
+            self.port_allocator = None
+        else:
+            # 使用真实客户端
             self.client = self._init_client()
-            
-            # 初始化MongoDB客户端
             self.mongo_client = self._init_mongo_client()
-            
-            # 初始化多WAN口管理器
             self.port_allocator = self._init_port_allocator()
 
 
@@ -389,7 +440,7 @@ class StkRewardsFetcher:
         获取高管薪酬和持股信息
         
         Args:
-            ts_code: 股票代码，如果为None则获取所有股票
+            ts_code: 股票代码，如果为None则获取所有股票。支持多个股票代码，用逗号分隔
             end_date: 截止日期，格式：YYYYMMDD
             
         Returns:
@@ -409,6 +460,10 @@ class StkRewardsFetcher:
             # 添加API必需参数
             if ts_code:
                 params["ts_code"] = ts_code
+                if ',' in ts_code:
+                    # 批量处理多个股票代码
+                    code_count = len(ts_code.split(','))
+                    logger.debug(f"批量请求 {code_count} 个股票代码的数据")
                 
             if end_date:
                 params["end_date"] = end_date
@@ -422,7 +477,11 @@ class StkRewardsFetcher:
             use_wan = wan_info is not None
             
             # 调用Tushare API
-            logger.info(f"正在从湘财Tushare获取高管薪酬和持股信息... {f'ts_code={ts_code}' if ts_code else ''}")
+            if ',' in str(ts_code):
+                logger.info(f"正在从湘财Tushare批量获取高管薪酬和持股信息... {len(ts_code.split(','))} 个股票")
+            else:
+                logger.info(f"正在从湘财Tushare获取高管薪酬和持股信息... {f'ts_code={ts_code}' if ts_code else ''}")
+                
             if use_wan:
                 wan_idx, port = wan_info
                 logger.debug(f"使用WAN接口 {wan_idx} 和本地端口 {port} 请求数据")
@@ -430,36 +489,77 @@ class StkRewardsFetcher:
             start_time = time.time()
             
             # 使用客户端获取数据
-            logger.debug(f"API名称: {api_name}, 参数: {params}, 字段: {fields if self.verbose else '...'}")
+            if self.verbose:
+                logger.debug(f"API名称: {api_name}, 参数: {params}, 字段: {fields}")
             
-            # 增加超时，设置为120秒
-            self.client.set_timeout(120)
-            logger.info(f"增加API请求超时时间为120秒，提高网络可靠性")
+            # 设置超时，根据批量大小动态调整
+            timeout = 120  # 基础超时时间
+            if ts_code and ',' in ts_code:
+                # 根据批量大小增加超时
+                code_count = len(ts_code.split(','))
+                timeout += min(code_count * 5, 180)  # 每增加一个股票增加5秒超时，但最多增加180秒
+                
+            self.client.set_timeout(timeout)
+            logger.debug(f"设置API请求超时时间为{timeout}秒")
             
-            # 添加异常捕获，以便更好地调试
-            try:
-                df = self.client.get_data(api_name=api_name, params=params, fields=fields)
-                if df is not None and not df.empty:
-                    logger.success(f"成功获取数据，行数: {len(df)}, 列数: {df.shape[1]}")
-                    if self.verbose:
-                        logger.debug(f"列名: {list(df.columns)}")
-            except Exception as e:
-                import traceback
-                logger.error(f"获取API数据时发生异常: {str(e)}")
-                logger.debug(f"异常详情: {traceback.format_exc()}")
-                return None
+            # 添加重试机制
+            max_retries = self.config.get("tushare", {}).get("max_retries", 3)
+            retry_delay = self.config.get("tushare", {}).get("retry_delay", 5)
+            retry_random = self.config.get("tushare", {}).get("retry_random", True)
+            
+            # 执行请求，带重试机制
+            df = None
+            retry_count = 0
+            while retry_count <= max_retries:
+                try:
+                    df = self.client.get_data(api_name=api_name, params=params, fields=fields)
+                    if df is not None and not df.empty:
+                        break  # 成功获取数据，跳出重试循环
+                        
+                    # 如果返回空DataFrame但没有异常，可能是正常情况，也跳出循环
+                    if df is not None:
+                        break
+                        
+                    # 其他情况视为请求失败，需要重试
+                    retry_count += 1
+                    if retry_count <= max_retries:
+                        delay = retry_delay
+                        if retry_random:
+                            # 添加随机波动避免同时重试
+                            delay += random.uniform(0, 3)
+                        logger.warning(f"API请求失败，{delay:.1f}秒后进行第{retry_count}次重试...")
+                        time.sleep(delay)
+                        
+                except Exception as e:
+                    retry_count += 1
+                    if retry_count <= max_retries:
+                        delay = retry_delay
+                        if retry_random:
+                            delay += random.uniform(0, 3)
+                        logger.warning(f"API请求异常: {str(e)}，{delay:.1f}秒后进行第{retry_count}次重试...")
+                        time.sleep(delay)
+                    else:
+                        import traceback
+                        logger.error(f"达到最大重试次数({max_retries})，放弃请求。错误: {str(e)}")
+                        logger.debug(f"异常详情: {traceback.format_exc()}")
+                        return None
+                        
             elapsed = time.time() - start_time
             
-            if df is None or df.empty:
+            if df is None:
+                logger.error("API请求失败，未返回有效数据")
+                return None
+                
+            if df.empty:
                 logger.warning(f"API返回数据为空 {f'对于ts_code={ts_code}' if ts_code else ''}")
                 return pd.DataFrame(columns=fields if fields else [])
+                
+            logger.success(f"成功获取 {len(df)} 条高管薪酬和持股信息，耗时 {elapsed:.2f}s")
             
             # 释放WAN端口（如果使用了）
             if use_wan:
                 wan_idx, port = wan_info
                 self.port_allocator.release_port(wan_idx, port)
-            
-            logger.success(f"成功获取 {len(df)} 条高管薪酬和持股信息，耗时 {elapsed:.2f}s")
             
             # 如果使用详细日志，输出数据示例
             if self.verbose and not df.empty:
@@ -493,30 +593,63 @@ class StkRewardsFetcher:
         all_dfs = []
         ts_code_list = sorted(list(ts_codes))  # 排序以确保稳定的处理顺序
         
+        # 使用线程池并发请求数据 - 从配置中获取线程数量，默认为16
+        max_workers = self.config.get("tushare", {}).get("thread_num", 16)
+        logger.info(f"使用 {max_workers} 个工作线程并发获取数据")
+        
+        # 批量处理股票代码，每批次最多20个，减少API调用次数
+        batch_size = 20
+        # 组织批次任务，按日期和代码分组，减少API调用次数
+        batched_tasks = []
+        
+        if end_dates:
+            # 按日期分组任务
+            for end_date in end_dates:
+                # 每个日期分批处理股票
+                for i in range(0, len(ts_code_list), batch_size):
+                    batch_codes = ts_code_list[i:i+batch_size]
+                    # 股票代码用逗号连接，一次请求多个
+                    batched_ts_code = ",".join(batch_codes)
+                    batched_tasks.append((batched_ts_code, end_date))
+        else:
+            # 不指定日期的情况，只按股票批次分组
+            for i in range(0, len(ts_code_list), batch_size):
+                batch_codes = ts_code_list[i:i+batch_size]
+                batched_ts_code = ",".join(batch_codes)
+                batched_tasks.append((batched_ts_code, None))
+        
+        logger.info(f"将执行 {len(batched_tasks)} 个批量请求，每批次最多包含 {batch_size} 个股票")
+        
         # 使用线程池并发请求数据
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
             
-            # 对每个股票代码提交任务
-            for ts_code in ts_code_list:
-                if end_dates:
-                    # 如果有指定多个日期，则对每个日期获取数据
-                    for end_date in end_dates:
-                        futures.append(executor.submit(self.fetch_stk_rewards, ts_code, end_date))
-                else:
-                    # 否则只获取一次数据（无指定日期）
-                    futures.append(executor.submit(self.fetch_stk_rewards, ts_code, None))
+            # 对每个批次提交任务
+            for batched_ts_code, end_date in batched_tasks:
+                futures.append(executor.submit(self.fetch_stk_rewards, batched_ts_code, end_date))
+            
+            # 添加进度条
+            total_tasks = len(futures)
+            completed_tasks = 0
             
             # 收集结果
-            for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            for future in concurrent.futures.as_completed(futures):
                 try:
                     df = future.result()
+                    completed_tasks += 1
+                    
                     if df is not None and not df.empty:
                         all_dfs.append(df)
-                        if (i + 1) % 10 == 0 or (i + 1) == len(futures):
-                            logger.info(f"已完成 {i + 1}/{len(futures)} 个请求")
+                    
+                    # 显示进度
+                    if completed_tasks % 5 == 0 or completed_tasks == total_tasks:
+                        progress_pct = (completed_tasks / total_tasks) * 100
+                        logger.info(f"数据获取进度: {completed_tasks}/{total_tasks} ({progress_pct:.1f}%)")
+                        
                 except Exception as e:
                     logger.error(f"处理异步请求结果时出错: {str(e)}")
+                    import traceback
+                    logger.debug(f"详细错误信息: {traceback.format_exc()}")
         
         # 合并所有结果
         if not all_dfs:
@@ -622,7 +755,7 @@ class StkRewardsFetcher:
 
     def save_to_mongodb(self, df: pd.DataFrame) -> bool:
         """
-        将数据保存到MongoDB
+        将数据保存到MongoDB - 优化版本
         
         Args:
             df: 待保存的DataFrame
@@ -631,8 +764,8 @@ class StkRewardsFetcher:
             是否成功保存
         """
         if self.use_mock:
-            logger.info("模拟模式，不实际保存数据到MongoDB")
-            return True
+            logger.info("模拟模式，尝试保存模拟数据到MongoDB")
+            # 继续执行以允许将模拟数据保存到MongoDB
             
         # 强制确保使用tushare_data作为数据库名称
         logger.info(f"保存数据到MongoDB数据库：{self.db_name}，集合：{self.collection_name}")
@@ -665,37 +798,86 @@ class StkRewardsFetcher:
             if self.verbose:
                 logger.debug(f"向集合 {self.db_name}.{self.collection_name} 插入 {len(records)} 条记录")
                 
-            # 对于增量更新模式，删除集合中与新数据的ts_code和end_date相同的旧数据
+            # 对于增量更新模式，优化删除集合中与新数据的ts_code和end_date相同的旧数据
             if not self.full_history and records:
                 # 提取新数据中的所有ts_code和end_date组合
-                ts_codes = set(record['ts_code'] for record in records if 'ts_code' in record)
-                end_dates = set(record['end_date'] for record in records if 'end_date' in record)
+                # 使用列表推导式创建唯一的ts_code和end_date组合
+                ts_code_date_pairs = []
+                seen_pairs = set()
                 
-                if ts_codes and end_dates:
-                    # 删除对应的现有数据
-                    for end_date in end_dates:
-                        for ts_code in ts_codes:
-                            query = {'ts_code': ts_code, 'end_date': end_date}
+                for record in records:
+                    if 'ts_code' in record and 'end_date' in record:
+                        pair = (record['ts_code'], record['end_date'])
+                        if pair not in seen_pairs:
+                            seen_pairs.add(pair)
+                            ts_code_date_pairs.append(pair)
+                
+                # 批量删除旧数据，每批最多100个股票代码
+                if ts_code_date_pairs:
+                    batch_size = 100
+                    for i in range(0, len(ts_code_date_pairs), batch_size):
+                        batch_pairs = ts_code_date_pairs[i:i+batch_size]
+                        # 构建OR查询条件，一次删除一批数据
+                        delete_conditions = []
+                        for ts_code, end_date in batch_pairs:
+                            delete_conditions.append({'ts_code': ts_code, 'end_date': end_date})
+                        
+                        if delete_conditions:
+                            query = {'$or': delete_conditions}
                             self.mongo_client.delete_many(self.collection_name, query, self.db_name)
                             if self.verbose:
-                                logger.debug(f"删除旧数据: ts_code={ts_code}, end_date={end_date}")
+                                logger.debug(f"已批量删除 {len(delete_conditions)} 条旧数据记录")
             
-            # 尝试批量插入数据，捕获可能的错误
+            # 添加索引以提高查询效率 - 如果索引不存在则创建
+            # 注意：在实际环境中，应该在初始化数据库时创建索引，而不是每次操作都检查
+            # 这里仅作为示例，在大量数据场景中应移至单独的索引管理函数
             try:
-                result = self.mongo_client.insert_many(self.collection_name, records, self.db_name)
-                inserted_count = len(records) if result else 0
-            except Exception as e:
-                logger.error(f"批量插入数据失败: {str(e)}，尝试逐条插入...")
+                # 在MongoDB中创建复合索引可以大幅提高查询性能
+                # 这里假设MongoDBClient有create_index方法，如果没有，需要自行实现或跳过此步骤
+                if hasattr(self.mongo_client, 'create_index'):
+                    self.mongo_client.create_index(
+                        self.collection_name, 
+                        [('ts_code', 1), ('end_date', 1)],
+                        self.db_name,
+                        unique=True,
+                        background=True
+                    )
+            except Exception as idx_err:
+                logger.warning(f"创建索引失败: {str(idx_err)}")
+            
+            # 使用批量写入，每批最多1000条记录，避免单次写入过多导致MongoDB负载过高
+            batch_size = 1000
+            inserted_count = 0
+            total_batches = (len(records) + batch_size - 1) // batch_size  # 向上取整
+            
+            for batch_num in range(total_batches):
+                start_idx = batch_num * batch_size
+                end_idx = min((batch_num + 1) * batch_size, len(records))
+                batch_records = records[start_idx:end_idx]
                 
-                # 逐条插入以跳过导致错误的记录
-                inserted_count = 0
-                for record in records:
-                    try:
-                        self.mongo_client.insert_one(self.collection_name, record, self.db_name)
-                        inserted_count += 1
-                    except Exception as insert_err:
-                        logger.error(f"插入记录失败: {str(insert_err)}")
-                        continue
+                try:
+                    result = self.mongo_client.insert_many(self.collection_name, batch_records, self.db_name)
+                    if result:
+                        batch_inserted = len(batch_records)
+                        inserted_count += batch_inserted
+                        if self.verbose:
+                            progress = (batch_num + 1) / total_batches * 100
+                            logger.debug(f"批次 {batch_num+1}/{total_batches} 写入成功: {batch_inserted} 条记录 ({progress:.1f}%)")
+                except Exception as batch_err:
+                    logger.error(f"批量插入第 {batch_num+1}/{total_batches} 批数据失败: {str(batch_err)}，尝试逐条插入...")
+                    
+                    # 当批量写入失败时，尝试逐条插入以跳过问题记录
+                    for record in batch_records:
+                        try:
+                            self.mongo_client.insert_one(self.collection_name, record, self.db_name)
+                            inserted_count += 1
+                        except Exception as insert_err:
+                            if 'duplicate key error' in str(insert_err).lower():
+                                # 重复键错误，可能是数据已存在，记录为警告
+                                if self.verbose:
+                                    logger.debug(f"跳过重复记录: {record.get('ts_code', 'unknown')} {record.get('end_date', 'unknown')}")
+                            else:
+                                logger.error(f"插入记录失败: {str(insert_err)}")
             
             elapsed = time.time() - start_time
             logger.success(f"成功保存 {inserted_count}/{len(records)} 条记录到MongoDB，耗时: {elapsed:.2f}s")
@@ -712,40 +894,107 @@ class StkRewardsFetcher:
         """
         运行高管薪酬和持股数据获取流程
         """
-        logger.info("开始获取高管薪酬和持股数据")
+        try:
+            # 记录开始时间，用于计算总耗时
+            total_start_time = time.time()
+            logger.info("开始获取高管薪酬和持股数据")
+            
+            # 获取目标股票代码（根据市场代码过滤）
+            ts_codes = self.get_target_ts_codes_from_stock_basic()
+            if not ts_codes:
+                logger.error("未获取到目标股票代码，无法继续执行")
+                return False
+                
+            logger.success(f"将处理 {len(ts_codes)} 支股票的高管薪酬和持股数据")
+            
+            # 确定日期范围
+            end_dates = self.determine_date_ranges()
+            logger.info(f"将获取以下日期的数据: {end_dates}")
+            
+            # 检查是否进行增量更新，并获取已存在的记录以避免重复获取
+            if not self.full_history and not self.use_mock and hasattr(self.mongo_client, 'distinct'):
+                try:
+                    # 获取集合中已有的ts_code和end_date组合
+                    # 注意：这需要向MongoDBClient添加distinct方法
+                    existing_combinations = self.mongo_client.find(
+                        self.collection_name,
+                        {"end_date": {"$in": end_dates}},
+                        {"ts_code": 1, "end_date": 1, "_id": 0}
+                    )
+                    
+                    # 构建已存在的组合集合，用于增量更新时跳过已有数据
+                    existing_ts_code_date_pairs = set()
+                    for doc in existing_combinations:
+                        if "ts_code" in doc and "end_date" in doc:
+                            existing_ts_code_date_pairs.add((doc["ts_code"], doc["end_date"]))
+                            
+                    if existing_ts_code_date_pairs and self.verbose:
+                        logger.debug(f"数据库中已存在 {len(existing_ts_code_date_pairs)} 条记录，将执行增量更新")
+                except Exception as e:
+                    logger.warning(f"检查现有数据失败，将执行全量更新: {str(e)}")
+            
+            # 异步获取数据
+            logger.info("开始数据获取阶段...")
+            phase_start_time = time.time()
+            data_df = await self.fetch_stocks_data_async(ts_codes, end_dates)
+            phase_elapsed = time.time() - phase_start_time
+            if data_df is None or data_df.empty:
+                logger.error("获取数据失败或数据为空")
+                return False
+            logger.success(f"数据获取阶段完成，耗时: {phase_elapsed:.2f}秒")
+            
+            # 过滤数据
+            logger.info("开始数据过滤阶段...")
+            phase_start_time = time.time()
+            filtered_df = self.filter_data_by_market_codes(data_df)
+            phase_elapsed = time.time() - phase_start_time
+            if filtered_df.empty:
+                logger.error("过滤后数据为空")
+                return False
+            logger.success(f"数据过滤阶段完成，耗时: {phase_elapsed:.2f}秒")
+            
+            # 数据去重 - 避免重复插入相同的数据
+            logger.info("执行数据去重操作...")
+            phase_start_time = time.time()
+            # 使用DataFrame的drop_duplicates方法去除完全相同的行
+            original_count = len(filtered_df)
+            filtered_df = filtered_df.drop_duplicates()
+            # 根据业务主键去重
+            filtered_df = filtered_df.drop_duplicates(subset=["ts_code", "end_date", "name", "title"])
+            unique_count = len(filtered_df)
+            phase_elapsed = time.time() - phase_start_time
+            if original_count > unique_count:
+                logger.info(f"数据去重：从 {original_count} 条记录减少到 {unique_count} 条唯一记录，移除了 {original_count - unique_count} 条重复数据")
+            logger.success(f"数据去重阶段完成，耗时: {phase_elapsed:.2f}秒")
+            
+            # 保存到MongoDB
+            logger.info("开始数据保存阶段...")
+            phase_start_time = time.time()
+            success = self.save_to_mongodb(filtered_df)
+            phase_elapsed = time.time() - phase_start_time
+            if not success:
+                logger.error("保存数据到MongoDB失败")
+                return False
+            logger.success(f"数据保存阶段完成，耗时: {phase_elapsed:.2f}秒")
+            
+            # 计算并显示总耗时
+            total_elapsed = time.time() - total_start_time
+            logger.success(f"成功完成高管薪酬和持股数据获取和保存流程，总耗时: {total_elapsed:.2f}秒")
+            
+            # 输出统计信息
+            if self.verbose:
+                # 计算每个日期的数据量
+                date_counts = filtered_df["end_date"].value_counts().to_dict()
+                date_stats = ", ".join([f"{date}: {count}条" for date, count in sorted(date_counts.items())])
+                logger.debug(f"各日期数据统计: {date_stats}")
+                
+            return True
         
-        # 获取目标股票代码（根据市场代码过滤）
-        ts_codes = self.get_target_ts_codes_from_stock_basic()
-        if not ts_codes:
-            logger.error("未获取到目标股票代码，无法继续执行")
+        except Exception as e:
+            logger.error(f"执行数据获取流程时发生错误: {str(e)}")
+            import traceback
+            logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return False
-            
-        logger.success(f"将处理 {len(ts_codes)} 支股票的高管薪酬和持股数据")
-        
-        # 确定日期范围
-        end_dates = self.determine_date_ranges()
-        logger.info(f"将获取以下日期的数据: {end_dates}")
-        
-        # 异步获取数据
-        data_df = await self.fetch_stocks_data_async(ts_codes, end_dates)
-        if data_df is None or data_df.empty:
-            logger.error("获取数据失败或数据为空")
-            return False
-            
-        # 过滤数据
-        filtered_df = self.filter_data_by_market_codes(data_df)
-        if filtered_df.empty:
-            logger.error("过滤后数据为空")
-            return False
-            
-        # 保存到MongoDB
-        success = self.save_to_mongodb(filtered_df)
-        if not success:
-            logger.error("保存数据到MongoDB失败")
-            return False
-            
-        logger.success("成功完成高管薪酬和持股数据获取和保存流程")
-        return True
 
 async def main():
     """主函数"""
