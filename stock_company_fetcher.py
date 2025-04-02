@@ -45,7 +45,7 @@ class StockCompanyFetcher:
         interface_dir: str = "config/interfaces",
         interface_name: str = "stock_company.json",
         target_market_codes: Set[str] = {"00", "30", "60", "68"},
-        db_name: str = "tushare_data",
+        db_name: str = None,
         collection_name: str = "stock_company",
         verbose: bool = False
     ):
@@ -57,7 +57,7 @@ class StockCompanyFetcher:
             interface_dir: 接口配置文件目录
             interface_name: 接口名称
             target_market_codes: 目标市场代码集合
-            db_name: MongoDB数据库名称
+            db_name: MongoDB数据库名称，如果为None则从配置文件中读取
             collection_name: MongoDB集合名称
             verbose: 是否输出详细日志
         """
@@ -65,7 +65,6 @@ class StockCompanyFetcher:
         self.interface_dir = interface_dir
         self.interface_name = interface_name
         self.target_market_codes = target_market_codes
-        self.db_name = "tushare_data"  # 强制使用tushare_data作为数据库名
         self.collection_name = collection_name
         self.verbose = verbose
 
@@ -77,6 +76,27 @@ class StockCompanyFetcher:
         # 加载配置
         self.config = self._load_config()
         self.interface_config = self._load_interface_config()
+        
+        # 获取token和api_url - 从配置文件读取
+        tushare_config = self.config.get("tushare", {})
+        self.token = tushare_config.get("token", "")
+        self.api_url = tushare_config.get("api_url", "")
+        
+        # 从配置中读取db_name
+        mongodb_config = self.config.get("mongodb", {})
+        config_db_name = mongodb_config.get("db_name", "tushare_data")
+        # 如果未传入db_name或传入为None，则使用配置文件中的值
+        self.db_name = db_name if db_name is not None else config_db_name
+        logger.debug(f"使用数据库名称: {self.db_name}")
+        
+        if not self.token:
+            logger.error("未配置Tushare API Key")
+            sys.exit(1)
+            
+        # 记录API配置信息
+        mask_token = self.token[:4] + '*' * (len(self.token) - 8) + self.token[-4:] if len(self.token) > 8 else '***'
+        logger.debug(f"获取到的API token长度: {len(self.token)}")
+        logger.debug(f"获取到的API URL: {self.api_url}")
         
         # 初始化Tushare客户端
         self.client = self._init_client()
@@ -125,13 +145,21 @@ class StockCompanyFetcher:
     def _init_client(self) -> TushareClient:
         """初始化Tushare客户端"""
         try:
+            # 从配置中获取token和api_url
             tushare_config = self.config.get("tushare", {})
             token = tushare_config.get("token", "")
+            api_url = tushare_config.get("api_url", "")
+            
             if not token:
                 logger.error("未配置Tushare API Key")
                 sys.exit(1)
                 
-            return TushareClient(token=token)
+            # 记录token和api_url信息
+            mask_token = token[:4] + '*' * (len(token) - 8) + token[-4:] if len(token) > 8 else '***'
+            logger.debug(f"使用token初始化客户端: {mask_token} (长度: {len(token)}), API URL: {api_url}")
+                
+            # 创建并返回客户端实例，传递api_url
+            return TushareClient(token=token, api_url=api_url)
         except Exception as e:
             logger.error(f"初始化Tushare客户端失败: {str(e)}")
             sys.exit(1)
@@ -147,15 +175,31 @@ class StockCompanyFetcher:
             port = mongodb_config.get("port", 27017)
             username = mongodb_config.get("username", "")
             password = mongodb_config.get("password", "")
+            auth_source = mongodb_config.get("auth_source", "admin")
+            auth_mechanism = mongodb_config.get("auth_mechanism", "SCRAM-SHA-1")
             
-            # 创建MongoDB客户端 - 明确指定数据库名称为tushare_data
+            # 获取MongoDB连接选项
+            options = mongodb_config.get("options", {})
+            connection_pool_size = options.get("max_pool_size", 100)
+            timeout_ms = options.get("connect_timeout_ms", 30000)
+            
+            # 记录MongoDB连接信息
+            logger.debug(f"MongoDB连接信息: {host}:{port}, 认证源: {auth_source}, 认证机制: {auth_mechanism}")
+            logger.debug(f"MongoDB连接选项: 连接池大小: {connection_pool_size}, 超时: {timeout_ms}ms")
+            logger.debug(f"MongoDB数据库名称: {self.db_name}")
+            
+            # 创建MongoDB客户端 - 使用从配置中读取的参数
             mongo_client = MongoDBClient(
                 uri=uri,
                 host=host,
                 port=port,
                 username=username,
                 password=password,
-                db_name="tushare_data"  # 明确设置数据库名
+                db_name=self.db_name,  # 使用从配置或初始化参数中获取的db_name
+                auth_source=auth_source,
+                auth_mechanism=auth_mechanism,
+                connection_pool_size=connection_pool_size,
+                timeout_ms=timeout_ms
             )
             
             # 连接到数据库
