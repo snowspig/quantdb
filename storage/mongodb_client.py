@@ -714,6 +714,7 @@ mongodbclient = None
 
 try:
     mongodb_client = MongoDBClient()
+    mongodb_client.connect()  # Explicitly connect to the database
     logger.info("全局MongoDB客户端初始化完成")
 except Exception as e:
     logger.warning(f"全局MongoDB客户端初始化失败: {str(e)}，请手动创建客户端实例")
