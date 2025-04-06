@@ -26,23 +26,28 @@ def load_config():
         # 如果配置文件不存在，创建默认配置
         default_config = {
             'init_programs': [
-                'trade_cal_fetcher.py',
-                'stock_basic_fetcher.py'
+                'trade_cal_fetcher.py',                     #中国A股交易日历
+                'stock_basic_fetcher.py'                    #中国A股基本资料
             ],
             'serial_programs': [
-                'wan_test_client.py'            
+                'wan_test_client.py'                        #多wan口零时测试
                 ],
             'parallel_programs': [
-                'suspend_fetcher.py',
-                'stk_rewards_fetcher.py',
-                'stock_company_fetcher.py',
-                'stock_managers_fetcher.py',
-                'stock_previous_name_fetcher.py',
-                'daily_fetcher.py',
-                'div_fetcher.py',
-                'weekly_fetcher.py',
-                'monthly_fetcher.py'
-                
+
+
+                'stock_company_fetcher.py',                 #中国A股公司简介
+                'stock_previous_name_fetcher.py',           #中国A股证券曾用名
+                'stock_managers_fetcher.py',                #上市公司管理层
+                'div_fetcher.py',                           #A股除权除息记录
+                'stk_rewards_fetcher.py',                   #管理层薪酬和持股
+
+                'daily_fetcher.py',                         #A股日线行情
+                'weekly_fetcher.py',                        #A股周线行情
+                'monthly_fetcher.py',                       #A股月线行情
+                'suspend_fetcher.py'                        #A股停牌记录
+                # 'daily_basic_ts_fetcher.py',                #A股日线行情指标
+ 
+
                 
                 # 'miss_adj_factor.py',
                 # 'miss_daily_basic_ts.py',
