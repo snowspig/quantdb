@@ -304,8 +304,8 @@ class StockCompanyFetcher:
             logger.debug(f"API名称: {api_name}, 参数: {params}, 字段: {fields if self.verbose else '...'}")
             
             # 增加超时，设置为120秒
-            self.client.set_timeout(120)
-            logger.info(f"增加API请求超时时间为120秒，提高网络可靠性")
+            self.client.set_timeout(20)
+            logger.info(f"增加API请求超时时间为20秒，提高网络可靠性")
             
             # 添加异常捕获，以便更好地调试
             try:
