@@ -45,6 +45,7 @@ class StockBasicFetcher:
         interface_dir: str = "config/interfaces",
         interface_name: str = "stock_basic.json",
         target_market_codes: Set[str] = {"00", "30", "60", "68"},
+        excluded_stocks: Set[str] = {"600349.SH", "300361.SZ", "300728.SZ"},
         db_name: str = None,
         collection_name: str = "stock_basic",
         verbose: bool = False
@@ -57,6 +58,7 @@ class StockBasicFetcher:
             interface_dir: 接口配置文件目录
             interface_name: 接口名称
             target_market_codes: 目标市场代码集合
+            excluded_stocks: 需要排除的特定股票代码集合
             db_name: MongoDB数据库名称，如果为None则从配置文件中读取
             collection_name: MongoDB集合名称
             verbose: 是否输出详细日志
@@ -65,6 +67,7 @@ class StockBasicFetcher:
         self.interface_dir = interface_dir
         self.interface_name = interface_name
         self.target_market_codes = target_market_codes
+        self.excluded_stocks = excluded_stocks
         self.collection_name = collection_name
         self.verbose = verbose
 
@@ -348,7 +351,7 @@ class StockBasicFetcher:
 
     def filter_stock_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        过滤股票数据，只保留00、30、60和68板块的股票
+        过滤股票数据，只保留00、30、60和68板块的股票，并排除特定股票
         
         Args:
             df: 股票基本信息数据
@@ -380,6 +383,13 @@ class StockBasicFetcher:
         
         # 提取前两位作为市场代码并过滤，并创建显式副本避免SettingWithCopyWarning
         df_filtered = df[df['symbol'].str[:2].isin(self.target_market_codes)].copy()
+        
+        # 排除特定股票
+        if 'ts_code' in df_filtered.columns and self.excluded_stocks:
+            before_exclude = len(df_filtered)
+            df_filtered = df_filtered[~df_filtered['ts_code'].isin(self.excluded_stocks)]
+            excluded_count = before_exclude - len(df_filtered)
+            logger.info(f"已排除 {excluded_count} 支特定股票: {', '.join(self.excluded_stocks)}")
         
         # 输出过滤统计信息
         logger.info(f"过滤后股票数量: {len(df_filtered)}")
@@ -588,6 +598,7 @@ def main():
     parser.add_argument('--config', default='config/config.yaml', help='配置文件路径')
     parser.add_argument('--interface-dir', default='config/interfaces', help='接口配置文件目录')
     parser.add_argument('--market-codes', default='00,30,60,68', help='目标市场代码，用逗号分隔')
+    parser.add_argument('--excluded-stocks', default='600349.SH,300361.SZ,300728.SZ', help='需要排除的股票代码，用逗号分隔')
     parser.add_argument('--db-name', default='tushare_data', help='MongoDB数据库名称')
     parser.add_argument('--collection-name', default='stock_basic', help='MongoDB集合名称')
     parser.add_argument('--verbose', action='store_true', help='输出详细日志')
@@ -599,11 +610,15 @@ def main():
     # 解析市场代码
     target_market_codes = set(args.market_codes.split(','))
     
+    # 解析需要排除的股票代码
+    excluded_stocks = set(args.excluded_stocks.split(',')) if args.excluded_stocks else set()
+    
     # 创建获取器并运行
     fetcher = StockBasicFetcher(
         config_path=args.config,
         interface_dir=args.interface_dir,
         target_market_codes=target_market_codes,
+        excluded_stocks=excluded_stocks,
         db_name=args.db_name,  # 这个值会被内部强制设为"tushare_data"
         collection_name=args.collection_name,
         verbose=args.verbose
