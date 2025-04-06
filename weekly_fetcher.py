@@ -153,7 +153,7 @@ class WeeklyDataFetcher:
         )
         self.tushare_token = self.config.get('tushare', {}).get('token')
         self.available_fields = self.interface_config.get('available_fields', [])
-        self.collection_name = "tushare_data.weekly"
+        self.collection_name = "weekly"
         self.lock = threading.Lock()
         self.port_allocator = PortAllocator()
         
