@@ -56,19 +56,25 @@ class TushareClientWAN:
         }
         self.proxies = None
         self.local_addr = None
+        self.wan_idx = None
+        self.local_port = None
         
         # 验证token
         mask_token = token[:4] + '*' * (len(token) - 8) + token[-4:] if len(token) > 8 else '***'
         logger.debug(f"TushareClientWAN初始化: {mask_token} (长度: {len(token)}), API URL: {self.url}")
     
-    def set_local_address(self, host: str, port: int):
+    def set_local_address(self, host: str, port: int, wan_idx: int = None):
         """设置本地地址绑定"""
         self.local_addr = (host, port)
-        logger.debug(f"已设置本地地址绑定: {host}:{port}")
+        self.wan_idx = wan_idx
+        self.local_port = port
+        logger.debug(f"已设置本地地址绑定: {host}:{port}, WAN索引: {wan_idx}")
     
     def reset_local_address(self):
         """重置本地地址绑定"""
         self.local_addr = None
+        self.wan_idx = None
+        self.local_port = None
         logger.debug("已重置本地地址绑定")
     
     def set_timeout(self, timeout: int):
@@ -88,67 +94,195 @@ class TushareClientWAN:
         Returns:
             DataFrame格式的数据
         """
+        # 创建请求数据 - 与原始TushareClient请求格式保持一致
+        req_params = {
+            "api_name": api_name,
+            "token": self.token,
+            "params": params or {},
+            "fields": fields or ""
+        }
+        
+        logger.debug(f"请求URL: {self.url}, API: {api_name}, Token长度: {len(self.token)}")
+        
+        # 使用requests发送请求，增强错误处理
+        start_time = time.time()
+        
         try:
-            # 创建请求数据 - 与原始TushareClient请求格式保持一致
-            req_params = {
-                "api_name": api_name,
-                "token": self.token,
-                "params": params or {},
-                "fields": fields or ""
-            }
-            
-            logger.debug(f"请求URL: {self.url}, API: {api_name}, Token长度: {len(self.token)}")
-            
-            # 使用requests发送请求
-            start_time = time.time()
-            
-            # 支持本地地址绑定的请求
-            s = requests.Session()
-            if self.local_addr:
-                # 设置source_address
-                s.mount('http://', SourceAddressAdapter(self.local_addr))
-                s.mount('https://', SourceAddressAdapter(self.local_addr))
-            
-            response = s.post(
-                self.url,
-                json=req_params,
-                headers=self.headers,
-                timeout=self.timeout,
-                proxies=self.proxies
-            )
-            
-            elapsed = time.time() - start_time
-            logger.debug(f"API请求耗时: {elapsed:.2f}s")
-            
-            # 检查响应状态
-            if response.status_code != 200:
-                logger.error(f"API请求错误: {response.status_code} - {response.text}")
-                return None
+            # 使用类似wan_test_client的方式直接创建socket并绑定
+            if self.local_addr and self.wan_idx is not None:
+                logger.debug(f"使用WAN {self.wan_idx} 端口 {self.local_port} 发送请求")
                 
-            # 解析响应
-            result = response.json()
-            if result.get('code') != 0:
-                logger.error(f"API返回错误: {result.get('code')} - {result.get('msg')}")
-                return None
+                # 从URL解析主机和端口
+                import urllib.parse
+                parsed_url = urllib.parse.urlparse(self.url)
+                host = parsed_url.hostname
+                port = parsed_url.port or 80
+                is_https = parsed_url.scheme == 'https'
                 
-            # 转换为DataFrame
-            data = result.get('data')
-            if not data or not data.get('items'):
-                logger.debug("API返回空数据")
-                return pd.DataFrame()
+                if is_https:
+                    # 对于HTTPS，我们需要使用SSL
+                    import ssl
+                    context = ssl.create_default_context()
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.bind(self.local_addr)
+                    s.settimeout(self.timeout)
+                    wrapped_socket = context.wrap_socket(s, server_hostname=host)
+                    wrapped_socket.connect((host, port))
+                    
+                    # 构建HTTP请求
+                    request = f"POST {parsed_url.path} HTTP/1.1\r\n"
+                    request += f"Host: {host}\r\n"
+                    request += "Content-Type: application/json\r\n"
+                    
+                    # 添加其他请求头
+                    for header, value in self.headers.items():
+                        if header.lower() != "content-type" and header.lower() != "host":
+                            request += f"{header}: {value}\r\n"
+                    
+                    # 添加内容长度
+                    json_data = json.dumps(req_params)
+                    request += f"Content-Length: {len(json_data)}\r\n"
+                    request += "Connection: close\r\n\r\n"
+                    request += json_data
+                    
+                    # 发送请求
+                    wrapped_socket.sendall(request.encode())
+                    
+                    # 接收响应
+                    response = b""
+                    while True:
+                        try:
+                            data = wrapped_socket.recv(4096)
+                            if not data:
+                                break
+                            response += data
+                        except socket.timeout:
+                            break
+                    
+                    wrapped_socket.close()
+                    
+                    # 解析HTTP响应
+                    response_text = response.decode('utf-8', errors='ignore')
+                    
+                    # 提取JSON主体
+                    body_start = response_text.find('\r\n\r\n')
+                    if body_start != -1:
+                        body = response_text[body_start + 4:]
+                        
+                        # 解析JSON
+                        try:
+                            result = json.loads(body)
+                            # 检查响应状态
+                            if result.get('code') != 0:
+                                logger.error(f"API返回错误: {result.get('code')} - {result.get('msg')}")
+                                return None
+                                
+                            # 转换为DataFrame
+                            data = result.get('data')
+                            if not data or not data.get('items'):
+                                logger.debug("API返回空数据")
+                                return pd.DataFrame()
+                                
+                            items = data.get('items')
+                            columns = data.get('fields')
+                            
+                            # 创建DataFrame
+                            df = pd.DataFrame(items, columns=columns)
+                            return df
+                        except json.JSONDecodeError:
+                            logger.error("解析JSON响应失败")
+                            return None
+                    else:
+                        logger.error("无法找到HTTP响应主体")
+                        return None
                 
-            items = data.get('items')
-            columns = data.get('fields')
+                else:
+                    # 对于HTTP请求，必须使用SourceAddressAdapter来绑定源地址
+                    s = requests.Session()
+                    # 使用自定义适配器绑定源地址
+                    s.mount('http://', SourceAddressAdapter(self.local_addr))
+                    s.mount('https://', SourceAddressAdapter(self.local_addr))
+                    
+                    response = s.post(
+                        self.url,
+                        json=req_params,
+                        headers=self.headers,
+                        timeout=self.timeout,
+                        proxies=self.proxies
+                    )
+                    
+                    # 检查响应状态
+                    if response.status_code != 200:
+                        logger.error(f"API请求错误: {response.status_code} - {response.text}")
+                        return None
+                        
+                    # 解析响应
+                    result = response.json()
+                    if result.get('code') != 0:
+                        logger.error(f"API返回错误: {result.get('code')} - {result.get('msg')}")
+                        return None
+                        
+                    # 转换为DataFrame
+                    data = result.get('data')
+                    if not data or not data.get('items'):
+                        logger.debug("API返回空数据")
+                        return pd.DataFrame()
+                        
+                    items = data.get('items')
+                    columns = data.get('fields')
+                    
+                    # 创建DataFrame
+                    df = pd.DataFrame(items, columns=columns)
+                    return df
             
-            # 创建DataFrame
-            df = pd.DataFrame(items, columns=columns)
-            return df
-            
+            else:
+                # 如果没有设置本地地址绑定，使用普通请求
+                s = requests.Session()
+                
+                # 使用SourceAddressAdapter
+                if self.local_addr:
+                    s.mount('http://', SourceAddressAdapter(self.local_addr))
+                    s.mount('https://', SourceAddressAdapter(self.local_addr))
+                
+                response = s.post(
+                    self.url,
+                    json=req_params,
+                    headers=self.headers,
+                    timeout=self.timeout,
+                    proxies=self.proxies
+                )
+                
+                # 检查响应状态
+                if response.status_code != 200:
+                    logger.error(f"API请求错误: {response.status_code} - {response.text}")
+                    return None
+                    
+                # 解析响应
+                result = response.json()
+                if result.get('code') != 0:
+                    logger.error(f"API返回错误: {result.get('code')} - {result.get('msg')}")
+                    return None
+                    
+                # 转换为DataFrame
+                data = result.get('data')
+                if not data or not data.get('items'):
+                    logger.debug("API返回空数据")
+                    return pd.DataFrame()
+                    
+                items = data.get('items')
+                columns = data.get('fields')
+                
+                # 创建DataFrame
+                df = pd.DataFrame(items, columns=columns)
+                return df
+                
         except Exception as e:
+            elapsed = time.time() - start_time
             logger.error(f"获取API数据失败: {str(e)}")
             import traceback
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
-            return None
+            logger.debug(f"请求耗时: {elapsed:.2f}s 后失败")
+            raise  # 重新抛出异常，让调用者处理
 
 
 class SourceAddressAdapter(requests.adapters.HTTPAdapter):
@@ -477,7 +611,7 @@ class StkRewardsFetcher:
             ts_codes: 股票代码列表
             start_date: 开始日期，格式YYYYMMDD（不使用）
             end_date: 结束日期，格式YYYYMMDD（不使用）
-            wan_info: WAN接口和端口信息
+            wan_info: WAN接口和端口信息，格式为(wan_idx, port)
             
         Returns:
             管理层薪酬及持股数据DataFrame
@@ -505,9 +639,9 @@ class StkRewardsFetcher:
         use_wan = wan_info is not None
         
         # 设置最大重试次数
-        max_retries = 3
+        max_retries = 5  # 增加到5次重试
         retry_count = 0
-        retry_delay = 2  # 初始延迟时间（秒）
+        retry_delay = 5  # 增加初始延迟到5秒
         
         # 验证token是否有效
         if not self.token:
@@ -533,7 +667,8 @@ class StkRewardsFetcher:
                     # 创建WAN专用客户端，确保传递正确的token和api_url
                     logger.debug(f"使用token (长度: {len(self.token)}) 创建WAN客户端")
                     client = TushareClientWAN(token=self.token, timeout=120, api_url=self.api_url)
-                    client.set_local_address('0.0.0.0', port)
+                    # 传递WAN索引信息
+                    client.set_local_address('0.0.0.0', port, wan_idx)
                 else:
                     # 使用普通客户端
                     client = self.client
@@ -566,14 +701,52 @@ class StkRewardsFetcher:
                 
             except Exception as e:
                 retry_count += 1
+                error_msg = str(e)
                 
                 # 释放WAN端口（如果使用了）
                 if use_wan:
                     wan_idx, port = wan_info
                     self.port_allocator.release_port(wan_idx, port)
                 
-                # 如果还有重试机会
-                if retry_count <= max_retries:
+                # 特别处理API速率限制错误
+                if "40203" in error_msg and "每小时最多访问" in error_msg:
+                    # 如果是API速率限制错误，使用更长的等待时间
+                    if retry_count <= max_retries:
+                        wait_time = min(3600, retry_delay * (3 ** (retry_count - 1)))  # 更激进的指数退避
+                        logger.warning(f"触发API速率限制，将等待 {wait_time:.1f} 秒后重试 ({retry_count}/{max_retries})")
+                        time.sleep(wait_time)
+                    else:
+                        logger.error(f"达到最大重试次数，无法获取数据: {error_msg}")
+                        return pd.DataFrame()
+                # 处理端口冲突错误
+                elif "WinError 10048" in error_msg:
+                    # 处理端口冲突问题
+                    if retry_count <= max_retries:
+                        wait_time = retry_delay * retry_count + random.uniform(1, 5)
+                        logger.warning(f"端口冲突，将等待 {wait_time:.1f} 秒后重试 ({retry_count}/{max_retries})")
+                        
+                        # 端口冲突时，我们需要获取新的端口
+                        if use_wan:
+                            wan_idx, _ = wan_info  # 保留wan_idx，端口会重新分配
+                            new_port = self.port_allocator.allocate_port(wan_idx)
+                            if new_port:
+                                logger.debug(f"端口冲突后分配新端口: WAN {wan_idx} 端口 {new_port}")
+                                wan_info = (wan_idx, new_port)
+                            else:
+                                logger.warning(f"无法为WAN {wan_idx} 分配新端口，将尝试其他WAN")
+                                # 尝试其他WAN接口
+                                wan_indices = self.port_allocator.get_available_wan_indices()
+                                if wan_indices and len(wan_indices) > 1:
+                                    alt_wan_idx = next((idx for idx in wan_indices if idx != wan_idx), wan_indices[0])
+                                    new_port = self.port_allocator.allocate_port(alt_wan_idx)
+                                    if new_port:
+                                        logger.debug(f"切换到备用WAN: WAN {alt_wan_idx} 端口 {new_port}")
+                                        wan_info = (alt_wan_idx, new_port)
+                    else:
+                        logger.error(f"达到最大重试次数，无法获取数据: {error_msg}")
+                        return pd.DataFrame()
+                # 其他一般错误
+                elif retry_count <= max_retries:
                     # 指数退避算法计算等待时间
                     wait_time = retry_delay * (2 ** (retry_count - 1))
                     
@@ -581,11 +754,11 @@ class StkRewardsFetcher:
                     jitter = random.uniform(0, 0.1 * wait_time)
                     wait_time += jitter
                     
-                    logger.warning(f"获取数据失败 (尝试 {retry_count}/{max_retries}): {str(e)}，将在 {wait_time:.2f} 秒后重试")
+                    logger.warning(f"获取数据失败 (尝试 {retry_count}/{max_retries}): {error_msg}，将在 {wait_time:.2f} 秒后重试")
                     time.sleep(wait_time)
                 else:
                     # 超过最大重试次数
-                    logger.error(f"获取数据失败，已达最大重试次数: {str(e)}")
+                    logger.error(f"获取数据失败，已达最大重试次数: {error_msg}")
                     import traceback
                     logger.debug(f"详细错误信息: {traceback.format_exc()}")
                     return pd.DataFrame()
@@ -624,7 +797,7 @@ class StkRewardsFetcher:
         available_wans = []
         if self.port_allocator:
             available_wans = self.port_allocator.get_available_wan_indices()
-            logger.info(f"可用的WAN接口数量: {len(available_wans)}")
+            logger.info(f"可用的WAN接口数量: {len(available_wans)}, WAN索引: {available_wans}")
             
         if not available_wans:
             logger.warning("没有可用的WAN接口，将使用系统默认网络接口")
@@ -635,6 +808,9 @@ class StkRewardsFetcher:
         result_queue = queue.Queue()
         threads = []
         all_data = []
+        
+        # 创建一个批次重试队列
+        retry_queue = queue.Queue()
         
         # 速率控制器 - 每个WAN接口一个
         rate_controllers = {wan_idx: {
@@ -649,40 +825,141 @@ class StkRewardsFetcher:
         # 创建一个线程锁用于日志和进度更新
         log_lock = threading.Lock()
         
+        # API错误计数和等待机制
+        error_counters = {
+            "rate_limit_errors": 0,
+            "other_errors": 0,
+            "consecutive_rate_limit_errors": 0,
+            "retried_batches": set()  # 记录已重试过的批次
+        }
+        
+        # 用于跟踪每个批次使用的WAN口
+        batch_wan_mapping = {}
+        
         # 处理批次的线程函数
         def process_batch(batch_index, batch_ts_codes, wan_idx):
             try:
+                batch_wan_mapping[batch_index] = wan_idx  # 记录批次使用的WAN
                 with log_lock:
-                    logger.debug(f"WAN {wan_idx} 开始处理批次 {batch_index+1}/{total_batches}")
+                    logger.debug(f"[WAN-{wan_idx}] 开始处理批次 {batch_index+1}/{total_batches}")
                 
-                # 获取WAN接口和端口
-                wan_info = self._get_wan_socket(wan_idx)
-                if not wan_info:
-                    with log_lock:
-                        logger.warning(f"无法为WAN {wan_idx} 获取端口，跳过批次 {batch_index+1}")
-                    result_queue.put((batch_index, None, wan_idx))
-                    return
+                # 最大重试次数
+                max_retries = 5
+                retry_count = 0
                 
-                # 获取批次数据
-                batch_df = self.fetch_stk_rewards_for_ts_codes(batch_ts_codes, start_date, end_date, wan_info)
-                
-                # 记录结果
-                with log_lock:
-                    if batch_df is not None and not batch_df.empty:
-                        logger.debug(f"WAN {wan_idx} 批次 {batch_index+1} 成功获取 {len(batch_df)} 条记录")
-                    else:
-                        logger.debug(f"WAN {wan_idx} 批次 {batch_index+1} 无数据")
+                while retry_count <= max_retries:
+                    # 获取WAN接口和端口
+                    wan_info = self._get_wan_socket(wan_idx)
+                    if not wan_info:
+                        with log_lock:
+                            logger.warning(f"[WAN-{wan_idx}] 无法为WAN {wan_idx} 获取端口，重试 {retry_count+1}/{max_retries}")
                         
-                # 放入结果队列
-                result_queue.put((batch_index, batch_df, wan_idx))
-                
-                # 增加短暂休眠，避免API调用过于频繁，并减轻端口冲突
-                time.sleep(1)
+                        retry_count += 1
+                        if retry_count > max_retries:
+                            with log_lock:
+                                logger.error(f"[WAN-{wan_idx}] 无法为WAN {wan_idx} 获取端口，已达最大重试次数")
+                                # 将批次放入重试队列，以便其他WAN尝试
+                                retry_queue.put((batch_index, batch_ts_codes))
+                            return
+                        
+                        # 等待后重试
+                        time.sleep(5 * retry_count)
+                        continue
+                    
+                    try:
+                        # 获取批次数据
+                        batch_df = self.fetch_stk_rewards_for_ts_codes(batch_ts_codes, start_date, end_date, wan_info)
+                        
+                        # 记录结果
+                        with log_lock:
+                            if batch_df is not None and not batch_df.empty:
+                                logger.debug(f"[WAN-{wan_idx}] 批次 {batch_index+1} 成功获取 {len(batch_df)} 条记录")
+                                # 重置连续错误计数
+                                error_counters["consecutive_rate_limit_errors"] = 0
+                            else:
+                                logger.debug(f"[WAN-{wan_idx}] 批次 {batch_index+1} 无数据")
+                                
+                        # 放入结果队列
+                        result_queue.put((batch_index, batch_df, wan_idx))
+                        
+                        # 增加延迟，尤其是当出现过许多速率限制错误时
+                        with log_lock:
+                            if error_counters["rate_limit_errors"] > 10:
+                                wait_time = 5.0  # 当有多个速率限制错误时，增加等待时间
+                                logger.debug(f"[WAN-{wan_idx}] 由于之前的速率限制错误，额外等待 {wait_time} 秒")
+                                time.sleep(wait_time)
+                            else:
+                                # 增加到3秒的基本延迟
+                                time.sleep(3.0)
+                        
+                        # 成功获取数据，退出重试循环
+                        break
+                        
+                    except Exception as e:
+                        error_msg = str(e)
+                        retry_count += 1
+                        
+                        with log_lock:
+                            # 特别处理API速率限制错误
+                            if "40203" in error_msg and "每小时最多访问" in error_msg:
+                                error_counters["rate_limit_errors"] += 1
+                                error_counters["consecutive_rate_limit_errors"] += 1
+                                
+                                # 根据连续错误数决定等待时间
+                                if error_counters["consecutive_rate_limit_errors"] > 5:
+                                    # 连续多次速率限制错误，等待更长时间
+                                    wait_time = min(3600, 60 * error_counters["consecutive_rate_limit_errors"])
+                                    logger.warning(f"[WAN-{wan_idx}] 连续 {error_counters['consecutive_rate_limit_errors']} 次速率限制错误，将等待 {wait_time} 秒")
+                                else:
+                                    # 普通速率限制错误
+                                    wait_time = 30 * (2 ** (retry_count - 1))
+                                    logger.warning(f"[WAN-{wan_idx}] API速率限制错误 (尝试 {retry_count}/{max_retries})，将等待 {wait_time} 秒")
+                            elif "WinError 10048" in error_msg:  # 处理端口冲突
+                                wait_time = 10 * retry_count  # 端口冲突时等待更长时间
+                                logger.warning(f"[WAN-{wan_idx}] 端口冲突错误 (尝试 {retry_count}/{max_retries})，将等待 {wait_time} 秒")
+                                # 需要尝试其他WAN
+                                if retry_count > 2:  # 超过2次重试仍然冲突，尝试其他WAN
+                                    alternate_wans = [w for w in available_wans if w != wan_idx]
+                                    if alternate_wans:
+                                        new_wan_idx = random.choice(alternate_wans)
+                                        logger.info(f"[WAN-{wan_idx}] 端口冲突严重，从WAN {wan_idx} 切换到 WAN {new_wan_idx}")
+                                        wan_idx = new_wan_idx
+                                        batch_wan_mapping[batch_index] = wan_idx  # 更新批次使用的WAN
+                            else:
+                                error_counters["other_errors"] += 1
+                                wait_time = 5 * retry_count
+                                logger.warning(f"[WAN-{wan_idx}] 处理批次 {batch_index+1} 失败 (尝试 {retry_count}/{max_retries}): {error_msg}，将等待 {wait_time} 秒")
+                        
+                        # 如果达到最大重试次数，将批次放入重试队列
+                        if retry_count > max_retries:
+                            with log_lock:
+                                logger.error(f"[WAN-{wan_idx}] 处理批次 {batch_index+1} 失败，已达最大重试次数")
+                                
+                                # 首次重试时，放入重试队列，让其他WAN尝试
+                                if batch_index not in error_counters["retried_batches"]:
+                                    logger.info(f"[WAN-{wan_idx}] 将批次 {batch_index+1} 放入重试队列，以便其他WAN尝试")
+                                    error_counters["retried_batches"].add(batch_index)
+                                    retry_queue.put((batch_index, batch_ts_codes))
+                                else:
+                                    # 如果已经重试过，直接返回失败结果
+                                    logger.warning(f"[WAN-{wan_idx}] 批次 {batch_index+1} 已经通过其他WAN重试过，标记为失败")
+                                    result_queue.put((batch_index, None, wan_idx))
+                            return
+                        
+                        # 等待后重试
+                        time.sleep(wait_time)
                 
             except Exception as e:
                 with log_lock:
-                    logger.error(f"WAN {wan_idx} 处理批次 {batch_index+1} 失败: {str(e)}")
-                result_queue.put((batch_index, None, wan_idx))
+                    logger.error(f"[WAN-{wan_idx}] 处理批次 {batch_index+1} 失败: {str(e)}")
+                    # 将批次放入重试队列，以便其他WAN尝试
+                    if batch_index not in error_counters["retried_batches"]:
+                        logger.info(f"[WAN-{wan_idx}] 错误处理-将批次 {batch_index+1} 放入重试队列")
+                        error_counters["retried_batches"].add(batch_index)
+                        retry_queue.put((batch_index, batch_ts_codes))
+                    else:
+                        # 如果已经重试过，直接返回失败结果
+                        result_queue.put((batch_index, None, wan_idx))
         
         # 启动处理线程
         start_time_total = time.time()
@@ -690,61 +967,130 @@ class StkRewardsFetcher:
         success_batches = 0
         total_records = 0
         
-        # 分配批次到不同WAN接口 - 轮询方式
+        # 降低并发线程数，防止API速率限制
+        max_concurrent = min(len(available_wans), 4)  # 最多4个并发线程
+        logger.info(f"设置最大并发线程数为 {max_concurrent}")
+        
+        # 批次队列
+        batch_queue = []
         for i in range(0, len(ts_codes_list), batch_size):
             batch_index = i // batch_size
             batch_ts_codes = ts_codes_list[i:i+batch_size]
+            batch_queue.append((batch_index, batch_ts_codes))
+        
+        # 初始化活跃线程计数
+        active_threads = 0
+        
+        # WAN口使用统计
+        wan_usage_stats = {wan_idx: 0 for wan_idx in available_wans}
+        
+        # 处理所有批次
+        while batch_queue or active_threads > 0 or not retry_queue.empty():
+            # 检查是否有重试批次，优先处理
+            retry_batch = None
+            if not retry_queue.empty():
+                try:
+                    retry_batch = retry_queue.get_nowait()
+                    logger.info(f"从重试队列中获取批次 {retry_batch[0]+1}")
+                except queue.Empty:
+                    pass
             
-            # 选择WAN接口 - 简单轮询
-            wan_idx = available_wans[batch_index % len(available_wans)]
-            
-            # 创建线程处理批次
-            thread = threading.Thread(
-                target=process_batch, 
-                args=(batch_index, batch_ts_codes, wan_idx)
-            )
-            threads.append(thread)
-            thread.start()
-            
-            # 控制并发线程数，避免创建过多线程
-            max_concurrent = min(len(available_wans) * 2, 8)  # 降低并发数：每个WAN最多2个线程，总共不超过8个
-            if len(threads) >= max_concurrent:
-                # 等待一个线程完成
-                while result_queue.empty():
-                    time.sleep(0.1)
+            # 检查是否可以启动新线程
+            can_start_thread = active_threads < max_concurrent
+            if can_start_thread and (batch_queue or retry_batch):
+                if retry_batch:
+                    batch_index, batch_ts_codes = retry_batch
+                    # 为重试批次选择不同的WAN接口
+                    used_wans = set()
+                    for t in threads:
+                        if t.is_alive() and hasattr(t, 'wan_idx'):
+                            used_wans.add(t.wan_idx)
+                    
+                    available_for_retry = [w for w in available_wans if w not in used_wans]
+                    if not available_for_retry:
+                        available_for_retry = available_wans
+                    
+                    wan_idx = random.choice(available_for_retry)
+                    logger.info(f"为重试批次 {batch_index+1} 选择 WAN-{wan_idx}")
+                else:
+                    batch_index, batch_ts_codes = batch_queue.pop(0)
+                    # 选择WAN接口 - 简单轮询
+                    wan_idx = available_wans[batch_index % len(available_wans)]
                 
-                # 处理一个结果
+                # 更新WAN口使用统计
+                wan_usage_stats[wan_idx] += 1
+                
+                # 创建线程处理批次
+                thread = threading.Thread(
+                    target=process_batch, 
+                    args=(batch_index, batch_ts_codes, wan_idx)
+                )
+                # 为线程添加WAN索引信息，便于重试时选择不同WAN
+                thread.wan_idx = wan_idx
+                threads.append(thread)
+                thread.start()
+                
+                active_threads += 1
+            
+            # 检查完成的线程
+            if not result_queue.empty():
                 batch_idx, batch_df, wan_idx = result_queue.get()
                 processed_batches += 1
+                active_threads -= 1
+                
+                # 获取批次使用的WAN口编号
+                used_wan = batch_wan_mapping.get(batch_idx, wan_idx)
                 
                 if batch_df is not None and not batch_df.empty:
                     success_batches += 1
                     total_records += len(batch_df)
                     all_data.append(batch_df)
+                    logger.debug(f"[WAN-{used_wan}] 批次 {batch_idx+1} 成功获取 {len(batch_df)} 条记录")
+                else:
+                    logger.warning(f"[WAN-{used_wan}] 批次 {batch_idx+1} 未返回数据")
                 
                 # 更新进度
                 elapsed = time.time() - start_time_total
                 avg_time_per_batch = elapsed / processed_batches if processed_batches > 0 else 0
                 remaining = (total_batches - processed_batches) * avg_time_per_batch
                 progress = processed_batches / total_batches * 100
-                logger.info(f"批次进度: {processed_batches}/{total_batches} ({progress:.1f}%)，已处理时间: {elapsed:.1f}s，预估剩余: {remaining:.1f}s")
                 
-                # 添加额外等待时间，减少端口冲突
-                time.sleep(0.5)
+                # 显示当前活跃的WAN接口
+                active_wans = set(t.wan_idx for t in threads if t.is_alive() and hasattr(t, 'wan_idx'))
+                active_wans_str = ','.join(f"WAN-{w}" for w in active_wans) if active_wans else "无"
+                
+                logger.info(f"批次进度: {processed_batches}/{total_batches} ({progress:.1f}%) [WAN-{used_wan}完成, 活跃:{active_wans_str}], 已处理时间: {elapsed:.1f}s, 预估剩余: {remaining:.1f}s")
+                
+                # 每处理100个批次打印一次WAN使用统计
+                if processed_batches % 100 == 0 or processed_batches == total_batches:
+                    stats_msg = ", ".join([f"WAN-{idx}: {count}次" for idx, count in wan_usage_stats.items()])
+                    logger.info(f"WAN使用统计: {stats_msg}")
+            else:
+                # 短暂休眠，避免CPU占用过高
+                time.sleep(0.1)
         
         # 等待所有线程完成
         for thread in threads:
-            thread.join()
+            if thread.is_alive():
+                thread.join()
             
         # 处理剩余结果
         while not result_queue.empty():
             batch_idx, batch_df, wan_idx = result_queue.get()
             processed_batches += 1
             
+            # 获取批次使用的WAN口编号
+            used_wan = batch_wan_mapping.get(batch_idx, wan_idx)
+            
             if batch_df is not None and not batch_df.empty:
                 success_batches += 1
                 total_records += len(batch_df)
                 all_data.append(batch_df)
+                logger.debug(f"[WAN-{used_wan}] 批次 {batch_idx+1} 处理完成，成功获取 {len(batch_df)} 条记录")
+        
+        # 输出最终WAN使用统计
+        stats_msg = ", ".join([f"WAN-{idx}: {count}次" for idx, count in wan_usage_stats.items()])
+        logger.info(f"最终WAN使用统计: {stats_msg}")
         
         # 合并所有数据
         if all_data:
@@ -879,22 +1225,22 @@ class StkRewardsFetcher:
         hour_call_count += 1
         hour_elapsed = time.time() - hour_start_time
         
-        # 小时级限制控制
-        if hour_call_count >= hour_rate_limit:
+        # 小时级限制控制 - 更加积极的限制
+        if hour_call_count >= hour_rate_limit * 0.95:  # 达到限制的95%时
             # 如果接近小时限制，计算需要等待的时间
             if hour_elapsed < 3600:  # 3600秒 = 1小时
-                wait_time = 3600 - hour_elapsed + 5  # 额外5秒作为缓冲
+                wait_time = 3600 - hour_elapsed + 30  # 增加缓冲到30秒
                 logger.warning(f"接近API小时调用限制 ({hour_rate_limit}/小时)，等待 {wait_time:.1f} 秒")
                 time.sleep(wait_time)
             # 重置计数器
             hour_call_count = 1
             hour_start_time = time.time()
-        elif hour_call_count > hour_rate_limit * 0.9:  # 接近90%的限制
+        elif hour_call_count > hour_rate_limit * 0.8:  # 降低阈值到80%的限制
             # 计算当前调用频率
             calls_per_hour = hour_call_count / (hour_elapsed / 3600) if hour_elapsed > 0 else 0
-            if calls_per_hour > hour_rate_limit:
-                # 如果预计会超过限制，主动降低频率
-                wait_time = 10  # 降低频率的等待时间
+            if calls_per_hour > (hour_rate_limit * 0.9):  # 如果速率超过限制的90%
+                # 主动降低频率
+                wait_time = 20  # 增加等待时间到20秒
                 logger.info(f"API调用频率较高 ({calls_per_hour:.1f}/小时)，主动等待 {wait_time} 秒")
                 time.sleep(wait_time)
         
@@ -902,11 +1248,11 @@ class StkRewardsFetcher:
         minute_call_count += 1
         minute_elapsed = time.time() - minute_start_time
         
-        # 分钟级限制控制
-        if minute_call_count >= minute_rate_limit:
+        # 分钟级限制控制 - 更加积极的限制
+        if minute_call_count >= minute_rate_limit * 0.9:  # 降低阈值到90%
             # 如果接近分钟限制，计算需要等待的时间
             if minute_elapsed < 60:  # 60秒 = 1分钟
-                wait_time = 60 - minute_elapsed + 2  # 额外2秒作为缓冲
+                wait_time = 60 - minute_elapsed + 5  # 增加缓冲到5秒
                 logger.info(f"接近API分钟调用限制 ({minute_rate_limit}/分钟)，等待 {wait_time:.1f} 秒")
                 time.sleep(wait_time)
             # 重置计数器
@@ -915,8 +1261,47 @@ class StkRewardsFetcher:
         
         # 获取当前批次的数据
         wan_info = self._get_wan_socket()  # 获取一个默认WAN接口
-        batch_df = self.fetch_stk_rewards_for_ts_codes(batch_ts_codes, start_date, end_date, wan_info)
-        is_success = batch_df is not None and not batch_df.empty
+        
+        # 设置最大重试次数和初始延迟
+        max_retries = 5  # 增加到5次重试
+        retry_count = 0
+        retry_delay = 5  # 增加初始延迟到5秒
+        
+        while retry_count <= max_retries:
+            try:
+                batch_df = self.fetch_stk_rewards_for_ts_codes(batch_ts_codes, start_date, end_date, wan_info)
+                is_success = batch_df is not None and not batch_df.empty
+                break
+            except Exception as e:
+                retry_count += 1
+                error_msg = str(e)
+                
+                # 特别处理API速率限制错误
+                if "40203" in error_msg and "每小时最多访问" in error_msg:
+                    # 对于API速率限制错误，等待更长时间
+                    wait_time = min(3600, retry_delay * (3 ** (retry_count - 1)))  # 使用更激进的指数退避
+                    logger.warning(f"触发API速率限制，将等待 {wait_time:.1f} 秒后重试 ({retry_count}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    # 对于其他错误，使用普通指数退避
+                    wait_time = retry_delay * (2 ** (retry_count - 1))
+                    # 加入随机抖动，避免多个请求同时重试
+                    jitter = random.uniform(0, 0.1 * wait_time)
+                    wait_time += jitter
+                    logger.warning(f"获取数据失败 (尝试 {retry_count}/{max_retries}): {error_msg}，将在 {wait_time:.2f} 秒后重试")
+                    time.sleep(wait_time)
+                
+                # 如果达到最大重试次数，设置为失败
+                if retry_count > max_retries:
+                    logger.error(f"获取数据失败，已达最大重试次数: {error_msg}")
+                    batch_df = pd.DataFrame()
+                    is_success = False
+                    
+                    # 对于API速率限制错误，我们应该等待较长时间再继续
+                    if "40203" in error_msg and "每小时最多访问" in error_msg:
+                        wait_time = 300  # 等待5分钟
+                        logger.warning(f"由于API速率限制，等待 {wait_time} 秒后继续")
+                        time.sleep(wait_time)
         
         # 更新速率控制器
         rate_controllers.update({
@@ -927,7 +1312,7 @@ class StkRewardsFetcher:
         })
         
         # 短暂休眠以避免API调用过于频繁
-        time.sleep(0.5)  # 增加到0.5秒的间隔，防止端口冲突
+        time.sleep(2.0)  # 增加到2秒的间隔，防止端口冲突
         
         return batch_df, rate_controllers, is_success
 
@@ -963,18 +1348,20 @@ class StkRewardsFetcher:
                     return False
             
             # 获取MongoDB数据库和集合
-            db = self.mongo_client.get_database(self.db_name)
+            # 修复get_database方法不存在的问题
+            db = self.mongo_client.client[self.db_name]  # 使用client属性直接访问数据库
             collection = db[self.collection_name]
-            
-            # 批量更新记录（使用标准MongoDB操作代替upsert_many）
-            inserted_count = 0
-            updated_count = 0
-            unique_keys = ["ts_code", "name", "end_date"]
             
             # 批量处理，避免一次性处理太多记录
             batch_size = 1000
             total_batches = (len(records) + batch_size - 1) // batch_size
             
+            # 记录插入和更新的总数
+            inserted_count = 0
+            updated_count = 0
+            unique_keys = ["ts_code", "name", "end_date"]
+            
+            # 分批处理
             for i in range(0, len(records), batch_size):
                 batch = records[i:i+batch_size]
                 batch_result = self._batch_upsert(collection, batch, unique_keys)
@@ -1101,10 +1488,10 @@ class StkRewardsFetcher:
             "start_date": None,
             "end_date": None,
             "full": False,
-            "batch_size": 10,           # 降低每批次处理股票数量为10
-            "minute_rate_limit": 500,
-            "hour_rate_limit": 4000,
-            "retry_count": 3,
+            "batch_size": 5,           # 降低每批次处理股票数量为5
+            "minute_rate_limit": 400,   # 降低到400以增加安全边际
+            "hour_rate_limit": 3500,    # 降低到3500以增加安全边际
+            "retry_count": 5,           # 增加到5次重试
             "use_parallel": True        # 是否使用并行处理
         }
         
@@ -1159,8 +1546,45 @@ class StkRewardsFetcher:
             logger.warning("没有获取到任何管理层薪酬及持股数据")
             return False
             
-        # 保存数据到MongoDB
-        success = self.save_to_mongodb(df)
+        # 保存数据到MongoDB - 修复MongoDBClient的get_database方法问题
+        try:
+            success = self.save_to_mongodb(df)
+        except AttributeError as e:
+            if "'MongoDBClient' object has no attribute 'get_database'" in str(e):
+                logger.warning("使用替代方法保存到MongoDB")
+                # 使用直接访问client属性的方式
+                mongo_client = self.mongo_client
+                db = mongo_client.client[self.db_name]
+                collection = db[self.collection_name]
+                
+                # 将数据转换为记录并保存
+                if not df.empty:
+                    records = df.to_dict('records')
+                    start_time = time.time()
+                    
+                    # 使用批量写入
+                    bulk_operations = []
+                    for record in records:
+                        # 构建查询条件
+                        query = {"ts_code": record["ts_code"], "name": record["name"], "end_date": record["end_date"]}
+                        bulk_operations.append(pymongo.UpdateOne(query, {"$set": record}, upsert=True))
+                    
+                    # 执行批量操作
+                    if bulk_operations:
+                        result = collection.bulk_write(bulk_operations, ordered=False)
+                        elapsed = time.time() - start_time
+                        logger.success(f"成功保存 {len(records)} 条记录到 MongoDB，耗时 {elapsed:.2f}s")
+                        success = True
+                    else:
+                        logger.warning("没有数据可保存")
+                        success = False
+                else:
+                    logger.warning("没有数据可保存")
+                    success = False
+            else:
+                # 其他类型的AttributeError
+                logger.error(f"保存到MongoDB失败: {str(e)}")
+                success = False
         
         # 关闭MongoDB连接
         self.mongo_client.close()
