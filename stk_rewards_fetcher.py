@@ -603,14 +603,13 @@ class StkRewardsFetcher:
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return set()
 
-    def fetch_stk_rewards_for_ts_codes(self, ts_codes: List[str], start_date: str = None, end_date: str = None, wan_info: Tuple[int, int] = None) -> pd.DataFrame:
+    def fetch_stk_rewards_for_ts_codes(self, ts_codes: List[str], end_date: str = None, wan_info: Tuple[int, int] = None) -> pd.DataFrame:
         """
         批量获取多个股票的管理层薪酬及持股数据
         
         Args:
             ts_codes: 股票代码列表
-            start_date: 开始日期，格式YYYYMMDD（不使用）
-            end_date: 结束日期，格式YYYYMMDD（不使用）
+            end_date: 报告期，格式YYYYMMDD
             wan_info: WAN接口和端口信息，格式为(wan_idx, port)
             
         Returns:
@@ -628,8 +627,13 @@ class StkRewardsFetcher:
         params = self.interface_config.get("params", {}).copy()
         fields = self.interface_config.get("fields", [])
         
-        # 添加查询参数 - 只添加ts_code，不添加日期参数
+        # 添加查询参数 - 添加ts_code和end_date参数
         params["ts_code"] = ts_codes_str
+        
+        # 确保end_date参数被添加(如果提供)
+        if end_date:
+            params["end_date"] = end_date
+            logger.debug(f"设置end_date参数: {end_date}")
         
         # 确保使用正确的字段（根据接口定义）
         if not fields:
@@ -681,7 +685,8 @@ class StkRewardsFetcher:
                 
                 if df is None or df.empty:
                     if self.verbose:
-                        logger.debug(f"批量查询的 {len(ts_codes)} 个股票无管理层薪酬及持股数据")
+                        end_date_text = f"报告期 {end_date} 的" if end_date else ""
+                        logger.debug(f"批量查询的 {len(ts_codes)} 个股票无{end_date_text}管理层薪酬及持股数据")
                     
                     # 释放WAN端口（如果使用了）
                     if use_wan:
@@ -766,15 +771,14 @@ class StkRewardsFetcher:
         # 默认返回空DataFrame (虽然不会执行到这里)
         return pd.DataFrame()
 
-    def fetch_stk_rewards_parallel(self, ts_codes: Set[str], start_date: str = None, end_date: str = None, batch_size: int = 10) -> pd.DataFrame:
+    def fetch_stk_rewards_parallel(self, ts_codes: Set[str], end_date: str = None, batch_size: int = 80) -> pd.DataFrame:
         """
         使用多WAN口并行获取多个股票的管理层薪酬及持股数据
         
         Args:
             ts_codes: 股票代码集合
-            start_date: 开始日期，格式YYYYMMDD
-            end_date: 结束日期，格式YYYYMMDD
-            batch_size: 每批处理的股票数量，默认为10
+            end_date: 报告期，格式YYYYMMDD
+            batch_size: 每批处理的股票数量，默认为100
             
         Returns:
             所有股票的管理层薪酬及持股数据合并后的DataFrame
@@ -802,7 +806,7 @@ class StkRewardsFetcher:
         if not available_wans:
             logger.warning("没有可用的WAN接口，将使用系统默认网络接口")
             # 如果没有可用WAN，回退到普通批处理
-            return self.fetch_stk_rewards_batch(ts_codes, start_date, end_date, batch_size)
+            return self.fetch_stk_rewards_batch(ts_codes, end_date, batch_size)
         
         # 创建结果队列和线程列表
         result_queue = queue.Queue()
@@ -868,19 +872,32 @@ class StkRewardsFetcher:
                     
                     try:
                         # 获取批次数据
-                        batch_df = self.fetch_stk_rewards_for_ts_codes(batch_ts_codes, start_date, end_date, wan_info)
+                        batch_df = self.fetch_stk_rewards_for_ts_codes(batch_ts_codes, end_date, wan_info)
                         
                         # 记录结果
                         with log_lock:
                             if batch_df is not None and not batch_df.empty:
                                 logger.debug(f"[WAN-{wan_idx}] 批次 {batch_index+1} 成功获取 {len(batch_df)} 条记录")
+                                
+                                # 立即保存数据到MongoDB
+                                save_success = self.save_to_mongodb(batch_df)
+                                if save_success:
+                                    if hasattr(self, 'last_operation_stats'):
+                                        inserted = self.last_operation_stats.get('inserted', 0)
+                                        updated = self.last_operation_stats.get('updated', 0)
+                                        skipped = self.last_operation_stats.get('skipped', 0)
+                                        logger.debug(f"[WAN-{wan_idx}] 批次 {batch_index+1} 保存成功: 插入 {inserted}, 更新 {updated}, 跳过 {skipped}")
+                                else:
+                                    logger.warning(f"[WAN-{wan_idx}] 批次 {batch_index+1} 数据保存失败")
+                                
                                 # 重置连续错误计数
                                 error_counters["consecutive_rate_limit_errors"] = 0
                             else:
                                 logger.debug(f"[WAN-{wan_idx}] 批次 {batch_index+1} 无数据")
                                 
-                        # 放入结果队列
-                        result_queue.put((batch_index, batch_df, wan_idx))
+                        # 放入结果队列 - 只保存结果状态，不保存数据内容
+                        batch_records = len(batch_df) if batch_df is not None and not batch_df.empty else 0
+                        result_queue.put((batch_index, batch_records, wan_idx))
                         
                         # 增加延迟，尤其是当出现过许多速率限制错误时
                         with log_lock:
@@ -943,7 +960,7 @@ class StkRewardsFetcher:
                                 else:
                                     # 如果已经重试过，直接返回失败结果
                                     logger.warning(f"[WAN-{wan_idx}] 批次 {batch_index+1} 已经通过其他WAN重试过，标记为失败")
-                                    result_queue.put((batch_index, None, wan_idx))
+                                    result_queue.put((batch_index, 0, wan_idx))
                             return
                         
                         # 等待后重试
@@ -1034,20 +1051,19 @@ class StkRewardsFetcher:
             
             # 检查完成的线程
             if not result_queue.empty():
-                batch_idx, batch_df, wan_idx = result_queue.get()
+                batch_idx, batch_records, wan_idx = result_queue.get()
                 processed_batches += 1
                 active_threads -= 1
                 
                 # 获取批次使用的WAN口编号
                 used_wan = batch_wan_mapping.get(batch_idx, wan_idx)
                 
-                if batch_df is not None and not batch_df.empty:
+                if batch_records > 0:
                     success_batches += 1
-                    total_records += len(batch_df)
-                    all_data.append(batch_df)
-                    logger.debug(f"[WAN-{used_wan}] 批次 {batch_idx+1} 成功获取 {len(batch_df)} 条记录")
+                    total_records += batch_records
+                    logger.debug(f"[WAN-{used_wan}] 批次 {batch_idx+1} 成功获取并保存 {batch_records} 条记录")
                 else:
-                    logger.warning(f"[WAN-{used_wan}] 批次 {batch_idx+1} 未返回数据")
+                    logger.warning(f"[WAN-{used_wan}] 批次 {batch_idx+1} 未返回数据或保存失败")
                 
                 # 更新进度
                 elapsed = time.time() - start_time_total
@@ -1076,39 +1092,32 @@ class StkRewardsFetcher:
             
         # 处理剩余结果
         while not result_queue.empty():
-            batch_idx, batch_df, wan_idx = result_queue.get()
+            batch_idx, batch_records, wan_idx = result_queue.get()
             processed_batches += 1
             
             # 获取批次使用的WAN口编号
             used_wan = batch_wan_mapping.get(batch_idx, wan_idx)
             
-            if batch_df is not None and not batch_df.empty:
+            if batch_records > 0:
                 success_batches += 1
-                total_records += len(batch_df)
-                all_data.append(batch_df)
-                logger.debug(f"[WAN-{used_wan}] 批次 {batch_idx+1} 处理完成，成功获取 {len(batch_df)} 条记录")
+                total_records += batch_records
+                logger.debug(f"[WAN-{used_wan}] 批次 {batch_idx+1} 处理完成，成功获取并保存 {batch_records} 条记录")
         
         # 输出最终WAN使用统计
         stats_msg = ", ".join([f"WAN-{idx}: {count}次" for idx, count in wan_usage_stats.items()])
         logger.info(f"最终WAN使用统计: {stats_msg}")
         
-        # 合并所有数据
-        if all_data:
-            result_df = pd.concat(all_data, ignore_index=True)
-            logger.success(f"并行处理成功获取 {success_batches}/{total_batches} 个批次的管理层薪酬及持股数据，共 {len(result_df)} 条记录")
-            return result_df
-        else:
-            logger.warning("没有获取到任何管理层薪酬及持股数据")
-            return pd.DataFrame()
+        # 合并所有数据 - 这里不再需要合并数据因为每个批次都已经保存到MongoDB
+        logger.success(f"并行处理成功获取和保存 {success_batches}/{total_batches} 个批次的管理层薪酬及持股数据，共 {total_records} 条记录")
+        return pd.DataFrame()  # 返回空DataFrame，因为数据已经保存到MongoDB
 
-    def fetch_stk_rewards_batch(self, ts_codes: Set[str], start_date: str = None, end_date: str = None, batch_size: int = 100, minute_rate_limit: int = 500, hour_rate_limit: int = 4000) -> pd.DataFrame:
+    def fetch_stk_rewards_batch(self, ts_codes: Set[str], end_date: str = None, batch_size: int = 90, minute_rate_limit: int = 500, hour_rate_limit: int = 4000) -> pd.DataFrame:
         """
         批量获取多个股票的管理层薪酬及持股数据
         
         Args:
             ts_codes: 股票代码集合
-            start_date: 开始日期，格式YYYYMMDD
-            end_date: 结束日期，格式YYYYMMDD
+            end_date: 报告期，格式YYYYMMDD
             batch_size: 每批处理的股票数量
             minute_rate_limit: 每分钟API调用限制
             hour_rate_limit: 每小时API调用限制
@@ -1152,7 +1161,6 @@ class StkRewardsFetcher:
             # 获取批次数据
             batch_df, rate_controllers, is_success = self._fetch_batch(
                 batch_ts_codes, 
-                start_date, 
                 end_date, 
                 rate_controllers
             )
@@ -1186,7 +1194,6 @@ class StkRewardsFetcher:
     def _fetch_batch(
         self, 
         batch_ts_codes: List[str], 
-        start_date: str = None, 
         end_date: str = None,
         rate_controllers: Dict[str, Any] = None
     ) -> Tuple[pd.DataFrame, Dict[str, Any], bool]:
@@ -1195,8 +1202,7 @@ class StkRewardsFetcher:
         
         Args:
             batch_ts_codes: 批次股票代码列表
-            start_date: 开始日期
-            end_date: 结束日期
+            end_date: 报告期
             rate_controllers: 速率控制器字典，包含计数器和时间戳
             
         Returns:
@@ -1269,7 +1275,7 @@ class StkRewardsFetcher:
         
         while retry_count <= max_retries:
             try:
-                batch_df = self.fetch_stk_rewards_for_ts_codes(batch_ts_codes, start_date, end_date, wan_info)
+                batch_df = self.fetch_stk_rewards_for_ts_codes(batch_ts_codes, end_date, wan_info)
                 is_success = batch_df is not None and not batch_df.empty
                 break
             except Exception as e:
@@ -1326,18 +1332,11 @@ class StkRewardsFetcher:
         Returns:
             是否成功保存
         """
-        # 强制确保使用tushare_data作为数据库名称
-        logger.info(f"保存数据到MongoDB数据库：{self.db_name}，集合：{self.collection_name}")
-        
         if df is None or df.empty:
             logger.warning("没有数据可保存到MongoDB")
             return False
             
         try:
-            # 将DataFrame转换为记录列表
-            records = df.to_dict('records')
-            
-            # 保存到MongoDB
             start_time = time.time()
             
             # 确保MongoDB连接
@@ -1348,68 +1347,74 @@ class StkRewardsFetcher:
                     return False
             
             # 获取MongoDB数据库和集合
-            # 修复get_database方法不存在的问题
             db = self.mongo_client.client[self.db_name]  # 使用client属性直接访问数据库
             collection = db[self.collection_name]
             
+            # 首先创建索引 - 提前创建索引以提高插入和查询效率
+            if not self._ensure_indexes(collection):
+                logger.warning("索引创建或确认失败，将尝试继续保存数据")
+            
+            # 将DataFrame转换为字典列表
+            records = df.to_dict('records')
+            
             # 批量处理，避免一次性处理太多记录
-            batch_size = 1000
+            batch_size = 1000  # 设置合适的批量大小
             total_batches = (len(records) + batch_size - 1) // batch_size
             
-            # 记录插入和更新的总数
-            inserted_count = 0
-            updated_count = 0
-            unique_keys = ["ts_code", "name", "end_date"]
+            total_inserted = 0
+            total_updated = 0
+            total_skipped = 0
             
-            # 分批处理
+            # 准备批量操作
             for i in range(0, len(records), batch_size):
                 batch = records[i:i+batch_size]
-                batch_result = self._batch_upsert(collection, batch, unique_keys)
-                inserted_count += batch_result["inserted"]
-                updated_count += batch_result["updated"]
                 
-                # 进度显示
-                if self.verbose and total_batches > 1:
-                    progress = (i + batch_size) / len(records) * 100
-                    progress = min(progress, 100)
-                    logger.debug(f"MongoDB保存进度: {i+len(batch)}/{len(records)} ({progress:.1f}%)")
+                # 增加超时时间，避免大批量操作超时
+                try:
+                    # 使用更适合的唯一键 - 根据业务逻辑
+                    unique_keys = ["ts_code", "name", "end_date"]
+                    batch_result = self._batch_upsert(collection, batch, unique_keys)
+                    
+                    # 更新统计信息 - 注意_batch_upsert方法中可能没有skipped字段
+                    total_inserted += batch_result.get("inserted", 0)
+                    total_updated += batch_result.get("updated", 0)
+                    if "skipped" in batch_result:
+                        total_skipped += batch_result["skipped"]
+                    
+                    # 进度显示
+                    if self.verbose and total_batches > 1:
+                        progress = (i + len(batch)) / len(records) * 100
+                        progress = min(progress, 100)
+                        logger.debug(f"MongoDB保存进度: {i+len(batch)}/{len(records)} ({progress:.1f}%)")
+                except Exception as e:
+                    logger.error(f"批量处理数据时出错: {str(e)}")
+                    import traceback
+                    logger.debug(f"详细错误信息: {traceback.format_exc()}")
             
             elapsed = time.time() - start_time
+            total_processed = total_inserted + total_updated + total_skipped
             
-            # 创建索引
-            try:
-                # 根据接口配置中的index_fields创建索引
-                index_fields = self.interface_config.get("index_fields", [])
-                if index_fields:
-                    # 为ts_code, name, end_date创建复合索引
-                    if all(field in index_fields for field in ["ts_code", "name", "end_date"]):
-                        collection.create_index(
-                            [("ts_code", 1), ("name", 1), ("end_date", 1)],
-                            unique=True,
-                            background=True
-                        )
-                        logger.debug("已为字段组合 (ts_code, name, end_date) 创建唯一复合索引")
-                    
-                    # 创建其他单字段索引
-                    for field in ["ts_code", "end_date"]:
-                        if field in index_fields:
-                            collection.create_index(field)
-                            logger.debug(f"已为字段 {field} 创建索引")
-                else:
-                    # 默认创建索引
-                    collection.create_index([("ts_code", 1), ("name", 1), ("end_date", 1)], unique=True)
-                    collection.create_index("ts_code")
-                    collection.create_index("end_date")
-                    logger.debug("已创建默认索引")
-            except Exception as e:
-                logger.warning(f"创建索引时出错: {str(e)}")
+            # 保存操作统计信息，供调用方使用
+            self.last_operation_stats = {
+                "inserted": total_inserted,
+                "updated": total_updated,
+                "skipped": total_skipped,
+                "total": total_processed
+            }
             
-            total_modified = inserted_count + updated_count
-            logger.success(f"成功保存 {total_modified} 条记录到 MongoDB (新增: {inserted_count}, 更新: {updated_count})，耗时 {elapsed:.2f}s")
-            return True
+            # 输出详细的统计信息
+            logger.success(f"数据处理完成: 新插入 {total_inserted} 条记录，更新 {total_updated} 条记录，跳过 {total_skipped} 条记录，共处理 {total_processed}/{len(records)} 条记录，耗时 {elapsed:.2f}s")
             
+            # 确认是否成功处理了数据
+            if total_processed > 0:
+                return True
+            else:
+                if len(records) > 0:
+                    logger.warning(f"提交了 {len(records)} 条记录，但MongoDB未报告任何插入、更新或跳过的记录")
+                return False
+                
         except Exception as e:
-            logger.error(f"保存到MongoDB失败: {str(e)}")
+            logger.error(f"保存数据到MongoDB失败: {str(e)}")
             import traceback
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return False
@@ -1424,75 +1429,258 @@ class StkRewardsFetcher:
             unique_keys: 唯一键列表
             
         Returns:
-            包含插入和更新记录数的字典
+            包含插入、更新和跳过记录数的字典
         """
+        if not records:
+            return {"inserted": 0, "updated": 0, "skipped": 0}
+            
+        # 为了提高效率，我们不再逐个检查记录是否存在，而是批量处理
+        # 而是用两步策略：先查询哪些记录已存在，然后将记录分为插入和更新两组
         inserted = 0
         updated = 0
+        skipped = 0
         
-        # 使用bulk操作提高效率
-        bulk_operations = []
+        # 构建所有记录的唯一键查询
+        existing_records = set()
+        queries = []
+        valid_records = []
         
+        # 第一步：提取所有有效记录并构建查询条件
         for record in records:
             # 构建查询条件
-            query = {key: record[key] for key in unique_keys if key in record}
+            query = {}
+            key_str = ""
+            is_valid = True
             
-            # 如果缺少唯一键字段，则直接插入
-            if len(query) != len(unique_keys):
-                bulk_operations.append(pymongo.InsertOne(record))
-                inserted += 1
+            for key in unique_keys:
+                if key in record and record[key] is not None:
+                    query[key] = record[key]
+                    key_str += str(record[key]) + "_"
+                else:
+                    # 缺少唯一键字段，标记为无效
+                    is_valid = False
+                    break
+                    
+            if not is_valid or len(query) != len(unique_keys):
+                # 跳过无效记录
+                skipped += 1
                 continue
                 
-            # 否则执行更新
-            bulk_operations.append(
-                pymongo.UpdateOne(
-                    query,
-                    {"$set": record},
-                    upsert=True
-                )
-            )
-            updated += 1
-            
-        # 如果有操作，则执行批量操作
-        if bulk_operations:
-            try:
-                result = collection.bulk_write(bulk_operations, ordered=False)
-                # 重新统计真实的插入和更新数量
-                inserted = result.inserted_count
-                # upserted_count是新插入的，modified_count是更新的
-                updated = result.upserted_count + result.modified_count
-            except pymongo.errors.BulkWriteError as bwe:
-                # 处理部分失败的情况
-                if hasattr(bwe, 'details'):
-                    if 'nInserted' in bwe.details:
-                        inserted = bwe.details['nInserted']
-                    if 'nUpserted' in bwe.details:
-                        updated = bwe.details['nUpserted']
-                    if 'nModified' in bwe.details:
-                        updated += bwe.details['nModified']
-                logger.warning(f"批量写入部分失败: {len(bwe.details.get('writeErrors', []))} 错误")
+            # 检查是否已处理过相同的记录
+            if key_str in existing_records:
+                skipped += 1
+                continue
                 
-        return {"inserted": inserted, "updated": updated}
+            # 记录唯一键，准备查询
+            existing_records.add(key_str)
+            queries.append(query)
+            valid_records.append((record, query))
+            
+        # 第二步：查询哪些记录已经存在
+        if not valid_records:
+            logger.warning("没有有效记录可以处理")
+            return {"inserted": 0, "updated": 0, "skipped": skipped}
+            
+        # 使用$or查询批量检查记录是否存在
+        existing_keys = set()
+        try:
+            if queries:
+                query = {"$or": queries}
+                existing_docs = collection.find(query, {"_id": 0, **{k: 1 for k in unique_keys}})
+                
+                # 记录已存在的记录的唯一键
+                for doc in existing_docs:
+                    key_values = tuple(doc.get(key) for key in unique_keys)
+                    existing_keys.add(key_values)
+        except Exception as e:
+            logger.error(f"批量查询记录存在性失败: {str(e)}")
+            # 如果查询失败，假设所有记录都需要更新
+            existing_keys = set()  # 清空集合，后续会执行upsert
+            
+        # 根据查询结果准备插入和更新操作
+        insert_ops = []
+        update_ops = []
+        
+        for record, query in valid_records:
+            # 构建唯一键元组
+            key_values = tuple(record.get(key) for key in unique_keys)
+            
+            if key_values in existing_keys:
+                # 记录已存在，执行更新
+                update_ops.append(
+                    pymongo.UpdateOne(
+                        query,
+                        {"$set": record}
+                    )
+                )
+                updated += 1
+            else:
+                # 记录不存在，执行插入
+                insert_ops.append(pymongo.InsertOne(record))
+                inserted += 1
+                
+        # 分别执行插入和更新操作
+        try:
+            # 设置合理的WriteConcern参数
+            from pymongo import WriteConcern
+            temp_collection = collection.with_options(
+                write_concern=WriteConcern(w=1, j=False)
+            )
+            
+            # 执行插入操作
+            if insert_ops:
+                try:
+                    insert_result = temp_collection.bulk_write(insert_ops, ordered=False)
+                    real_inserted = insert_result.inserted_count
+                    if real_inserted != len(insert_ops):
+                        logger.warning(f"实际插入数量与预期不一致: 预期={len(insert_ops)}, 实际={real_inserted}")
+                        inserted = real_inserted
+                except pymongo.errors.BulkWriteError as bwe:
+                    # 处理部分失败的插入
+                    if hasattr(bwe, 'details'):
+                        details = bwe.details
+                        if 'nInserted' in details:
+                            inserted = details['nInserted']
+                        skipped += len(insert_ops) - inserted
+                        
+                        # 检查是否有重复键错误
+                        if 'writeErrors' in details:
+                            for error in details['writeErrors']:
+                                if error.get('code') == 11000:  # 重复键错误
+                                    if self.verbose:
+                                        logger.debug(f"插入操作重复键错误: {error.get('errmsg', '')}")
+                                        
+                    logger.warning(f"插入操作部分失败: {len(bwe.details.get('writeErrors', []))} 错误")
+            
+            # 执行更新操作
+            if update_ops:
+                try:
+                    update_result = temp_collection.bulk_write(update_ops, ordered=False)
+                    real_updated = update_result.modified_count
+                    if real_updated != len(update_ops):
+                        logger.debug(f"部分记录未被修改，可能数据未变化: 预期={len(update_ops)}, 实际修改={real_updated}")
+                except pymongo.errors.BulkWriteError as bwe:
+                    # 处理部分失败的更新
+                    if hasattr(bwe, 'details'):
+                        details = bwe.details
+                        if 'nModified' in details:
+                            updated = details['nModified']
+                        skipped += len(update_ops) - updated
+                    logger.warning(f"更新操作部分失败: {len(bwe.details.get('writeErrors', []))} 错误")
+                    
+        except Exception as e:
+            logger.error(f"执行批量操作失败: {str(e)}")
+            import traceback
+            logger.debug(f"详细错误信息: {traceback.format_exc()}")
+            
+        return {"inserted": inserted, "updated": updated, "skipped": skipped}
+
+    def _ensure_indexes(self, collection) -> bool:
+        """
+        确保必要的索引存在
+        
+        Args:
+            collection: MongoDB集合对象
+            
+        Returns:
+            是否成功创建或确认索引
+        """
+        try:
+            # 获取现有索引
+            existing_indexes = collection.index_information()
+            logger.debug(f"现有索引信息: {existing_indexes}")
+            
+            # 获取索引字段配置
+            index_fields = self.interface_config.get("index_fields", ["ts_code", "name", "end_date"])
+            
+            # 检查复合唯一索引 (ts_code, name, end_date)
+            index_name = "ts_code_1_name_1_end_date_1"
+            index_created = False
+            
+            # 检查索引是否存在并且结构正确
+            if index_name in existing_indexes:
+                # 验证索引的键和属性
+                existing_index = existing_indexes[index_name]
+                expected_keys = [("ts_code", 1), ("name", 1), ("end_date", 1)]
+                
+                # 确保是有序的正确键和唯一约束
+                keys_match = all(key in expected_keys for key in existing_index['key']) and len(existing_index['key']) == len(expected_keys)
+                is_unique = existing_index.get('unique', False)
+                
+                if keys_match and is_unique:
+                    logger.debug("复合唯一索引 (ts_code, name, end_date) 已存在且结构正确，跳过创建")
+                else:
+                    # 索引存在但结构不正确，删除并重建
+                    logger.info("复合唯一索引 (ts_code, name, end_date) 存在但结构不正确，删除并重建索引")
+                    try:
+                        collection.drop_index(index_name)
+                        logger.debug(f"成功删除现有索引: {index_name}")
+                    except Exception as e:
+                        logger.error(f"删除索引时出错: {str(e)}")
+                    
+                    # 创建正确的索引
+                    collection.create_index(
+                        [("ts_code", 1), ("name", 1), ("end_date", 1)], 
+                        unique=True, 
+                        background=True
+                    )
+                    logger.success("已重建复合唯一索引 (ts_code, name, end_date)")
+                    index_created = True
+            else:
+                # 索引不存在，创建它
+                logger.info(f"正在为集合 {collection.name} 创建复合唯一索引 (ts_code, name, end_date)...")
+                collection.create_index(
+                    [("ts_code", 1), ("name", 1), ("end_date", 1)], 
+                    unique=True, 
+                    background=True
+                )
+                logger.success("已成功创建复合唯一索引 (ts_code, name, end_date)")
+                index_created = True
+            
+            # 检查单字段索引
+            for field in ["ts_code", "end_date"]:
+                if field in index_fields:
+                    index_field_name = f"{field}_1"
+                    if index_field_name not in existing_indexes:
+                        logger.info(f"正在为字段 {field} 创建索引...")
+                        collection.create_index(field)
+                        logger.success(f"已为字段 {field} 创建索引")
+                        index_created = True
+                    else:
+                        logger.debug(f"字段 {field} 的索引已存在，跳过创建")
+            
+            # 确保在创建索引后等待一小段时间，让MongoDB完成索引构建
+            if index_created:
+                logger.info("索引已创建或修改，等待MongoDB完成索引构建...")
+                time.sleep(1.0)  # 等待1秒，让MongoDB完成索引构建
+            
+            return True
+                    
+        except Exception as e:
+            logger.error(f"创建索引时出错: {str(e)}")
+            import traceback
+            logger.debug(f"详细错误信息: {traceback.format_exc()}")
+            return False
 
     def run(self, config: Optional[Dict[str, Any]] = None) -> bool:
         """
         运行数据获取和保存流程，支持自定义配置
         
         Args:
-            config: 配置字典，包含start_date, end_date, full等信息
+            config: 配置字典，包含end_date, full等信息
             
         Returns:
             是否成功
         """
         # 使用默认配置
         default_config = {
-            "start_date": None,
             "end_date": None,
             "full": False,
-            "batch_size": 5,           # 降低每批次处理股票数量为5
+            "batch_size": 90,           # 降低到30支股票，防止单批次返回超过4000条限制
             "minute_rate_limit": 400,   # 降低到400以增加安全边际
             "hour_rate_limit": 3500,    # 降低到3500以增加安全边际
             "retry_count": 5,           # 增加到5次重试
-            "use_parallel": True        # 是否使用并行处理
+            "use_parallel": True,       # 是否使用并行处理
         }
         
         # 合并配置
@@ -1500,7 +1688,6 @@ class StkRewardsFetcher:
             config = {}
         
         effective_config = {**default_config, **config}
-        start_date = effective_config["start_date"]
         end_date = effective_config["end_date"]
         full = effective_config["full"]
         batch_size = effective_config["batch_size"]
@@ -1508,11 +1695,32 @@ class StkRewardsFetcher:
         hour_rate_limit = effective_config["hour_rate_limit"]
         use_parallel = effective_config["use_parallel"]
         
-        # 如果未提供日期并且不是全量模式，则设置默认为最近一周
-        if not start_date and not end_date and not full:
-            end_date = datetime.now().strftime("%Y%m%d")
-            start_date = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
-            logger.info(f"设置默认日期范围: {start_date} - {end_date}")
+        # 如果未提供日期并且不是全量模式，则设置默认为最近一个季度末
+        if not end_date and not full:
+            now = datetime.now()
+            # 获取最近一个季度末日期 (3月31日、6月30日、9月30日、12月31日)
+            month = now.month
+            year = now.year
+            
+            if month <= 3:
+                # 上一年Q4
+                quarter_end_month = 12
+                quarter_end_year = year - 1
+            elif month <= 6:
+                # 当年Q1
+                quarter_end_month = 3
+                quarter_end_year = year
+            elif month <= 9:
+                # 当年Q2
+                quarter_end_month = 6
+                quarter_end_year = year
+            else:
+                # 当年Q3
+                quarter_end_month = 9
+                quarter_end_year = year
+            
+            end_date = f"{quarter_end_year}{quarter_end_month:02d}{'30' if quarter_end_month in [6, 9] else '31'}"
+            logger.info(f"设置默认季度末日期: {end_date}")
         
         # 从stock_basic集合获取目标股票代码
         target_ts_codes = self.get_target_ts_codes_from_stock_basic()
@@ -1520,74 +1728,54 @@ class StkRewardsFetcher:
             logger.error("未能从stock_basic集合获取目标股票代码")
             return False
             
+        # 确保在获取数据前创建好索引 - 预先创建索引可以提高后续插入效率
+        try:
+            db = self.mongo_client.client[self.db_name]
+            collection = db[self.collection_name]
+            logger.info(f"预先创建索引，确保集合 {self.collection_name} 具有必要的索引")
+            self._ensure_indexes(collection)
+        except Exception as e:
+            logger.warning(f"预先创建索引时出错: {str(e)}，将在保存数据时再尝试创建")
+        
         # 批量获取管理层薪酬及持股数据
         if use_parallel and self.port_allocator:
             # 使用多WAN口并行抓取
-            logger.info("使用多WAN口并行获取数据")
-            df = self.fetch_stk_rewards_parallel(
+            logger.info(f"使用多WAN口并行获取数据，每批次 {batch_size} 支股票，报告期: {end_date}")
+            df_result = self.fetch_stk_rewards_parallel(
                 ts_codes=target_ts_codes, 
-                start_date=start_date, 
                 end_date=end_date,
                 batch_size=batch_size
             )
+            # fetch_stk_rewards_parallel方法现在在内部每批次获取数据后立即保存到MongoDB
+            # 如果返回空DataFrame，表示已经全部保存，视为成功
+            if df_result.empty:
+                logger.info("并行模式已完成所有数据获取和保存")
+                success = True
+            else:
+                # 如果有返回数据，则需要保存最后这一批
+                logger.info(f"并行模式有剩余数据需要保存 ({len(df_result)} 条记录)")
+                success = self.save_to_mongodb(df_result)
         else:
             # 使用普通批量获取
-            logger.info("使用普通批量方式获取数据")
+            logger.info(f"使用普通批量方式获取数据，每批次 {batch_size} 支股票，报告期: {end_date}")
             df = self.fetch_stk_rewards_batch(
                 ts_codes=target_ts_codes, 
-                start_date=start_date, 
                 end_date=end_date,
                 batch_size=batch_size,
                 minute_rate_limit=minute_rate_limit,
                 hour_rate_limit=hour_rate_limit
             )
-        
-        if df.empty:
-            logger.warning("没有获取到任何管理层薪酬及持股数据")
-            return False
             
-        # 保存数据到MongoDB - 修复MongoDBClient的get_database方法问题
-        try:
-            success = self.save_to_mongodb(df)
-        except AttributeError as e:
-            if "'MongoDBClient' object has no attribute 'get_database'" in str(e):
-                logger.warning("使用替代方法保存到MongoDB")
-                # 使用直接访问client属性的方式
-                mongo_client = self.mongo_client
-                db = mongo_client.client[self.db_name]
-                collection = db[self.collection_name]
-                
-                # 将数据转换为记录并保存
-                if not df.empty:
-                    records = df.to_dict('records')
-                    start_time = time.time()
-                    
-                    # 使用批量写入
-                    bulk_operations = []
-                    for record in records:
-                        # 构建查询条件
-                        query = {"ts_code": record["ts_code"], "name": record["name"], "end_date": record["end_date"]}
-                        bulk_operations.append(pymongo.UpdateOne(query, {"$set": record}, upsert=True))
-                    
-                    # 执行批量操作
-                    if bulk_operations:
-                        result = collection.bulk_write(bulk_operations, ordered=False)
-                        elapsed = time.time() - start_time
-                        logger.success(f"成功保存 {len(records)} 条记录到 MongoDB，耗时 {elapsed:.2f}s")
-                        success = True
-                    else:
-                        logger.warning("没有数据可保存")
-                        success = False
-                else:
-                    logger.warning("没有数据可保存")
-                    success = False
-            else:
-                # 其他类型的AttributeError
-                logger.error(f"保存到MongoDB失败: {str(e)}")
+            if df.empty:
+                logger.warning("没有获取到任何管理层薪酬及持股数据")
                 success = False
+            else:
+                logger.info(f"批量获取了 {len(df)} 条记录，准备保存到MongoDB")
+                success = self.save_to_mongodb(df)
         
         # 关闭MongoDB连接
         self.mongo_client.close()
+        logger.info("MongoDB连接已关闭")
         
         return success
 
@@ -1624,11 +1812,10 @@ def main():
     parser.add_argument('--market-codes', default='00,30,60,68', help='目标市场代码，用逗号分隔')
     parser.add_argument('--db-name', default='tushare_data', help='MongoDB数据库名称')
     parser.add_argument('--collection-name', default='stk_rewards', help='MongoDB集合名称')
-    parser.add_argument('--start-date', help='开始日期，格式YYYYMMDD')
-    parser.add_argument('--end-date', help='结束日期，格式YYYYMMDD')
-    parser.add_argument('--full', action='store_true', help='获取所有历史数据（默认只获取最近一周）')
+    parser.add_argument('--end-date', help='报告期，格式YYYYMMDD，如20190630表示获取该季度末的数据')
+    parser.add_argument('--full', action='store_true', help='获取所有历史数据（默认只获取最近一个季度末）')
     parser.add_argument('--verbose', action='store_true', help='输出详细日志')
-    parser.add_argument('--batch-size', type=int, default=1, help='每批请求的股票数量')
+    parser.add_argument('--batch-size', type=int, default=90, help='每批请求的股票数量，建议不超过90')
     parser.add_argument('--minute-rate-limit', type=int, default=100, help='每分钟API调用限制')
     parser.add_argument('--hour-rate-limit', type=int, default=2000, help='每小时API调用限制')
     parser.add_argument('--retry-count', type=int, default=3, help='API调用失败重试次数')
@@ -1646,7 +1833,7 @@ def main():
         config_path=args.config,
         interface_dir=args.interface_dir,
         target_market_codes=target_market_codes,
-        db_name=args.db_name,  # 这个值会被内部强制设为"tushare_data"
+        db_name=args.db_name,
         collection_name=args.collection_name,
         verbose=args.verbose
     )
@@ -1657,7 +1844,6 @@ def main():
         
         # 构建运行配置字典
         run_config = {
-            "start_date": args.start_date,
             "end_date": args.end_date,
             "full": args.full,
             "batch_size": args.batch_size,

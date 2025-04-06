@@ -1,0 +1,15 @@
+{
+    "description": "每日涨跌停价格",
+    "api_name": "stk_limit",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code", "trade_date"
+    ],
+    "available_fields": [
+      "ts_code", "trade_date", "pre_close", "up_limit", "down_limit"
+    ]
+  }

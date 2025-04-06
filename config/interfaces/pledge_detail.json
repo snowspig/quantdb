@@ -1,0 +1,14 @@
+{
+    "description": "股权质押明细",
+    "api_name": "pledge_detail",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code", "ann_date", "start_date"
+    ],
+    "available_fields": [
+    ]
+  }

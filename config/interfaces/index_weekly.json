@@ -1,0 +1,15 @@
+{
+    "description": "指数周线行情",
+    "api_name": "index_weekly",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "weekly",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code", "trade_date"
+    ],
+    "available_fields": [
+
+    ]
+  }

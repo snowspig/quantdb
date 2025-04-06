@@ -2432,12 +2432,61 @@ class MonthlyFetcher:
             return self._run_by_stock_codes(start_date, end_date, batch_size, use_parallel)
             
         elif recent:
-            # --recent 模式: 获取最近一个月的数据，筛选出周五的数据
-            today = datetime.now()
-            end_date = today.strftime('%Y%m%d')
-            start_date = (today - timedelta(days=30)).strftime('%Y%m%d')  # 最近30天
-            logger.info(f"使用recent模式：获取 {start_date} 至 {end_date} 期间的周五交易日数据")
-            return self._run_by_trade_dates(start_date, end_date, use_parallel)
+            # --recent 模式: 获取最近三个月每月末5天的数据
+            # 获取最近三个月的月末5天日期
+            month_end_dates = self._get_recent_months_end_days(months=3, days_per_month=5)
+            if not month_end_dates:
+                logger.warning("无法获取最近三个月的月末日期")
+                return False
+                
+            logger.info(f"使用recent模式：获取最近三个月的月末5天数据，共 {len(month_end_dates)} 个日期")
+            for date_batch in self._split_list(month_end_dates, 5):
+                logger.debug(f"月末日期批次: {date_batch}")
+                
+            # 获取目标股票代码
+            target_ts_codes = self.get_target_ts_codes_from_stock_basic()
+            if not target_ts_codes:
+                logger.error("未能获取到任何目标板块的股票代码")
+                return False
+                
+            # 检查是否可以并行处理
+            if use_parallel and self.port_allocator:
+                available_wans = self.port_allocator.get_available_wan_indices()
+                if available_wans:
+                    logger.info(f"使用多WAN接口并行模式处理 {len(month_end_dates)} 个月末日期")
+                    return self._fetch_parallel_by_dates(month_end_dates, target_ts_codes, available_wans)
+            
+            # 串行处理每个日期
+            logger.info(f"使用串行模式处理 {len(month_end_dates)} 个月末日期")
+            total_records = 0
+            success_count = 0
+            
+            for trade_date in month_end_dates:
+                logger.info(f"处理月末日期: {trade_date}")
+                
+                # 获取当日数据
+                df = self.fetch_monthly_by_date_with_offset(trade_date=trade_date)
+                
+                if not df.empty:
+                    # 过滤目标板块股票
+                    df_filtered = self.filter_monthly_data(df, target_ts_codes)
+                    
+                    # 保存到MongoDB
+                    if not df_filtered.empty:
+                        success = self.save_to_mongodb(df_filtered)
+                        if success:
+                            success_count += 1
+                            total_records += len(df_filtered)
+                            logger.success(f"成功保存 {trade_date} 的月线数据，共 {len(df_filtered)} 条记录")
+                        else:
+                            logger.warning(f"保存 {trade_date} 的月线数据失败")
+                    else:
+                        logger.warning(f"日期 {trade_date} 过滤后无目标板块股票数据")
+                else:
+                    logger.warning(f"日期 {trade_date} 未获取到数据")
+                
+            logger.success(f"最近三个月月末数据获取完成，成功处理 {success_count}/{len(month_end_dates)} 个日期，共 {total_records} 条记录")
+            return success_count > 0
             
         elif start_date and end_date:
             # --start-date --end-date 模式: 指定日期范围，按股票代码列表分批获取
@@ -2445,12 +2494,8 @@ class MonthlyFetcher:
             return self._run_by_stock_codes(start_date, end_date, batch_size, use_parallel)
             
         else:
-            # 默认模式: 同recent模式，但使用最近一个月
-            today = datetime.now()
-            end_date = today.strftime('%Y%m%d')
-            start_date = (today - timedelta(days=30)).strftime('%Y%m%d')  # 最近30天
-            logger.info(f"使用默认模式（等同于recent）：获取 {start_date} 至 {end_date} 期间的周五交易日数据")
-            return self._run_by_trade_dates(start_date, end_date, use_parallel)
+            # 默认模式: 同recent模式
+            return self.run(config={"recent": True})
 
     def fetch_monthly_by_date_with_wan(self, trade_date: str, ts_code: str = None, wan_info: Tuple[int, int] = None, max_count: int = 9000) -> pd.DataFrame:
         """
@@ -2855,6 +2900,72 @@ class MonthlyFetcher:
         logger.info(f"从 {len(date_list)} 个交易日中提取出 {len(monthly_last_trading_days)} 个周末最后交易日")
         return monthly_last_trading_days
 
+    def _get_month_end_days(self, year: int, month: int, days: int = 5) -> List[str]:
+        """
+        获取指定年月的月末几天的日期列表
+        
+        Args:
+            year: 年份
+            month: 月份
+            days: 月末天数，默认为5
+            
+        Returns:
+            月末日期列表，格式为YYYYMMDD
+        """
+        # 获取下个月的第一天
+        if month == 12:
+            next_month = datetime(year + 1, 1, 1)
+        else:
+            next_month = datetime(year, month + 1, 1)
+        
+        # 获取当前月的最后一天
+        last_day = next_month - timedelta(days=1)
+        
+        # 生成月末days天的日期列表
+        result = []
+        for i in range(days):
+            day = last_day - timedelta(days=i)
+            result.append(day.strftime("%Y%m%d"))
+        
+        # 返回按日期升序排序的结果
+        return sorted(result)
+
+    def _get_recent_months_end_days(self, months: int = 3, days_per_month: int = 5) -> List[str]:
+        """
+        获取最近几个月的月末几天日期列表
+        
+        Args:
+            months: 最近几个月
+            days_per_month: 每月末天数
+            
+        Returns:
+            最近几个月的月末日期列表，格式为YYYYMMDD
+        """
+        today = datetime.now()
+        result = []
+        
+        # 获取最近几个月的月末日期
+        for i in range(months):
+            # 计算目标月份
+            target_month = today.month - i
+            target_year = today.year
+            
+            # 处理月份为负数的情况
+            while target_month <= 0:
+                target_month += 12
+                target_year -= 1
+                
+            # 获取该月的月末几天
+            month_end_days = self._get_month_end_days(target_year, target_month, days_per_month)
+            result.extend(month_end_days)
+        
+        # 过滤掉未来的日期
+        today_str = today.strftime("%Y%m%d")
+        result = [date for date in result if date <= today_str]
+        
+        # 按日期排序
+        return sorted(result)
+
 
 def main():
     """主函数"""
@@ -2867,7 +2978,7 @@ def main():
     parser.add_argument("--mock", action="store_true", help="使用模拟数据模式（API不可用时）")
     parser.add_argument("--start-date", type=str, help="开始日期，格式为YYYYMMDD，如20100101")
     parser.add_argument("--end-date", type=str, help="结束日期，格式为YYYYMMDD，如20201231")
-    parser.add_argument("--recent", action="store_true", help="获取最近一个月的周五交易日数据（默认模式）")
+    parser.add_argument("--recent", action="store_true", help="获取最近三个月每月末5天的数据（默认模式）")
     parser.add_argument("--full", action="store_true", help="获取从1990年1月1日至今的完整历史数据，按ts_code列表分批获取")
     parser.add_argument("--ts-code", type=str, help="指定股票代码，例如600000.SH")
     parser.add_argument("--batch-size", type=int, default=1, help="每批次处理的股票数量，默认1")
@@ -2945,11 +3056,11 @@ def main():
             if args.full:
                 logger.info("Full模式: 获取1990年1月1日至今的全部月线数据，按ts_code列表分批获取")
             elif args.recent:
-                logger.info("Recent模式: 获取最近一个月的周五交易日数据，筛选出目标板块")
+                logger.info("Recent模式: 获取最近三个月每月末5天的数据")
             elif args.start_date and args.end_date:
                 logger.info(f"日期范围模式: 获取 {args.start_date} 至 {args.end_date} 期间的月线数据，按ts_code列表分批获取")
             else:
-                logger.info("默认模式: 等同于Recent模式，获取最近一个月的周五交易日数据")
+                logger.info("默认模式: 等同于Recent模式，获取最近三个月每月末5天的数据")
             
             # 使用配置字典运行
             logger.info(f"使用批量模式获取月线数据，目标市场代码: {', '.join(target_market_codes)}")

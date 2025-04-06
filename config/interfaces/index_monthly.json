@@ -1,0 +1,15 @@
+{
+    "description": "指数月线行情",
+    "api_name": "index_monthly",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "monthly",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code", "trade_date"
+    ],
+    "available_fields": [
+
+    ]
+  }

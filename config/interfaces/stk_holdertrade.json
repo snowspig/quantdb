@@ -1,0 +1,14 @@
+{
+    "description": "股东增减持",
+    "api_name": "stk_holdertrade",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code", "ann_date", "holder_name","trade_type"
+    ],
+    "available_fields": [
+    ]
+  }
