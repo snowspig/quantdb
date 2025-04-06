@@ -352,6 +352,7 @@ class StockBasicFetcher:
     def filter_stock_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         过滤股票数据，只保留00、30、60和68板块的股票，并排除特定股票
+        同时只保留上市日期(list_date)小于等于今天的股票
         
         Args:
             df: 股票基本信息数据
@@ -390,6 +391,17 @@ class StockBasicFetcher:
             df_filtered = df_filtered[~df_filtered['ts_code'].isin(self.excluded_stocks)]
             excluded_count = before_exclude - len(df_filtered)
             logger.info(f"已排除 {excluded_count} 支特定股票: {', '.join(self.excluded_stocks)}")
+        
+        # 过滤掉上市日期大于今天的股票（即尚未上市的股票）
+        if 'list_date' in df_filtered.columns:
+            today_str = datetime.now().strftime('%Y%m%d')
+            before_filter_date = len(df_filtered)
+            # 过滤非空list_date且小于等于今天的记录
+            df_filtered = df_filtered[(df_filtered['list_date'].notna()) & (df_filtered['list_date'] <= today_str)]
+            filtered_date_count = before_filter_date - len(df_filtered)
+            logger.info(f"已过滤 {filtered_date_count} 支上市日期大于今天的股票")
+        else:
+            logger.warning("数据中没有list_date列，无法按上市日期过滤")
         
         # 输出过滤统计信息
         logger.info(f"过滤后股票数量: {len(df_filtered)}")
