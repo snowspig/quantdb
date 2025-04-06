@@ -1,0 +1,15 @@
+{
+    "description": "A股指数成份股",
+    "api_name": "index_members",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code", "con_ts_code"
+    ],
+    "available_fields": [
+
+    ]
+  }

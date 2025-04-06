@@ -1,0 +1,15 @@
+{
+    "description": "大盘指数每日指标",
+    "api_name": "index_dailybasic",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code", "trade_date"
+    ],
+    "available_fields": [
+
+    ]
+  }

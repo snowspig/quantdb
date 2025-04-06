@@ -1,0 +1,14 @@
+{
+    "description": "股权质押统计数据",
+    "api_name": "pledge_stat",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code", "end_date"
+    ],
+    "available_fields": [
+    ]
+  }

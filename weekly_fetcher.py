@@ -547,7 +547,7 @@ class WeeklyFetcher:
             logger.exception(f"获取交易日历时出错: {e}")
             return []
 
-    def _get_recent_weeks(self, weeks: int = 4) -> Tuple[str, str]:
+    def _get_recent_weeks(self, weeks: int = 2) -> Tuple[str, str]:
         """
         获取最近几周的日期范围
         """
@@ -706,7 +706,7 @@ class WeeklyFetcher:
         """
         获取最近几周的数据更新
         """
-        start_date, end_date = self._get_recent_weeks(weeks=4)
+        start_date, end_date = self._get_recent_weeks(weeks=2)
         logger.info(f"获取最近几周数据: 从 {start_date} 到 {end_date}")
         
         # 获取交易日历
@@ -2445,7 +2445,7 @@ class WeeklyFetcher:
             # 默认模式: 同recent模式，但使用最近一个月
             today = datetime.now()
             end_date = today.strftime('%Y%m%d')
-            start_date = (today - timedelta(days=30)).strftime('%Y%m%d')  # 最近30天
+            start_date = (today - timedelta(days=14)).strftime('%Y%m%d')  # 最近30天
             logger.info(f"使用默认模式（等同于recent）：获取 {start_date} 至 {end_date} 期间的周五交易日数据")
             return self._run_by_trade_dates(start_date, end_date, use_parallel)
 
@@ -2864,7 +2864,7 @@ def main():
     parser.add_argument("--mock", action="store_true", help="使用模拟数据模式（API不可用时）")
     parser.add_argument("--start-date", type=str, help="开始日期，格式为YYYYMMDD，如20100101")
     parser.add_argument("--end-date", type=str, help="结束日期，格式为YYYYMMDD，如20201231")
-    parser.add_argument("--recent", action="store_true", help="获取最近一个月的周五交易日数据（默认模式）")
+    parser.add_argument("--recent", action="store_true", help="获取最近两周周末交易日数据（默认模式）")
     parser.add_argument("--full", action="store_true", help="获取从1990年1月1日至今的完整历史数据，按ts_code列表分批获取")
     parser.add_argument("--ts-code", type=str, help="指定股票代码，例如600000.SH")
     parser.add_argument("--batch-size", type=int, default=1, help="每批次处理的股票数量，默认1")

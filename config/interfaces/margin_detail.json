@@ -1,0 +1,15 @@
+{
+    "description": "融资融券交易明细",
+    "api_name": "margin_detail",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "trade_date", "ts_code"
+    ],
+    "available_fields": [
+
+    ]
+  }

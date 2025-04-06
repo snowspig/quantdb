@@ -1,0 +1,15 @@
+{
+    "description": "融资融券交易汇总",
+    "api_name": "margin",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "quarterly",
+    "update_priority": 1,
+    "index_fields": [
+        "trade_date", "exchange_id"
+    ],
+    "available_fields": [
+
+    ]
+  }

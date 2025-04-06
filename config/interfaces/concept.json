@@ -1,0 +1,15 @@
+{
+    "description": "概念股分类",
+    "api_name": "concept",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "code", "name"
+    ],
+    "available_fields": [
+
+    ]
+  }

@@ -1,0 +1,14 @@
+{
+    "description": "前十大股东",
+    "api_name": "top10_floatholders",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code", "ann_date","end_date"
+    ],
+    "available_fields": [
+    ]
+  }

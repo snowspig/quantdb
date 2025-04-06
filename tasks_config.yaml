@@ -1,0 +1,15 @@
+init_programs:
+- trade_cal_fetcher.py
+- stock_basic_fetcher.py
+parallel_programs:
+- suspend_fetcher.py
+- stk_rewards_fetcher.py
+- stock_company_fetcher.py
+- stock_managers_fetcher.py
+- stock_previous_name_fetcher.py
+- daily_fetcher.py
+- div_fetcher.py
+- weekly_fetcher.py
+- monthly_fetcher.py
+serial_programs:
+- wan_test_client.py

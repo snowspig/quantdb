@@ -1,0 +1,15 @@
+{
+    "description": "分红送股",
+    "api_name": "dividend",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "quarterly",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code", "ann_date","ex_date"
+    ],
+    "available_fields": [
+
+    ]
+  }

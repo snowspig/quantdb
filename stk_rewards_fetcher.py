@@ -603,14 +603,13 @@ class StkRewardsFetcher:
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return set()
 
-    def fetch_stk_rewards_for_ts_codes(self, ts_codes: List[str], start_date: str = None, end_date: str = None, wan_info: Tuple[int, int] = None) -> pd.DataFrame:
+    def fetch_stk_rewards_for_ts_codes(self, ts_codes: List[str], end_date: str = None, wan_info: Tuple[int, int] = None) -> pd.DataFrame:
         """
         批量获取多个股票的管理层薪酬及持股数据
         
         Args:
             ts_codes: 股票代码列表
-            start_date: 开始日期，格式YYYYMMDD（不使用）
-            end_date: 结束日期，格式YYYYMMDD（不使用）
+            end_date: 报告期，格式YYYYMMDD
             wan_info: WAN接口和端口信息，格式为(wan_idx, port)
             
         Returns:
@@ -628,8 +627,13 @@ class StkRewardsFetcher:
         params = self.interface_config.get("params", {}).copy()
         fields = self.interface_config.get("fields", [])
         
-        # 添加查询参数 - 只添加ts_code，不添加日期参数
+        # 添加查询参数 - 添加ts_code和end_date参数
         params["ts_code"] = ts_codes_str
+        
+        # 确保end_date参数被添加(如果提供)
+        if end_date:
+            params["end_date"] = end_date
+            logger.debug(f"设置end_date参数: {end_date}")
         
         # 确保使用正确的字段（根据接口定义）
         if not fields:
@@ -681,7 +685,8 @@ class StkRewardsFetcher:
                 
                 if df is None or df.empty:
                     if self.verbose:
-                        logger.debug(f"批量查询的 {len(ts_codes)} 个股票无管理层薪酬及持股数据")
+                        end_date_text = f"报告期 {end_date} 的" if end_date else ""
+                        logger.debug(f"批量查询的 {len(ts_codes)} 个股票无{end_date_text}管理层薪酬及持股数据")
                     
                     # 释放WAN端口（如果使用了）
                     if use_wan:
@@ -766,15 +771,14 @@ class StkRewardsFetcher:
         # 默认返回空DataFrame (虽然不会执行到这里)
         return pd.DataFrame()
 
-    def fetch_stk_rewards_parallel(self, ts_codes: Set[str], start_date: str = None, end_date: str = None, batch_size: int = 10) -> pd.DataFrame:
+    def fetch_stk_rewards_parallel(self, ts_codes: Set[str], end_date: str = None, batch_size: int = 80) -> pd.DataFrame:
         """
         使用多WAN口并行获取多个股票的管理层薪酬及持股数据
         
         Args:
             ts_codes: 股票代码集合
-            start_date: 开始日期，格式YYYYMMDD
-            end_date: 结束日期，格式YYYYMMDD
-            batch_size: 每批处理的股票数量，默认为10
+            end_date: 报告期，格式YYYYMMDD
+            batch_size: 每批处理的股票数量，默认为100
             
         Returns:
             所有股票的管理层薪酬及持股数据合并后的DataFrame
@@ -802,7 +806,7 @@ class StkRewardsFetcher:
         if not available_wans:
             logger.warning("没有可用的WAN接口，将使用系统默认网络接口")
             # 如果没有可用WAN，回退到普通批处理
-            return self.fetch_stk_rewards_batch(ts_codes, start_date, end_date, batch_size)
+            return self.fetch_stk_rewards_batch(ts_codes, end_date, batch_size)
         
         # 创建结果队列和线程列表
         result_queue = queue.Queue()
@@ -868,7 +872,7 @@ class StkRewardsFetcher:
                     
                     try:
                         # 获取批次数据
-                        batch_df = self.fetch_stk_rewards_for_ts_codes(batch_ts_codes, start_date, end_date, wan_info)
+                        batch_df = self.fetch_stk_rewards_for_ts_codes(batch_ts_codes, end_date, wan_info)
                         
                         # 记录结果
                         with log_lock:
@@ -1107,14 +1111,13 @@ class StkRewardsFetcher:
         logger.success(f"并行处理成功获取和保存 {success_batches}/{total_batches} 个批次的管理层薪酬及持股数据，共 {total_records} 条记录")
         return pd.DataFrame()  # 返回空DataFrame，因为数据已经保存到MongoDB
 
-    def fetch_stk_rewards_batch(self, ts_codes: Set[str], start_date: str = None, end_date: str = None, batch_size: int = 100, minute_rate_limit: int = 500, hour_rate_limit: int = 4000) -> pd.DataFrame:
+    def fetch_stk_rewards_batch(self, ts_codes: Set[str], end_date: str = None, batch_size: int = 90, minute_rate_limit: int = 500, hour_rate_limit: int = 4000) -> pd.DataFrame:
         """
         批量获取多个股票的管理层薪酬及持股数据
         
         Args:
             ts_codes: 股票代码集合
-            start_date: 开始日期，格式YYYYMMDD
-            end_date: 结束日期，格式YYYYMMDD
+            end_date: 报告期，格式YYYYMMDD
             batch_size: 每批处理的股票数量
             minute_rate_limit: 每分钟API调用限制
             hour_rate_limit: 每小时API调用限制
@@ -1158,7 +1161,6 @@ class StkRewardsFetcher:
             # 获取批次数据
             batch_df, rate_controllers, is_success = self._fetch_batch(
                 batch_ts_codes, 
-                start_date, 
                 end_date, 
                 rate_controllers
             )
@@ -1192,7 +1194,6 @@ class StkRewardsFetcher:
     def _fetch_batch(
         self, 
         batch_ts_codes: List[str], 
-        start_date: str = None, 
         end_date: str = None,
         rate_controllers: Dict[str, Any] = None
     ) -> Tuple[pd.DataFrame, Dict[str, Any], bool]:
@@ -1201,8 +1202,7 @@ class StkRewardsFetcher:
         
         Args:
             batch_ts_codes: 批次股票代码列表
-            start_date: 开始日期
-            end_date: 结束日期
+            end_date: 报告期
             rate_controllers: 速率控制器字典，包含计数器和时间戳
             
         Returns:
@@ -1275,7 +1275,7 @@ class StkRewardsFetcher:
         
         while retry_count <= max_retries:
             try:
-                batch_df = self.fetch_stk_rewards_for_ts_codes(batch_ts_codes, start_date, end_date, wan_info)
+                batch_df = self.fetch_stk_rewards_for_ts_codes(batch_ts_codes, end_date, wan_info)
                 is_success = batch_df is not None and not batch_df.empty
                 break
             except Exception as e:
@@ -1667,21 +1667,20 @@ class StkRewardsFetcher:
         运行数据获取和保存流程，支持自定义配置
         
         Args:
-            config: 配置字典，包含start_date, end_date, full等信息
+            config: 配置字典，包含end_date, full等信息
             
         Returns:
             是否成功
         """
         # 使用默认配置
         default_config = {
-            "start_date": None,
             "end_date": None,
             "full": False,
-            "batch_size": 5,           # 降低每批次处理股票数量为5
+            "batch_size": 90,           # 降低到30支股票，防止单批次返回超过4000条限制
             "minute_rate_limit": 400,   # 降低到400以增加安全边际
             "hour_rate_limit": 3500,    # 降低到3500以增加安全边际
             "retry_count": 5,           # 增加到5次重试
-            "use_parallel": True        # 是否使用并行处理
+            "use_parallel": True,       # 是否使用并行处理
         }
         
         # 合并配置
@@ -1689,7 +1688,6 @@ class StkRewardsFetcher:
             config = {}
         
         effective_config = {**default_config, **config}
-        start_date = effective_config["start_date"]
         end_date = effective_config["end_date"]
         full = effective_config["full"]
         batch_size = effective_config["batch_size"]
@@ -1697,11 +1695,32 @@ class StkRewardsFetcher:
         hour_rate_limit = effective_config["hour_rate_limit"]
         use_parallel = effective_config["use_parallel"]
         
-        # 如果未提供日期并且不是全量模式，则设置默认为最近一周
-        if not start_date and not end_date and not full:
-            end_date = datetime.now().strftime("%Y%m%d")
-            start_date = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
-            logger.info(f"设置默认日期范围: {start_date} - {end_date}")
+        # 如果未提供日期并且不是全量模式，则设置默认为最近一个季度末
+        if not end_date and not full:
+            now = datetime.now()
+            # 获取最近一个季度末日期 (3月31日、6月30日、9月30日、12月31日)
+            month = now.month
+            year = now.year
+            
+            if month <= 3:
+                # 上一年Q4
+                quarter_end_month = 12
+                quarter_end_year = year - 1
+            elif month <= 6:
+                # 当年Q1
+                quarter_end_month = 3
+                quarter_end_year = year
+            elif month <= 9:
+                # 当年Q2
+                quarter_end_month = 6
+                quarter_end_year = year
+            else:
+                # 当年Q3
+                quarter_end_month = 9
+                quarter_end_year = year
+            
+            end_date = f"{quarter_end_year}{quarter_end_month:02d}{'30' if quarter_end_month in [6, 9] else '31'}"
+            logger.info(f"设置默认季度末日期: {end_date}")
         
         # 从stock_basic集合获取目标股票代码
         target_ts_codes = self.get_target_ts_codes_from_stock_basic()
@@ -1717,14 +1736,13 @@ class StkRewardsFetcher:
             self._ensure_indexes(collection)
         except Exception as e:
             logger.warning(f"预先创建索引时出错: {str(e)}，将在保存数据时再尝试创建")
-            
+        
         # 批量获取管理层薪酬及持股数据
         if use_parallel and self.port_allocator:
             # 使用多WAN口并行抓取
-            logger.info("使用多WAN口并行获取数据")
+            logger.info(f"使用多WAN口并行获取数据，每批次 {batch_size} 支股票，报告期: {end_date}")
             df_result = self.fetch_stk_rewards_parallel(
                 ts_codes=target_ts_codes, 
-                start_date=start_date, 
                 end_date=end_date,
                 batch_size=batch_size
             )
@@ -1739,10 +1757,9 @@ class StkRewardsFetcher:
                 success = self.save_to_mongodb(df_result)
         else:
             # 使用普通批量获取
-            logger.info("使用普通批量方式获取数据")
+            logger.info(f"使用普通批量方式获取数据，每批次 {batch_size} 支股票，报告期: {end_date}")
             df = self.fetch_stk_rewards_batch(
                 ts_codes=target_ts_codes, 
-                start_date=start_date, 
                 end_date=end_date,
                 batch_size=batch_size,
                 minute_rate_limit=minute_rate_limit,
@@ -1795,11 +1812,10 @@ def main():
     parser.add_argument('--market-codes', default='00,30,60,68', help='目标市场代码，用逗号分隔')
     parser.add_argument('--db-name', default='tushare_data', help='MongoDB数据库名称')
     parser.add_argument('--collection-name', default='stk_rewards', help='MongoDB集合名称')
-    parser.add_argument('--start-date', help='开始日期，格式YYYYMMDD')
-    parser.add_argument('--end-date', help='结束日期，格式YYYYMMDD')
-    parser.add_argument('--full', action='store_true', help='获取所有历史数据（默认只获取最近一周）')
+    parser.add_argument('--end-date', help='报告期，格式YYYYMMDD，如20190630表示获取该季度末的数据')
+    parser.add_argument('--full', action='store_true', help='获取所有历史数据（默认只获取最近一个季度末）')
     parser.add_argument('--verbose', action='store_true', help='输出详细日志')
-    parser.add_argument('--batch-size', type=int, default=1, help='每批请求的股票数量')
+    parser.add_argument('--batch-size', type=int, default=90, help='每批请求的股票数量，建议不超过90')
     parser.add_argument('--minute-rate-limit', type=int, default=100, help='每分钟API调用限制')
     parser.add_argument('--hour-rate-limit', type=int, default=2000, help='每小时API调用限制')
     parser.add_argument('--retry-count', type=int, default=3, help='API调用失败重试次数')
@@ -1817,7 +1833,7 @@ def main():
         config_path=args.config,
         interface_dir=args.interface_dir,
         target_market_codes=target_market_codes,
-        db_name=args.db_name,  # 这个值会被内部强制设为"tushare_data"
+        db_name=args.db_name,
         collection_name=args.collection_name,
         verbose=args.verbose
     )
@@ -1828,7 +1844,6 @@ def main():
         
         # 构建运行配置字典
         run_config = {
-            "start_date": args.start_date,
             "end_date": args.end_date,
             "full": args.full,
             "batch_size": args.batch_size,

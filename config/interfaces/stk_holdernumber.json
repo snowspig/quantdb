@@ -1,0 +1,14 @@
+{
+    "description": "股东人数",
+    "api_name": "stk_holdernumber",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code", "ann_date", "end_date"
+    ],
+    "available_fields": [
+    ]
+  }
