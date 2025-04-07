@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-配置管理模块，提供统一的配置读取和管理功能
+配置管理模块
+负责读取、解析和管理系统配置
 """
 import os
 import sys
@@ -18,7 +19,11 @@ DEFAULT_INTERFACE_DIR = "config/interfaces"
 
 class ConfigManager:
     """
-    配置管理器类，提供统一的配置读取和管理功能
+    配置管理器类
+    提供统一的配置读取和管理功能，包括：
+    1. 读取主配置文件（YAML格式）
+    2. 读取接口配置文件（JSON格式）
+    3. 获取特定配置项
     """
     
     _instance = None
@@ -43,7 +48,7 @@ class ConfigManager:
             config_path: 配置文件路径，不提供则使用默认路径
         """
         # 避免重复初始化
-        if self._initialized:
+        if hasattr(self, '_initialized') and self._initialized:
             return
             
         # 配置文件路径
@@ -66,7 +71,7 @@ class ConfigManager:
         """
         设置日志记录
         """
-        self.logger = logging.getLogger("config.ConfigManager")
+        self.logger = logging.getLogger("core.ConfigManager")
         
         if not self.logger.handlers:
             # 避免重复添加处理程序
@@ -77,7 +82,8 @@ class ConfigManager:
             self.logger.addHandler(console_handler)
             
             # 设置日志级别
-            self.logger.setLevel(logging.INFO)
+            log_level = os.environ.get("QUANTDB_LOG_LEVEL", "INFO").upper()
+            self.logger.setLevel(getattr(logging, log_level, logging.INFO))
     
     def _load_config(self) -> Dict:
         """
@@ -143,9 +149,10 @@ class ConfigManager:
     def get(self, key: str, default: Any = None) -> Any:
         """
         获取指定键的配置值
+        支持多级嵌套的配置项，如 'mongodb.uri'
         
         Args:
-            key: 配置键
+            key: 配置键（可以是多级路径，以点分隔）
             default: 默认值，未找到指定键时返回
             
         Returns:
@@ -166,15 +173,16 @@ class ConfigManager:
     def set(self, key: str, value: Any):
         """
         设置指定键的配置值
+        支持多级嵌套的配置项，如 'mongodb.uri'
         
         Args:
-            key: 配置键
+            key: 配置键（可以是多级路径，以点分隔）
             value: 配置值
         """
         parts = key.split('.')
         target = self.config
         
-        # 逐层查找配置
+        # 逐层查找配置，并创建缺失的层级
         for i, part in enumerate(parts[:-1]):
             if part not in target:
                 target[part] = {}
@@ -204,7 +212,7 @@ class ConfigManager:
     
     def get_all_interface_names(self) -> List[str]:
         """
-        获取所有接口名称
+        获取所有可用的接口名称
         
         Returns:
             List[str]: 接口名称列表
@@ -227,7 +235,7 @@ class ConfigManager:
         保存配置到文件
         
         Args:
-            config_path: 配置文件路径，不提供则使用默认路径
+            config_path: 配置文件路径，不提供则使用当前配置文件路径
             
         Returns:
             bool: 是否成功保存
@@ -319,6 +327,34 @@ class ConfigManager:
         """
         wan_config = self.get_wan_config()
         return wan_config.get('interfaces', [])
+    
+    def get_fetch_config(self, fetcher_name: str) -> Dict:
+        """
+        获取指定获取器的配置
+        
+        Args:
+            fetcher_name: 获取器名称
+            
+        Returns:
+            Dict: 获取器配置
+        """
+        fetchers_config = self.get('fetchers', {})
+        return fetchers_config.get(fetcher_name, {})
+
+    def get_default_fetcher_config(self) -> Dict:
+        """
+        获取默认的获取器配置
+        
+        Returns:
+            Dict: 默认获取器配置
+        """
+        return {
+            'thread_count': 5,
+            'batch_size': 100,
+            'retry_count': 3,
+            'retry_interval': 1,
+            'timeout': 30
+        }
 
 
 # 创建全局配置管理器实例

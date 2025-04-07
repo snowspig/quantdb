@@ -1,16 +1,14 @@
 """
-数据存储模块，负责数据模型定义和MongoDB存储管理
+存储模块包初始化文件
+提供数据库存储和访问功能
 """
-from storage.mongodb_client import MongoDBClient, mongodb_client
-from storage.data_models import (
-    BaseModel, StockBasic, DailyQuote, MinuteQuote, 
-    FinancialStatement, IncomeStatement, BalanceSheet, CashFlow,
-    IndexQuote, create_model_from_api
-)
+from storage.mongodb_handler import MongoDBHandler, mongodb_handler
 
+# 导出的组件
 __all__ = [
-    'MongoDBClient', 'mongodb_client', 
-    'BaseModel', 'StockBasic', 'DailyQuote', 'MinuteQuote',
-    'FinancialStatement', 'IncomeStatement', 'BalanceSheet', 'CashFlow',
-    'IndexQuote', 'create_model_from_api'
-] 
+    'MongoDBHandler',
+    'mongodb_handler'
+]
+
+# 版本信息
+__version__ = '0.1.0'
