@@ -44,6 +44,20 @@ from data_fetcher.tushare_client import TushareClient
 from storage.mongodb_client import MongoDBClient
 from wan_manager.port_allocator import PortAllocator
 
+
+
+class SourceAddressAdapter(requests.adapters.HTTPAdapter):
+    """用于设置源地址的HTTP适配器"""
+    
+    def __init__(self, source_address, **kwargs):
+        self.source_address = source_address
+        super(SourceAddressAdapter, self).__init__(**kwargs)
+    
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        pool_kwargs['source_address'] = self.source_address
+        super(SourceAddressAdapter, self).init_poolmanager(
+            connections, maxsize, block, **pool_kwargs)
+
 class TushareClientWAN:
     """
     专用于WAN绑定的Tushare客户端
@@ -155,19 +169,6 @@ class TushareClientWAN:
             import traceback
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return None
-
-
-class SourceAddressAdapter(requests.adapters.HTTPAdapter):
-    """用于设置源地址的HTTP适配器"""
-    
-    def __init__(self, source_address, **kwargs):
-        self.source_address = source_address
-        super(SourceAddressAdapter, self).__init__(**kwargs)
-    
-    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
-        pool_kwargs['source_address'] = self.source_address
-        super(SourceAddressAdapter, self).init_poolmanager(
-            connections, maxsize, block, **pool_kwargs)
 
 class MonthlyFetcher:
     """

@@ -202,7 +202,6 @@ class TushareClientWAN:
             logger.error(f"API请求失败: {str(e)}")
             return None
 
-
 class MoneyflowFetcher:
     """
     个股资金流向数据获取器
@@ -283,8 +282,9 @@ class MoneyflowFetcher:
         
         # 如果db_name为None，则使用配置中的默认值
         if db_name is None:
-            db_name = db_config.get("database", "quantdb")
-        
+            db_name = db_config.get("database", "tushare_data")
+
+
         # 获取数据库和集合
         self.db = self.mongodb_client[db_name]
         self.collection = self.db[collection_name]
@@ -296,198 +296,122 @@ class MoneyflowFetcher:
         # 设置WAN接口配置
         self.port_allocator = port_allocator  # 使用全局端口分配器
         
-        # 使用上下文管理器初始化索引并打印结果
-        with self._create_index_context():
-            pass
+        # 添加索引验证标志，避免重复验证
+        self.indexes_verified = False
+        
+        # 初始化时创建一次索引
+        self._ensure_indexes(self.collection)
         
         logger.success("初始化个股资金流向数据获取器完成")
 
     def _ensure_indexes(self, collection) -> bool:
-        """
-        确保必要的索引存在
+        """确保必要的索引存在，避免重复调用"""
+        # 如果已经验证过索引，直接返回
+        if hasattr(self, 'indexes_verified') and self.indexes_verified:
+            return True
         
-        Args:
-            collection: MongoDB集合对象
-            
-        Returns:
-            是否成功创建索引
-        """
         try:
-            # 确保MongoDB连接
-            if not self.mongodb_client.is_connected():
-                logger.warning("MongoDB未连接，尝试连接...")
-                if not self.mongodb_client.connect():
-                    logger.error("连接MongoDB失败，无法创建索引")
-                    return False
-            
-            # 获取现有索引
+            # 获取所有已存在的索引
             existing_indexes = collection.index_information()
-            logger.debug(f"现有索引信息: {existing_indexes}")
+            logger.debug(f"集合 {collection.name} 现有索引信息: {existing_indexes}")
             
-            # 检查复合唯一索引 (ts_code, trade_date)
-            index_name = "ts_code_1_trade_date_1"
-            index_created = False
+            # 从接口配置获取索引字段
+            index_fields = self.interface_config.get("index_fields", ["ts_code", "trade_date"])
+            if "index_fields" not in self.interface_config and "primary_keys" in self.interface_config:
+                index_fields = self.interface_config.get("primary_keys", ["ts_code", "trade_date"])
             
-            # 检查索引是否存在并且结构正确
-            if index_name in existing_indexes:
-                # 验证索引的键和属性
-                existing_index = existing_indexes[index_name]
-                expected_keys = [("ts_code", 1), ("trade_date", 1)]
-                
-                # 确保是有序的正确键和唯一约束
-                keys_match = all(key in expected_keys for key in existing_index['key']) and len(existing_index['key']) == len(expected_keys)
-                is_unique = existing_index.get('unique', False)
-                
-                if keys_match and is_unique:
-                    logger.debug(f"复合唯一索引 (ts_code, trade_date) 已存在且结构正确，跳过创建")
-                else:
-                    # 索引存在但结构不正确，删除并重建
-                    logger.info(f"复合唯一索引 (ts_code, trade_date) 存在但结构不正确，删除并重建索引")
-                    try:
-                        collection.drop_index(index_name)
-                        logger.debug(f"成功删除现有索引: {index_name}")
-                    except Exception as e:
-                        logger.error(f"删除索引时出错: {str(e)}")
+            # 检查是否已存在复合索引
+            has_compound_index = False
+            
+            # 查找所有索引，检查是否存在所需的复合索引
+            for idx_name, idx_info in existing_indexes.items():
+                # 跳过_id索引
+                if idx_name == '_id_':
+                    continue
                     
-                    # 创建正确的索引
-                    collection.create_index(
-                        [("ts_code", 1), ("trade_date", 1)], 
-                        unique=True, 
-                        background=True
-                    )
-                    logger.success(f"已重建复合唯一索引 (ts_code, trade_date)")
-                    index_created = True
-            else:
-                # 索引不存在，创建它
-                logger.info(f"正在为集合 {collection.name} 创建复合唯一索引 (ts_code, trade_date)...")
+                # 检查是否有匹配的复合索引
+                if len(idx_info.get('key', [])) == len(index_fields):
+                    keys = [k[0] for k in idx_info.get('key', [])]
+                    if all(field in keys for field in index_fields):
+                        has_compound_index = True
+                        logger.info(f"已存在复合索引 {index_fields}，索引名: {idx_name}，跳过创建")
+                        break
+            
+            # 如果没有复合索引，创建一个
+            if not has_compound_index:
+                logger.info(f"正在为集合 {collection.name} 创建复合唯一索引 {index_fields}...")
                 collection.create_index(
-                    [("ts_code", 1), ("trade_date", 1)], 
-                    unique=True, 
+                    [(field, 1) for field in index_fields],
+                    unique=True,
                     background=True
                 )
-                logger.success(f"已成功创建复合唯一索引 (ts_code, trade_date)")
-                index_created = True
+                logger.success(f"已成功创建复合唯一索引 {index_fields}")
             
-            # 检查单字段索引
-            for field in ["ts_code", "trade_date"]:
-                index_field_name = f"{field}_1"
-                if index_field_name not in existing_indexes:
-                    logger.info(f"正在为字段 {field} 创建索引...")
-                    collection.create_index(field)
-                    logger.success(f"已为字段 {field} 创建索引")
-                    index_created = True
-                else:
-                    logger.debug(f"字段 {field} 的索引已存在，跳过创建")
-            
-            # 确保在创建索引后等待一小段时间，让MongoDB完成索引构建
-            if index_created:
-                logger.info("索引已创建或修改，等待MongoDB完成索引构建...")
-                time.sleep(1.0)  # 等待1秒，让MongoDB完成索引构建
-            
+            # 设置标志，表示索引已验证
+            self.indexes_verified = True
             return True
-            
         except Exception as e:
             logger.error(f"创建索引时出错: {str(e)}")
             import traceback
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return False
-        
-    def _load_config(self) -> Dict:
-        """
-        加载YAML格式的配置文件
-        
-        Returns:
-            配置字典
-        """
-        try:
-            # 使用self.config中的配置路径而非self.config_path
-            config_path = self.config.get("config_path", "config/config.yaml")
-            import yaml
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
-                logger.debug(f"成功加载配置文件: {config_path}")
-                return config
-        except Exception as e:
-            logger.error(f"加载配置文件失败: {str(e)}")
-            return {}
     
     def _load_interface_config(self):
         """加载接口配置文件"""
         try:
             if not os.path.exists(self.interface_path):
                 logger.error(f"接口配置文件不存在: {self.interface_path}")
-                sys.exit(1)
+                # 创建默认配置
+                self.interface_config = {
+                    "api_name": "moneyflow",
+                    "available_fields": [],
+                    "index_fields": ["ts_code", "trade_date"], 
+                    "primary_keys": ["ts_code", "trade_date"]   # 保留兼容性
+                }
+                logger.warning("使用默认接口配置")
+                return
                 
             with open(self.interface_path, 'r', encoding='utf-8') as f:
                 self.interface_config = json.load(f)
                 
             logger.debug(f"成功加载接口配置: {self.interface_name}")
-            
-            # 验证接口配置
-            if "api_name" not in self.interface_config:
-                logger.error(f"接口配置缺少必要的api_name字段: {self.interface_path}")
-                sys.exit(1)
                 
-            # 检查并设置接口字段和主键
+            # 验证接口配置，保证必要字段存在
+            if "api_name" not in self.interface_config:
+                logger.warning(f"接口配置缺少api_name字段，将使用默认值: moneyflow")
+                self.interface_config["api_name"] = "moneyflow"
+                
             if "available_fields" not in self.interface_config:
                 logger.warning(f"接口配置缺少available_fields字段，将使用空列表")
                 self.interface_config["available_fields"] = []
                 
-            if "primary_keys" not in self.interface_config:
-                logger.warning(f"接口配置缺少primary_keys字段，将使用默认值: ['ts_code', 'trade_date']")
+            # 从index_fields字段获取主键，如果不存在则使用primary_keys或默认值
+            if "index_fields" in self.interface_config:
+                primary_keys = self.interface_config["index_fields"]
+                logger.debug(f"从接口配置的index_fields字段获取主键: {primary_keys}")
+                # 同时设置primary_keys以保持兼容性
+                self.interface_config["primary_keys"] = primary_keys
+            elif "primary_keys" in self.interface_config:
+                primary_keys = self.interface_config["primary_keys"]
+                logger.debug(f"从接口配置的primary_keys字段获取主键: {primary_keys}")
+                # 同时设置index_fields
+                self.interface_config["index_fields"] = primary_keys
+            else:
+                logger.warning(f"接口配置缺少index_fields和primary_keys字段，将使用默认值: ['ts_code', 'trade_date']")
                 self.interface_config["primary_keys"] = ["ts_code", "trade_date"]
+                self.interface_config["index_fields"] = ["ts_code", "trade_date"]
                 
         except Exception as e:
             logger.error(f"加载接口配置文件失败: {str(e)}")
-            sys.exit(1)
-            
-    @contextmanager
-    def _create_index_context(self):
-        """创建索引的上下文管理器"""
-        try:
-            # 确保索引
-            primary_keys = self.interface_config.get("primary_keys", ["ts_code", "trade_date"])
-            
-            # 创建复合唯一索引
-            index_name = "_".join(primary_keys)
-            index_spec = [(key, 1) for key in primary_keys]
-            
-            if not primary_keys:
-                logger.warning("未指定主键，将不创建索引")
-                yield
-                return
-                
-            try:
-                logger.debug(f"为集合 {self.collection.name} 创建复合唯一索引: {index_name}")
-                self.collection.create_index(index_spec, unique=True, name=index_name)
-                logger.success(f"成功创建索引: {index_name}")
-            except Exception as e:
-                logger.warning(f"创建索引 {index_name} 失败: {str(e)}")
-                
-            # 创建trade_date索引（如果存在此字段）
-            if "trade_date" in primary_keys:
-                try:
-                    logger.debug(f"为集合 {self.collection.name} 创建trade_date索引")
-                    self.collection.create_index([("trade_date", 1)], name="idx_trade_date")
-                    logger.success(f"成功创建trade_date索引")
-                except Exception as e:
-                    logger.warning(f"创建trade_date索引失败: {str(e)}")
-                    
-            # 创建ts_code索引（如果存在此字段）
-            if "ts_code" in primary_keys:
-                try:
-                    logger.debug(f"为集合 {self.collection.name} 创建ts_code索引")
-                    self.collection.create_index([("ts_code", 1)], name="idx_ts_code")
-                    logger.success(f"成功创建ts_code索引")
-                except Exception as e:
-                    logger.warning(f"创建ts_code索引失败: {str(e)}")
-                    
-            yield
-            
-        except Exception as e:
-            logger.error(f"索引创建操作失败: {str(e)}")
-            yield
-
+            # 使用默认配置
+            self.interface_config = {
+                "api_name": "moneyflow",
+                "available_fields": [],
+                "index_fields": ["ts_code", "trade_date"],
+                "primary_keys": ["ts_code", "trade_date"]
+            }
+            logger.warning("使用默认接口配置")
+    
     def _generate_date_ranges(self, start_date: str, end_date: str, interval_days: int = 365) -> List[Tuple[str, str]]:
         """
         生成日期范围列表，将长时间段按interval_days天分割成多个短时间段
@@ -831,15 +755,11 @@ class MoneyflowFetcher:
             # 获取数据库对象和集合对象
             collection = self.collection
             
-            # 首先创建索引 - 提前创建索引以提高插入和查询效率
-            with self._create_index_context():
-                pass
-            
             # 将DataFrame转换为字典列表
             records = data.to_dict("records")
             
             # 从接口配置中获取主键字段，如果没有指定，则使用默认的 ["ts_code", "trade_date"]
-            primary_keys = self.interface_config.get("primary_keys", ["ts_code", "trade_date"])
+            primary_keys = self.interface_config.get("index_fields", ["ts_code", "trade_date"])
             
             # 批量处理，避免一次性处理太多记录
             batch_size = 10000  # 减小batch_size以减轻MongoDB负担
