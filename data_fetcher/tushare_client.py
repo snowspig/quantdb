@@ -201,7 +201,7 @@ class TushareClient:
         
         # 对daily API特殊处理，不传递fields，让API返回所有字段
         if api_name == 'daily':
-            logger.info(f"daily API请求不传递fields参数，将使用API默认返回的所有字段")
+            logger.debug(f"daily API请求不传递fields参数，将使用API默认返回的所有字段")
             fields = None
             
         # 准备请求数据
@@ -223,7 +223,7 @@ class TushareClient:
         
         # 对daily API添加额外日志
         if api_name == 'daily':
-            logger.info(f"发送daily API请求{socket_info}, 参数: {params}, 请求字段: {'全部字段' if fields is None else fields}")
+            logger.debug(f"发送daily API请求{socket_info}, 参数: {params}, 请求字段: {'全部字段' if fields is None else fields}")
         
         try:
             start_time = time.time()
@@ -275,7 +275,7 @@ class TushareClient:
             # 记录API返回的完整字段信息
             if "data" in result and "fields" in result["data"]:
                 available_fields = result["data"]["fields"]
-                logger.info(f"API {api_name} 返回的所有字段(来自响应): {available_fields}")
+                logger.debug(f"API {api_name} 返回的所有字段(来自响应): {available_fields}")
                 
                 # 如果有请求的具体字段，检查是否所有字段都可用
                 if fields and set(fields) != set(available_fields):
@@ -286,9 +286,9 @@ class TushareClient:
             # 对daily API添加数据量统计日志
             if api_name == 'daily' and "data" in result and "items" in result["data"]:
                 items_count = len(result["data"]["items"])
-                logger.info(f"API {api_name} 请求成功，获取到 {items_count} 条数据，耗时: {elapsed:.2f}秒")
+                logger.debug(f"API {api_name} 请求成功，获取到 {items_count} 条数据，耗时: {elapsed:.2f}秒")
             else:
-                logger.info(f"Tushare API请求成功{socket_info}: {api_name}, 耗时: {elapsed:.2f}秒")
+                logger.debug(f"Tushare API请求成功{socket_info}: {api_name}, 耗时: {elapsed:.2f}秒")
             
             return result
             
@@ -357,7 +357,7 @@ class TushareClient:
                 
                 # 记录获取到的所有字段
                 available_fields = list(df.columns)
-                logger.info(f"API {api_name} 获取到的所有字段: {available_fields}")
+                logger.debug(f"API {api_name} 获取到的所有字段: {available_fields}")
                 
                 # 如果配置的字段与获取到的字段不一致，记录差异
                 if fields and set(fields) != set(available_fields):
@@ -366,7 +366,7 @@ class TushareClient:
                     if missing_fields:
                         logger.warning(f"API {api_name} 缺少配置的字段: {missing_fields}")
                     if extra_fields:
-                        logger.info(f"API {api_name} 包含未配置的额外字段: {extra_fields}")
+                        logger.debug(f"API {api_name} 包含未配置的额外字段: {extra_fields}")
                 
                 return df
             else:

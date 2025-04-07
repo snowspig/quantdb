@@ -6,13 +6,13 @@
 可以设置检查的时间范围，如一周、一个月或自定义时间段
 
 使用方法：
-    python check_daily_completeness.py --period week  # 检查最近一周数据完整性
-    python check_daily_completeness.py --period month  # 检查最近一个月数据完整性
-    python check_daily_completeness.py --start-date 20230101 --end-date 20230630  # 检查指定日期范围内的数据完整性
-    python check_daily_completeness.py --verbose  # 输出详细日志
-    python check_daily_completeness.py --output incomplete_stocks.csv  # 将不完整的股票列表保存到CSV文件
-    python check_daily_completeness.py --fetch-incomplete  # 检测并自动抓取不完整的股票数据
-    python check_daily_completeness.py --max-fetch 50  # 最多抓取50只不完整的股票数据
+    python -m check.check_daily_completeness --period week  # 检查最近一周数据完整性
+    python -m check.check_daily_completeness --period month  # 检查最近一个月数据完整性
+    python -m check.check_daily_completeness --start-date 20230101 --end-date 20230630  # 检查指定日期范围内的数据完整性
+    python -m check.check_daily_completeness --verbose  # 输出详细日志
+    python -m check.check_daily_completeness --output incomplete_stocks.csv  # 将不完整的股票列表保存到CSV文件
+    python -m check.check_daily_completeness --fetch-incomplete  # 检测并自动抓取不完整的股票数据
+    python -m check.check_daily_completeness --max-fetch 50  # 最多抓取50只不完整的股票数据
 """
 
 import os
@@ -30,15 +30,12 @@ import time
 
 # 添加项目根目录到Python路径
 current_dir = Path(__file__).resolve().parent
-sys.path.append(str(current_dir))
+root_dir = current_dir.parent
+sys.path.append(str(root_dir))
 
-# 导入daily_fetcher模块 (如果在同一目录下)
-try:
-    from daily_fetcher import DailyFetcher
-    DAILY_FETCHER_IMPORTABLE = True
-except ImportError:
-    DAILY_FETCHER_IMPORTABLE = False
-    logger.warning("无法导入DailyFetcher类，将使用命令行方式调用daily_fetcher.py")
+# 导入daily_fetcher模块 (如果在根目录下)
+from daily_fetcher import DailyFetcher
+DAILY_FETCHER_IMPORTABLE = True
 
 class DailyDataChecker:
     """
@@ -66,6 +63,10 @@ class DailyDataChecker:
             verbose: 是否输出详细日志
         """
         self.config_path = config_path
+        # 如果配置路径不是绝对路径，则转换为相对于项目根目录的路径
+        if not os.path.isabs(self.config_path):
+            self.config_path = os.path.join(root_dir, self.config_path)
+            
         self.collection_name = collection_name
         self.target_market_codes = target_market_codes
         self.verbose = verbose
@@ -923,9 +924,11 @@ class DailyDataChecker:
                 for sub_batch_idx, sub_batch in enumerate(sub_batches):
                     # 构建命令
                     codes_str = ",".join(sub_batch)
+                    # 修改命令路径，使用-m选项调用模块而不是直接运行脚本
                     cmd = [
                         "python", 
-                        str(current_dir / "daily_fetcher.py"), 
+                        "-m",
+                        "check.daily_fetcher", 
                         "--ts-code", codes_str,
                         "--start-date", start_date,
                         "--end-date", end_date,
@@ -1029,9 +1032,14 @@ def main():
         start_date = (today - timedelta(days=30)).strftime("%Y%m%d")
         logger.info(f"使用默认日期范围(最近一个月): {start_date} 至 {end_date}")
     
+    # 如果配置路径不是绝对路径，则转换为相对于项目根目录的路径
+    config_path = args.config
+    if not os.path.isabs(config_path):
+        config_path = os.path.join(root_dir, config_path)
+    
     # 创建检查器
     checker = DailyDataChecker(
-        config_path=args.config,
+        config_path=config_path,
         db_name=args.db_name,
         collection_name=args.collection,
         target_market_codes=target_market_codes,

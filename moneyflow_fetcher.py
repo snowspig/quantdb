@@ -203,11 +203,11 @@ class TushareClientWAN:
             return None
 
 
-class DailyBasicFetcher:
+class MoneyflowFetcher:
     """
-    每日指标数据获取器
+    个股资金流向数据获取器
     
-    该类用于从Tushare获取每日指标数据并保存到MongoDB数据库
+    该类用于从Tushare获取个股资金流向数据并保存到MongoDB数据库
     优化点：
     1. 支持按时间段分批获取数据，避免一次获取超过10000条数据限制
     2. 多WAN接口并行获取，提高数据获取效率
@@ -219,10 +219,10 @@ class DailyBasicFetcher:
         self,
         config_path: str = "config/config.yaml",
         interface_dir: str = "config/interfaces",
-        interface_name: str = "daily_basic_ts.json",
+        interface_name: str = "moneyflow.json",
         target_market_codes: Set[str] = {"00", "30", "60", "68"},  # 默认只保存00 30 60 68四个板块的股票数据
         db_name: str = None,
-        collection_name: str = "daily_basic",
+        collection_name: str = "moneyflow",
         verbose: bool = False,
         max_workers: int = 3,  # 并行工作线程数
         retry_count: int = 5,  # 数据获取重试次数 (5次)
@@ -230,7 +230,7 @@ class DailyBasicFetcher:
         batch_size: int = 10000  # 每批次获取数据的最大数量，防止超过API限制
     ):
         """
-        初始化每日指标数据获取器
+        初始化个股资金流向数据获取器
         
         Args:
             config_path: 配置文件路径
@@ -267,7 +267,7 @@ class DailyBasicFetcher:
         self._load_interface_config()
         
         # 获取API名称
-        self.api_name = self.interface_config.get("api_name", "daily_basic")
+        self.api_name = self.interface_config.get("api_name", "moneyflow")
         
         # 初始化Tushare客户端
         self.ts_client = self._init_client()
@@ -296,64 +296,102 @@ class DailyBasicFetcher:
         # 设置WAN接口配置
         self.port_allocator = port_allocator  # 使用全局端口分配器
         
-        # 添加索引验证标志，避免重复验证
-        self.indexes_verified = False
+        # 使用上下文管理器初始化索引并打印结果
+        with self._create_index_context():
+            pass
         
-        # 初始化时创建一次索引
-        self._ensure_indexes(self.collection)
-        
-        logger.success("初始化日线基本指标数据获取器完成")
+        logger.success("初始化个股资金流向数据获取器完成")
 
     def _ensure_indexes(self, collection) -> bool:
-        """确保必要的索引存在，避免重复调用"""
-        # 如果已经验证过索引，直接返回
-        if hasattr(self, 'indexes_verified') and self.indexes_verified:
-            return True
+        """
+        确保必要的索引存在
         
+        Args:
+            collection: MongoDB集合对象
+            
+        Returns:
+            是否成功创建索引
+        """
         try:
-            # 获取所有已存在的索引
+            # 确保MongoDB连接
+            if not self.mongodb_client.is_connected():
+                logger.warning("MongoDB未连接，尝试连接...")
+                if not self.mongodb_client.connect():
+                    logger.error("连接MongoDB失败，无法创建索引")
+                    return False
+            
+            # 获取现有索引
             existing_indexes = collection.index_information()
-            logger.debug(f"集合 {collection.name} 现有索引信息: {existing_indexes}")
+            logger.debug(f"现有索引信息: {existing_indexes}")
             
-            # 从接口配置获取索引字段
-            index_fields = self.interface_config.get("index_fields", ["ts_code", "trade_date"])
+            # 检查复合唯一索引 (ts_code, trade_date)
+            index_name = "ts_code_1_trade_date_1"
+            index_created = False
             
-            # 检查是否已存在复合索引
-            has_compound_index = False
-            
-            # 查找所有索引，检查是否存在所需的复合索引
-            for idx_name, idx_info in existing_indexes.items():
-                # 跳过_id索引
-                if idx_name == '_id_':
-                    continue
+            # 检查索引是否存在并且结构正确
+            if index_name in existing_indexes:
+                # 验证索引的键和属性
+                existing_index = existing_indexes[index_name]
+                expected_keys = [("ts_code", 1), ("trade_date", 1)]
+                
+                # 确保是有序的正确键和唯一约束
+                keys_match = all(key in expected_keys for key in existing_index['key']) and len(existing_index['key']) == len(expected_keys)
+                is_unique = existing_index.get('unique', False)
+                
+                if keys_match and is_unique:
+                    logger.debug(f"复合唯一索引 (ts_code, trade_date) 已存在且结构正确，跳过创建")
+                else:
+                    # 索引存在但结构不正确，删除并重建
+                    logger.info(f"复合唯一索引 (ts_code, trade_date) 存在但结构不正确，删除并重建索引")
+                    try:
+                        collection.drop_index(index_name)
+                        logger.debug(f"成功删除现有索引: {index_name}")
+                    except Exception as e:
+                        logger.error(f"删除索引时出错: {str(e)}")
                     
-                # 检查是否有匹配的复合索引
-                if len(idx_info.get('key', [])) == len(index_fields):
-                    keys = [k[0] for k in idx_info.get('key', [])]
-                    if all(field in keys for field in index_fields):
-                        has_compound_index = True
-                        logger.info(f"已存在复合索引 {index_fields}，索引名: {idx_name}，跳过创建")
-                        break
-            
-            # 如果没有复合索引，创建一个
-            if not has_compound_index:
-                logger.info(f"正在为集合 {collection.name} 创建复合唯一索引 {index_fields}...")
+                    # 创建正确的索引
+                    collection.create_index(
+                        [("ts_code", 1), ("trade_date", 1)], 
+                        unique=True, 
+                        background=True
+                    )
+                    logger.success(f"已重建复合唯一索引 (ts_code, trade_date)")
+                    index_created = True
+            else:
+                # 索引不存在，创建它
+                logger.info(f"正在为集合 {collection.name} 创建复合唯一索引 (ts_code, trade_date)...")
                 collection.create_index(
-                    [(field, 1) for field in index_fields],
-                    unique=True,
+                    [("ts_code", 1), ("trade_date", 1)], 
+                    unique=True, 
                     background=True
                 )
-                logger.success(f"已成功创建复合唯一索引 {index_fields}")
+                logger.success(f"已成功创建复合唯一索引 (ts_code, trade_date)")
+                index_created = True
             
-            # 设置标志，表示索引已验证
-            self.indexes_verified = True
+            # 检查单字段索引
+            for field in ["ts_code", "trade_date"]:
+                index_field_name = f"{field}_1"
+                if index_field_name not in existing_indexes:
+                    logger.info(f"正在为字段 {field} 创建索引...")
+                    collection.create_index(field)
+                    logger.success(f"已为字段 {field} 创建索引")
+                    index_created = True
+                else:
+                    logger.debug(f"字段 {field} 的索引已存在，跳过创建")
+            
+            # 确保在创建索引后等待一小段时间，让MongoDB完成索引构建
+            if index_created:
+                logger.info("索引已创建或修改，等待MongoDB完成索引构建...")
+                time.sleep(1.0)  # 等待1秒，让MongoDB完成索引构建
+            
             return True
+            
         except Exception as e:
             logger.error(f"创建索引时出错: {str(e)}")
             import traceback
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return False
-    
+        
     def _load_config(self) -> Dict:
         """
         加载YAML格式的配置文件
@@ -378,70 +416,187 @@ class DailyBasicFetcher:
         try:
             if not os.path.exists(self.interface_path):
                 logger.error(f"接口配置文件不存在: {self.interface_path}")
-                # 创建默认配置
-                self.interface_config = {
-                    "api_name": "daily_basic",
-                    "available_fields": [],
-                    "index_fields": ["ts_code", "trade_date"],  # 使用index_fields表示索引字段
-                    "primary_keys": ["ts_code", "trade_date"]   # 保留兼容性
-                }
-                logger.warning("使用默认接口配置")
-                return
+                sys.exit(1)
                 
             with open(self.interface_path, 'r', encoding='utf-8') as f:
                 self.interface_config = json.load(f)
                 
             logger.debug(f"成功加载接口配置: {self.interface_name}")
-                
-            # 验证接口配置，保证必要字段存在
+            
+            # 验证接口配置
             if "api_name" not in self.interface_config:
-                logger.warning(f"接口配置缺少api_name字段，将使用默认值: daily_basic")
-                self.interface_config["api_name"] = "daily_basic"
+                logger.error(f"接口配置缺少必要的api_name字段: {self.interface_path}")
+                sys.exit(1)
                 
+            # 检查并设置接口字段和主键
             if "available_fields" not in self.interface_config:
                 logger.warning(f"接口配置缺少available_fields字段，将使用空列表")
                 self.interface_config["available_fields"] = []
                 
-            # 从index_fields字段获取主键，如果不存在则使用默认值
-            if "index_fields" in self.interface_config:
-                primary_keys = self.interface_config["index_fields"]
-                logger.debug(f"从接口配置的index_fields字段获取主键: {primary_keys}")
-                # 同时设置primary_keys以保持兼容性
-                self.interface_config["primary_keys"] = primary_keys
-            elif "primary_keys" not in self.interface_config:
-                logger.warning(f"接口配置缺少index_fields和primary_keys字段，将使用默认值: ['ts_code', 'trade_date']")
+            if "primary_keys" not in self.interface_config:
+                logger.warning(f"接口配置缺少primary_keys字段，将使用默认值: ['ts_code', 'trade_date']")
                 self.interface_config["primary_keys"] = ["ts_code", "trade_date"]
-                # 同时设置index_fields
-                self.interface_config["index_fields"] = ["ts_code", "trade_date"]
                 
         except Exception as e:
             logger.error(f"加载接口配置文件失败: {str(e)}")
-            # 使用默认配置
-            self.interface_config = {
-                "api_name": "daily_basic",
-                "available_fields": [],
-                "index_fields": ["ts_code", "trade_date"],
-                "primary_keys": ["ts_code", "trade_date"]
-            }
-            logger.warning("使用默认接口配置")
+            sys.exit(1)
+            
+    @contextmanager
+    def _create_index_context(self):
+        """创建索引的上下文管理器"""
+        try:
+            # 确保索引
+            primary_keys = self.interface_config.get("primary_keys", ["ts_code", "trade_date"])
+            
+            # 创建复合唯一索引
+            index_name = "_".join(primary_keys)
+            index_spec = [(key, 1) for key in primary_keys]
+            
+            if not primary_keys:
+                logger.warning("未指定主键，将不创建索引")
+                yield
+                return
+                
+            try:
+                logger.debug(f"为集合 {self.collection.name} 创建复合唯一索引: {index_name}")
+                self.collection.create_index(index_spec, unique=True, name=index_name)
+                logger.success(f"成功创建索引: {index_name}")
+            except Exception as e:
+                logger.warning(f"创建索引 {index_name} 失败: {str(e)}")
+                
+            # 创建trade_date索引（如果存在此字段）
+            if "trade_date" in primary_keys:
+                try:
+                    logger.debug(f"为集合 {self.collection.name} 创建trade_date索引")
+                    self.collection.create_index([("trade_date", 1)], name="idx_trade_date")
+                    logger.success(f"成功创建trade_date索引")
+                except Exception as e:
+                    logger.warning(f"创建trade_date索引失败: {str(e)}")
+                    
+            # 创建ts_code索引（如果存在此字段）
+            if "ts_code" in primary_keys:
+                try:
+                    logger.debug(f"为集合 {self.collection.name} 创建ts_code索引")
+                    self.collection.create_index([("ts_code", 1)], name="idx_ts_code")
+                    logger.success(f"成功创建ts_code索引")
+                except Exception as e:
+                    logger.warning(f"创建ts_code索引失败: {str(e)}")
+                    
+            yield
+            
+        except Exception as e:
+            logger.error(f"索引创建操作失败: {str(e)}")
+            yield
 
-    def fetch_daily_basic_by_date(self, trade_date: str, ts_code: str = None) -> pd.DataFrame:
+    def _generate_date_ranges(self, start_date: str, end_date: str, interval_days: int = 365) -> List[Tuple[str, str]]:
         """
-        按日期获取每日指标数据
+        生成日期范围列表，将长时间段按interval_days天分割成多个短时间段
+        
+        Args:
+            start_date: 开始日期，格式为YYYYMMDD
+            end_date: 结束日期，格式为YYYYMMDD
+            interval_days: 每个时间段的天数
+            
+        Returns:
+            日期范围列表，每个元素为(开始日期, 结束日期)的元组
+        """
+        try:
+            start_date_obj = datetime.strptime(start_date, '%Y%m%d')
+            end_date_obj = datetime.strptime(end_date, '%Y%m%d')
+            
+            if start_date_obj > end_date_obj:
+                logger.error(f"开始日期 {start_date} 晚于结束日期 {end_date}，将交换这两个日期")
+                start_date_obj, end_date_obj = end_date_obj, start_date_obj
+                
+            date_ranges = []
+            current_start = start_date_obj
+            
+            while current_start <= end_date_obj:
+                current_end = current_start + timedelta(days=interval_days)
+                if current_end > end_date_obj:
+                    current_end = end_date_obj
+                    
+                date_ranges.append(
+                    (current_start.strftime('%Y%m%d'), current_end.strftime('%Y%m%d'))
+                )
+                
+                current_start = current_end + timedelta(days=1)
+                if current_start > end_date_obj:
+                    break
+                    
+            return date_ranges
+        except Exception as e:
+            logger.error(f"生成日期范围时出错: {str(e)}")
+            return []
+            
+    def _get_all_stock_codes(self) -> List[str]:
+        """
+        获取所有股票代码
+        
+        Returns:
+            股票代码列表
+        """
+        try:
+            # 使用stock_basic接口获取所有股票列表
+            df = self.ts_client.get_data(
+                api_name="stock_basic",
+                params={},
+                fields=["ts_code"]
+            )
+            
+            if df.empty:
+                logger.error("获取股票列表失败，API返回数据为空")
+                return []
+                
+            return df['ts_code'].tolist()
+        except Exception as e:
+            logger.error(f"获取股票列表失败: {str(e)}")
+            return []
+            
+    def _split_stock_codes(self, ts_codes: List[str], batch_size: int) -> List[List[str]]:
+        """
+        将股票代码列表分成指定大小的批次
+        
+        Args:
+            ts_codes: 股票代码列表
+            batch_size: 每批的大小
+            
+        Returns:
+            分批后的股票代码列表的列表
+        """
+        if not ts_codes:
+            return []
+            
+        # 计算需要多少批次
+        total_batches = (len(ts_codes) + batch_size - 1) // batch_size
+        
+        # 分批
+        batches = []
+        for i in range(total_batches):
+            start_idx = i * batch_size
+            end_idx = min(start_idx + batch_size, len(ts_codes))
+            batch = ts_codes[start_idx:end_idx]
+            batches.append(batch)
+            
+        return batches
+
+    def fetch_moneyflow_by_date(self, trade_date: str, ts_code: str = None) -> pd.DataFrame:
+        """
+        按日期获取个股资金流向数据
         
         Args:
             trade_date: 交易日期，格式为YYYYMMDD
             ts_code: 可选，股票代码
             
         Returns:
-            DataFrame形式的日线数据
+            DataFrame形式的资金流向数据
         """
         try:
             params = {"trade_date": trade_date}
             if ts_code:
                 params["ts_code"] = ts_code
                 
-            logger.debug(f"获取日期 {trade_date} 的每日指标数据"+(f" 股票代码: {ts_code}" if ts_code else ""))
+            logger.debug(f"获取日期 {trade_date} 的个股资金流向数据"+(f" 股票代码: {ts_code}" if ts_code else ""))
             
             # 添加重试逻辑，出现失败时进行5次延时重试后再跳过该批次的抓取
             for retry in range(self.retry_count):
@@ -466,15 +621,15 @@ class DailyBasicFetcher:
                 logger.warning(f"日期 {trade_date} 未获取到数据"+(f" 股票代码: {ts_code}" if ts_code else ""))
                 return pd.DataFrame()
             
-            logger.info(f"成功获取日期 {trade_date} 的每日指标数据"+(f" 股票代码: {ts_code}" if ts_code else f"，共 {len(df)} 条记录"))
+            logger.info(f"成功获取日期 {trade_date} 的个股资金流向数据"+(f" 股票代码: {ts_code}" if ts_code else f"，共 {len(df)} 条记录"))
             return df
         except Exception as e:
-            logger.error(f"获取日期 {trade_date} 的每日指标数据失败: {str(e)}")
+            logger.error(f"获取日期 {trade_date} 的个股资金流向数据失败: {str(e)}")
             return pd.DataFrame()
 
-    def fetch_daily_basic_by_code(self, ts_code: str, start_date: str = None, end_date: str = None) -> pd.DataFrame:
+    def fetch_moneyflow_by_code(self, ts_code: str, start_date: str = None, end_date: str = None) -> pd.DataFrame:
         """
-        按股票代码获取每日指标数据
+        按股票代码获取个股资金流向数据
         
         Args:
             ts_code: 股票代码
@@ -482,7 +637,7 @@ class DailyBasicFetcher:
             end_date: 可选，结束日期，格式为YYYYMMDD
             
         Returns:
-            DataFrame形式的每日指标数据
+            DataFrame形式的个股资金流向数据
         """
         try:
             params = {"ts_code": ts_code}
@@ -491,7 +646,7 @@ class DailyBasicFetcher:
             if end_date:
                 params["end_date"] = end_date
                 
-            logger.debug(f"获取股票 {ts_code} 的每日指标数据"+(f" 日期范围: {start_date} 至 {end_date}" if start_date and end_date else ""))
+            logger.debug(f"获取股票 {ts_code} 的个股资金流向数据"+(f" 日期范围: {start_date} 至 {end_date}" if start_date and end_date else ""))
             
             # 添加重试逻辑，出现失败时进行5次延时重试后再跳过该批次的抓取
             for retry in range(self.retry_count):
@@ -522,10 +677,10 @@ class DailyBasicFetcher:
             if record_count >= self.batch_size * 0.9:  # 如果返回的数据量超过批次大小的90%
                 logger.warning(f"股票 {ts_code} 返回数据量 {record_count} 接近API限制，数据可能不完整，建议缩小时间范围")
             
-            logger.info(f"成功获取股票 {ts_code} 的每日指标数据，共 {record_count} 条记录")
+            logger.info(f"成功获取股票 {ts_code} 的个股资金流向数据，共 {record_count} 条记录")
             return df
         except Exception as e:
-            logger.error(f"获取股票 {ts_code} 的每日指标数据失败: {str(e)}")
+            logger.error(f"获取股票 {ts_code} 的个股资金流向数据失败: {str(e)}")
             return pd.DataFrame()
 
     def get_target_ts_codes_from_stock_basic(self) -> Set[str]:
@@ -676,11 +831,15 @@ class DailyBasicFetcher:
             # 获取数据库对象和集合对象
             collection = self.collection
             
+            # 首先创建索引 - 提前创建索引以提高插入和查询效率
+            with self._create_index_context():
+                pass
+            
             # 将DataFrame转换为字典列表
             records = data.to_dict("records")
             
             # 从接口配置中获取主键字段，如果没有指定，则使用默认的 ["ts_code", "trade_date"]
-            primary_keys = self.interface_config.get("index_fields", ["ts_code", "trade_date"])
+            primary_keys = self.interface_config.get("primary_keys", ["ts_code", "trade_date"])
             
             # 批量处理，避免一次性处理太多记录
             batch_size = 10000  # 减小batch_size以减轻MongoDB负担
@@ -904,9 +1063,9 @@ class DailyBasicFetcher:
 
         return {"inserted": inserted, "updated": updated, "skipped": skipped}
 
-    def fetch_daily_basic_data_by_date_range(self, start_date: str, end_date: str, batch_size: int = 1, use_parallel: bool = True):
+    def fetch_moneyflow_data_by_date_range(self, start_date: str, end_date: str, batch_size: int = 1, use_parallel: bool = True):
         """
-        按日期范围获取每日指标数据
+        按日期范围获取个股资金流向数据
         
         Args:
             start_date: 开始日期，格式为YYYYMMDD
@@ -923,7 +1082,7 @@ class DailyBasicFetcher:
                 
             # 记录总股票数量
             total_stocks = len(stock_codes)
-            logger.info(f"准备获取 {total_stocks} 个股票的每日指标数据，日期范围: {start_date} - {end_date}")
+            logger.info(f"准备获取 {total_stocks} 个股票的个股资金流向数据，日期范围: {start_date} - {end_date}")
             
             # 检查是否可以并行处理
             if use_parallel and self.port_allocator:
@@ -943,7 +1102,7 @@ class DailyBasicFetcher:
                 # 使用ThreadPoolExecutor并行处理股票
                 with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                     # 为每个股票创建任务
-                    future_to_code = {executor.submit(self.fetch_daily_basic_by_code, code, start_date, end_date): code for code in batch}
+                    future_to_code = {executor.submit(self.fetch_moneyflow_by_code, code, start_date, end_date): code for code in batch}
                     
                     # 处理完成的任务
                     for future in future_to_code:
@@ -959,16 +1118,16 @@ class DailyBasicFetcher:
                 # 每批次后稍微延迟，避免API连续请求过快
                 time.sleep(1)
                 
-            logger.success(f"按日期范围获取每日指标数据完成，日期范围: {start_date} - {end_date}")
+            logger.success(f"按日期范围获取个股资金流向数据完成，日期范围: {start_date} - {end_date}")
             
         except Exception as e:
-            logger.error(f"按日期范围获取每日指标数据失败: {str(e)}")
+            logger.error(f"按日期范围获取个股资金流向数据失败: {str(e)}")
             import traceback
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
     
     def fetch_recent_data(self, days: int = 7, verbose: bool = True, use_parallel: bool = True, batch_size: int = 1):
         """
-        获取最近几天的每日指标数据
+        获取最近几天的个股资金流向数据
         
         Args:
             days: 最近几天，默认7天
@@ -986,7 +1145,7 @@ class DailyBasicFetcher:
             start_date_obj = datetime.now() - timedelta(days=days)
             start_date = start_date_obj.strftime('%Y%m%d')
             
-            logger.info(f"获取最近 {days} 天的每日指标数据，日期范围: {start_date} - {end_date}")
+            logger.info(f"获取最近 {days} 天的个股资金流向数据，日期范围: {start_date} - {end_date}")
             
             # 生成日期列表 - 为近期数据使用假的工作日（周一至周五）
             trade_dates = []
@@ -1045,9 +1204,9 @@ class DailyBasicFetcher:
                 logger.info(f"使用串行模式处理近期数据，目标日期: {len(trade_dates)}个")
                 for trade_date in trade_dates:
                     try:
-                        logger.info(f"处理日期 {trade_date} 的每日指标数据")
+                        logger.info(f"处理日期 {trade_date} 的个股资金流向数据")
                         # 使用直接获取全市场数据的方式
-                        df = self.fetch_daily_basic_by_date(trade_date=trade_date)
+                        df = self.fetch_moneyflow_by_date(trade_date=trade_date)
                         
                         if df.empty:
                             logger.warning(f"日期 {trade_date} 未获取到数据或过滤后无目标板块数据")
@@ -1077,11 +1236,11 @@ class DailyBasicFetcher:
             # 恢复详细模式设置
             self.verbose = old_verbose
             
-            logger.error(f"获取最近 {days} 天的每日指标数据失败: {str(e)}")
+            logger.error(f"获取最近 {days} 天的个股资金流向数据失败: {str(e)}")
             import traceback
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
             
-        logger.success(f"获取最近 {days} 天的每日指标数据完成")
+        logger.success(f"获取最近 {days} 天的个股资金流向数据完成")
 
     def _fetch_data_for_date_parallel(self, trade_date: str, wan_idx: int, target_ts_codes: Set[str] = None) -> Dict:
         """
@@ -1096,7 +1255,7 @@ class DailyBasicFetcher:
             处理结果的统计信息字典
         """
         try:
-            logger.info(f"处理日期 {trade_date} 的每日指标数据")
+            logger.info(f"处理日期 {trade_date} 的个股资金流向数据")
             
             # 使用多WAN接口直接按日期获取全市场数据
             logger.info(f"使用多WAN接口直接按日期获取 {trade_date} 的全市场数据")
@@ -1104,10 +1263,10 @@ class DailyBasicFetcher:
             wan_info = self._get_wan_socket(wan_idx)
             if not wan_info:
                 logger.warning(f"未能获取WAN {wan_idx} 的端口，将使用普通方式获取数据")
-                df = self.fetch_daily_basic_by_date(trade_date)
+                df = self.fetch_moneyflow_by_date(trade_date)
             else:
                 try:
-                    df = self.fetch_daily_basic_by_date_with_wan(trade_date=trade_date, wan_info=wan_info)
+                    df = self.fetch_moneyflow_by_date_with_wan(trade_date=trade_date, wan_info=wan_info)
                 finally:
                     # 释放WAN端口
                     if wan_info:
@@ -1262,7 +1421,7 @@ class DailyBasicFetcher:
                     for code in batch_ts_codes:
                         try:
                             # 使用WAN接口获取数据
-                            df = self.fetch_daily_basic_by_code_with_wan(code, start_date, end_date, wan_info)
+                            df = self.fetch_moneyflow_by_code_with_wan(code, start_date, end_date, wan_info)
                             if not df.empty:
                                 # 立即保存数据
                                 result = self.store_data(df)
@@ -1518,7 +1677,7 @@ class DailyBasicFetcher:
                 for code in batch_ts_codes:
                     try:
                         # 获取数据
-                        df = self.fetch_daily_basic_by_code(code, start_date, end_date)
+                        df = self.fetch_moneyflow_by_code_with_wan(code, start_date, end_date, wan_info)
                         if not df.empty:
                             # 保存数据
                             result = self.store_data(df)
@@ -1574,9 +1733,9 @@ class DailyBasicFetcher:
         
         return success_batches > 0
         
-    def fetch_daily_basic_by_code_with_wan(self, ts_code: str, start_date: str, end_date: str, wan_info: Tuple[int, int]) -> pd.DataFrame:
+    def fetch_moneyflow_by_code_with_wan(self, ts_code: str, start_date: str, end_date: str, wan_info: Tuple[int, int]) -> pd.DataFrame:
         """
-        使用WAN接口按股票代码获取日期范围内的每日指标数据
+        使用WAN接口按股票代码获取日期范围内的个股资金流向数据
         
         Args:
             ts_code: 股票代码
@@ -1585,7 +1744,7 @@ class DailyBasicFetcher:
             wan_info: WAN接口信息(wan_idx, port)
             
         Returns:
-            DataFrame形式的每日指标数据
+            DataFrame形式的个股资金流向数据
         """
         try:
             # 准备请求参数
@@ -1596,7 +1755,7 @@ class DailyBasicFetcher:
             }
             
             if hasattr(self, 'verbose') and self.verbose:
-                logger.debug(f"使用WAN接口获取股票 {ts_code} 的每日指标数据，日期范围: {start_date} - {end_date}")
+                logger.debug(f"使用WAN接口获取股票 {ts_code} 的个股资金流向数据，日期范围: {start_date} - {end_date}")
             
             # 准备API参数
             api_name = self.api_name
@@ -1604,7 +1763,7 @@ class DailyBasicFetcher:
             
             if not wan_info:
                 logger.warning("未提供WAN接口信息，使用普通客户端获取数据")
-                return self.fetch_daily_basic_by_code(ts_code, start_date, end_date)
+                return self.fetch_moneyflow_by_code(ts_code, start_date, end_date)
             
             # 解包WAN信息
             wan_idx, port = wan_info
@@ -1813,16 +1972,16 @@ class DailyBasicFetcher:
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return None
 
-    def fetch_daily_basic_by_date_with_wan(self, trade_date: str, wan_info: Tuple[int, int]) -> pd.DataFrame:
+    def fetch_moneyflow_by_date_with_wan(self, trade_date: str, wan_info: Tuple[int, int]) -> pd.DataFrame:
         """
-        使用WAN接口按交易日期获取每日指标数据
+        使用WAN接口按交易日期获取个股资金流向数据
         
         Args:
             trade_date: 交易日期，格式为YYYYMMDD
             wan_info: WAN接口信息(wan_idx, port)
             
         Returns:
-            DataFrame形式的每日指标数据
+            DataFrame形式的个股资金流向数据
         """
         try:
             # 准备请求参数
@@ -1831,7 +1990,7 @@ class DailyBasicFetcher:
             }
             
             if hasattr(self, 'verbose') and self.verbose:
-                logger.debug(f"使用WAN接口获取交易日期 {trade_date} 的每日指标数据")
+                logger.debug(f"使用WAN接口获取交易日期 {trade_date} 的个股资金流向数据")
             
             # 准备API参数
             api_name = self.api_name
@@ -1839,7 +1998,7 @@ class DailyBasicFetcher:
             
             if not wan_info:
                 logger.warning("未提供WAN接口信息，使用普通客户端获取数据")
-                return self.fetch_daily_basic_by_date(trade_date)
+                return self.fetch_moneyflow_by_date(trade_date)
             
             # 解包WAN信息
             wan_idx, port = wan_info
@@ -2013,113 +2172,12 @@ class DailyBasicFetcher:
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
             sys.exit(1)
 
-    def fetch_daily_basic_by_ts_code(self, ts_code: str, start_date: str, end_date: str, use_wan: bool = True) -> bool:
-        try:
-            logger.info(f"获取单个股票 {ts_code} 的每日指标数据，日期范围: {start_date} - {end_date}")
-            
-            # 检查股票代码是否属于目标板块
-            code_prefix = ts_code[:6][:2] if len(ts_code) >= 6 else ""
-            if code_prefix not in self.target_market_codes:
-                logger.warning(f"股票 {ts_code} 不在目标市场代码 {self.target_market_codes} 中，不保存数据")
-                return False
-                
-            # 删除这行，避免重复检查索引
-            # self._ensure_indexes(self.collection)
-            
-            # 实现重试机制
-            max_retries = 5
-            success = False
-            df = None
-            
-            for retry in range(max_retries):
-                try:
-                    # 检查是否使用多WAN口
-                    if use_wan and self.port_allocator:
-                        available_wans = self.port_allocator.get_available_wan_indices()
-                        if available_wans:
-                            # 获取WAN端口 - 轮换使用WAN
-                            wan_idx = available_wans[retry % len(available_wans)]
-                            wan_info = self._get_wan_socket(wan_idx)
-                            
-                            if wan_info:
-                                try:
-                                    logger.info(f"使用WAN {wan_idx} 获取股票 {ts_code} 的数据 (重试 {retry+1}/{max_retries})")
-                                    df = self.fetch_daily_basic_by_code_with_wan(ts_code, start_date, end_date, wan_info)
-                                finally:
-                                    # 释放WAN端口
-                                    if wan_info:
-                                        wan_idx, port = wan_info
-                                        time.sleep(1)  # 短暂延迟确保端口完全释放
-                                        self.port_allocator.release_port(wan_idx, port)
-                            else:
-                                logger.warning(f"无法获取WAN端口，使用普通模式获取数据")
-                                df = self.fetch_daily_basic_by_code(ts_code, start_date, end_date)
-                        else:
-                            logger.warning("没有可用的WAN接口，使用普通模式获取数据")
-                            df = self.fetch_daily_basic_by_code(ts_code, start_date, end_date)
-                    else:
-                        # 普通模式获取数据
-                        if retry == 0:
-                            logger.info(f"使用普通模式获取股票 {ts_code} 的数据")
-                        else:
-                            logger.info(f"使用普通模式获取股票 {ts_code} 的数据 (重试 {retry}/{max_retries-1})")
-                        df = self.fetch_daily_basic_by_code(ts_code, start_date, end_date)
-                    
-                    # 检查结果
-                    if df is None:
-                        # API调用失败，需要重试
-                        raise Exception("API调用失败，返回None")
-                    
-                    if not df.empty:
-                        success = True
-                        break
-                    else:
-                        logger.warning(f"获取股票 {ts_code} 的数据为空 (重试 {retry+1}/{max_retries})")
-                        # 空结果也算成功，但无数据可保存
-                        success = True
-                        break
-                        
-                except Exception as e:
-                    if retry < max_retries - 1:
-                        # 随机延迟，避免同时重试
-                        retry_delay = self.retry_delay + random.random() * 3
-                        logger.warning(f"获取股票 {ts_code} 数据失败: {str(e)}，第 {retry+1}/{max_retries} 次重试，等待 {retry_delay:.1f} 秒")
-                        time.sleep(retry_delay)
-                    else:
-                        logger.error(f"获取股票 {ts_code} 数据失败: {str(e)}，已达到最大重试次数")
-            
-            if not success or df is None:
-                logger.warning(f"所有重试后仍未获取到股票 {ts_code} 的有效数据")
-                return False
-                
-            if df.empty:
-                logger.warning(f"未获取到股票 {ts_code} 的数据")
-                return False
-                
-            # 存储数据
-            result = self.store_data(df)
-            
-            # 输出统计信息
-            total_inserted = result.get("inserted", 0)
-            total_updated = result.get("updated", 0)
-            total_skipped = result.get("skipped", 0)
-            total_records = len(df)
-            
-            logger.success(f"股票 {ts_code} 数据处理完成: 新增 {total_inserted} 条记录，更新 {total_updated} 条记录，跳过 {total_skipped} 条记录，总计 {total_records} 条记录")
-            return True
-            
-        except Exception as e:
-            logger.error(f"获取股票 {ts_code} 数据失败: {str(e)}")
-            import traceback
-            logger.debug(f"详细错误信息: {traceback.format_exc()}")
-            return False
-
 
 if __name__ == "__main__":
     import argparse
     
     # 创建命令行参数解析器
-    parser = argparse.ArgumentParser(description="每日指标数据获取器 - 从湘财Tushare获取每日指标数据并存储到MongoDB")
+    parser = argparse.ArgumentParser(description="个股资金流向数据获取器 - 从湘财Tushare获取个股资金流向数据并存储到MongoDB")
     
     # 添加命令行参数
     parser.add_argument("--full", action="store_true", help="获取完整历史数据(从19900101至今)")
@@ -2131,13 +2189,12 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=1, help="每批处理的股票数量，默认为1")
     parser.add_argument("--no-parallel", dest="use_parallel", action="store_false", help="不使用并行处理")
     parser.set_defaults(use_parallel=True)
-    parser.add_argument("--ts-code", type=str, help="指定股票代码，例如600000.SH")
     
     # 解析命令行参数
     args = parser.parse_args()
     
     # 初始化获取器
-    fetcher = DailyBasicFetcher(verbose=args.verbose)
+    fetcher = MoneyflowFetcher(verbose=args.verbose)
     
     # 根据命令行参数执行不同的操作
     if args.full:
@@ -2208,25 +2265,11 @@ if __name__ == "__main__":
                 fetcher.fetch_full_history(batch_size=args.batch_size, use_parallel=args.use_parallel)
             else:
                 logger.error("未能获取目标股票代码，无法进行完整历史数据获取")
-    elif args.ts_code:
-        # 处理单个股票代码的情况
-        start_date = args.start_date
-        end_date = args.end_date
-        
-        # 设置默认日期范围
-        if not start_date or not end_date:
-            today = datetime.now()
-            end_date = today.strftime('%Y%m%d')  # 今天
-            start_date = (today - timedelta(days=7)).strftime('%Y%m%d')  # 一周前
-            logger.info(f"为指定股票 {args.ts_code} 设置默认日期范围: {start_date} 至 {end_date}")
-        
-        # 使用新方法获取单个股票数据
-        fetcher.fetch_daily_basic_by_ts_code(args.ts_code, start_date, end_date, use_wan=args.use_parallel)
     elif args.start_date and args.end_date:
         # 获取指定日期范围的数据
-        fetcher.fetch_daily_basic_data_by_date_range(args.start_date, args.end_date, batch_size=args.batch_size)
+        fetcher.fetch_moneyflow_data_by_date_range(args.start_date, args.end_date, batch_size=args.batch_size)
     else:
         # 默认获取最近7天的数据
         fetcher.fetch_recent_data(use_parallel=args.use_parallel, batch_size=args.batch_size)
     
-    logger.success("每日指标数据获取器执行完毕")
+    logger.success("个股资金流向数据获取器执行完毕")
