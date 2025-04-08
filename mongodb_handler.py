@@ -34,7 +34,7 @@ class MongoDBHandler:
                 uri += f"{quote_plus(username)}:{quote_plus(password)}@"
             uri += f"{host}:{port}/?authMechanism={auth_mechanism}"
 
-            self.client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=5000)
+            self.client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=10000)
             self.client.server_info()  # Check connection
             self.db = self.client[db_name]
             print("Successfully connected to MongoDB server and accessed database")
