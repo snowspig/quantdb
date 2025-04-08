@@ -83,8 +83,8 @@ class TushareClient:
             token: Tushare API密钥,如果为None则从配置中获取
             api_url: Tushare API URL,如果为None则从配置中获取
         """
-        self.token = token or config_manager.get_tushare_token()
-        self.api_url = api_url or config_manager.get_tushare_api_url()
+        self.token = 'b5bb9d57e35cf485f0366eb6581017fb69cefff888da312b0128f3a0'
+        self.api_url = 'http://116.128.206.39:7172'
         self.timeout = config_manager.get('tushare', 'timeout', 60)
         self.max_retries = config_manager.get('tushare', 'max_retries', 3)
         self.retry_delay = config_manager.get('tushare', 'retry_delay', 5)

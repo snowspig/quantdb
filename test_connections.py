@@ -199,3 +199,10 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+# Test Xiangcai Tushare server connection
+import xcsc_tushare as ts
+ts.set_token('b5bb9d57e35cf485f0366eb6581017fb69cefff888da312b0128f3a0')
+pro = ts.pro_api(server='http://116.128.206.39:7172')
+df = pro.trade_cal(exchange='', start_date='20180901', end_date='20181001')
+print(df)
