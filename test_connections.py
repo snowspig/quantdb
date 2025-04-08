@@ -5,7 +5,7 @@ import os
 import sys
 import yaml
 import pymongo
-import tushare as ts
+import xcsc_tushare as ts
 import pandas as pd
 from datetime import datetime
 from colorama import Fore, Style, init
@@ -47,22 +47,19 @@ def test_tushare_connection(config):
     print_header("Testing Tushare API Connection")
     
     try:
-        token = config["tushare"]["token"]
-        if token == "your_tushare_token_here":
-            print_error("Tushare token not set in config.yaml")
-            print_info("Please replace 'your_tushare_token_here' with your actual Tushare token")
-            return False
+        token = 'b5bb9d57e35cf485f0366eb6581017fb69cefff888da312b0128f3a0'
+        server = 'http://116.128.206.39:7172'
         
         print_info("Initializing Tushare with token...")
         ts.set_token(token)
-        pro = ts.pro_api(token)
+        pro = ts.pro_api(token, server=server)
         
-        print_info("Fetching stock basics data...")
-        df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name,area,industry,list_date')
+        print_info("Fetching trade calendar data...")
+        df = pro.trade_cal(exchange='', start_date='20180901', end_date='20181001')
         
         if df is not None and not df.empty:
             print_success("Successfully connected to Tushare API")
-            print_success(f"Retrieved {len(df)} stocks from Tushare")
+            print_success(f"Retrieved {len(df)} records from Tushare")
             print_info("Sample data:")
             print(df.head(5).to_string())
             return True
@@ -199,9 +196,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
-# Test Xiangcai Tushare server connection
-import xcsc_tushare as ts
-pro = ts.pro_api('b5bb9d57e35cf485f0366eb6581017fb69cefff888da312b0128f3a0', server='http://116.128.206.39:7172')
-df = pro.trade_cal(exchange='', start_date='20180901', end_date='20181001')
-print(df)
