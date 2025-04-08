@@ -47,8 +47,8 @@ def test_tushare_connection(config):
     print_header("Testing Tushare API Connection")
     
     try:
-        token = 'b5bb9d57e35cf485f0366eb6581017fb69cefff888da312b0128f3a0'
-        server = 'http://116.128.206.39:7172'
+        token = config['tushare']['token']
+        server = config['tushare']['api_url']
         
         print_info("Initializing Tushare with token...")
         ts.set_token(token)
