@@ -297,17 +297,6 @@ class ConfigManager:
         """
         return self.get('log', {'level': 'INFO', 'file': 'logs/quantdb.log'})
     
-    def is_wan_enabled(self) -> bool:
-        """
-        检查是否启用多WAN口
-        
-        Returns:
-            bool: 是否启用多WAN口
-        """
-        network_config = self.get('network', {})
-        wan_config = network_config.get('wan', {})
-        return wan_config.get('enabled', False)
-    
     def get_wan_config(self) -> Dict:
         """
         获取多WAN口配置
@@ -315,8 +304,17 @@ class ConfigManager:
         Returns:
             Dict: WAN配置字典
         """
-        network_config = self.get('network', {})
-        return network_config.get('wan', {})
+        return self.get('wan', {})
+    
+    def is_wan_enabled(self) -> bool:
+        """
+        检查是否启用多WAN口
+        
+        Returns:
+            bool: 是否启用多WAN口
+        """
+        wan_config = self.get_wan_config()
+        return wan_config.get('enabled', False)
     
     def get_wan_interfaces(self) -> List[Dict]:
         """

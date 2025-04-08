@@ -6,7 +6,8 @@
     "update_frequency": "daily",
     "update_priority": 1,
     "index_fields": [
-        "trade_date"
+        "trade_date",
+        "exchange"
     ],
     "available_fields": [
         "trade_date",

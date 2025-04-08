@@ -1,119 +1,17 @@
 {
+  "description": "日线行情数据",
   "api_name": "daily",
-  "description": "获取股票日线行情数据",
-  "endpoint": "/stock/daily",
-  "fields": [
-    {
-      "name": "ts_code",
-      "type": "str",
-      "description": "股票代码（带后缀，如 000001.SZ）",
-      "is_required": false,
-      "is_index": true
-    },
-    {
-      "name": "trade_date",
-      "type": "str",
-      "description": "交易日期（YYYYMMDD格式）",
-      "is_required": false,
-      "is_index": true
-    },
-    {
-      "name": "start_date",
-      "type": "str",
-      "description": "开始日期（YYYYMMDD格式）",
-      "is_required": false,
-      "is_index": false
-    },
-    {
-      "name": "end_date",
-      "type": "str",
-      "description": "结束日期（YYYYMMDD格式）",
-      "is_required": false,
-      "is_index": false
-    },
-    {
-      "name": "open",
-      "type": "float",
-      "description": "开盘价",
-      "is_required": false,
-      "is_index": false
-    },
-    {
-      "name": "high",
-      "type": "float",
-      "description": "最高价",
-      "is_required": false,
-      "is_index": false
-    },
-    {
-      "name": "low",
-      "type": "float",
-      "description": "最低价",
-      "is_required": false,
-      "is_index": false
-    },
-    {
-      "name": "close",
-      "type": "float",
-      "description": "收盘价",
-      "is_required": false,
-      "is_index": false
-    },
-    {
-      "name": "pre_close",
-      "type": "float",
-      "description": "昨收价",
-      "is_required": false,
-      "is_index": false
-    },
-    {
-      "name": "change",
-      "type": "float",
-      "description": "涨跌额",
-      "is_required": false,
-      "is_index": false
-    },
-    {
-      "name": "pct_chg",
-      "type": "float",
-      "description": "涨跌幅（%）",
-      "is_required": false,
-      "is_index": false
-    },
-    {
-      "name": "vol",
-      "type": "float",
-      "description": "成交量（手）",
-      "is_required": false,
-      "is_index": false
-    },
-    {
-      "name": "amount",
-      "type": "float",
-      "description": "成交额（千元）",
-      "is_required": false,
-      "is_index": false
-    }
+  "fields": [],
+  "params": {
+  },
+  "update_frequency": "daily",
+  "update_priority": 1,
+  "index_fields": [
+      "ts_code","trade_date"
   ],
-  "index_fields": ["ts_code", "trade_date"],
-  "default_limit": 5000,
-  "default_order_by": "trade_date desc",
-  "parameters": {
-    "ts_code": {
-      "required": false,
-      "pattern": "^[0-9]{6}\\.[A-Z]{2}$"
-    },
-    "trade_date": {
-      "required": false,
-      "pattern": "^[0-9]{8}$"
-    },
-    "start_date": {
-      "required": false,
-      "pattern": "^[0-9]{8}$"
-    },
-    "end_date": {
-      "required": false,
-      "pattern": "^[0-9]{8}$"
-    }
-  }
-}
+  "available_fields": [
+      "ts_code", "trade_date", "crncy_code", "pre_close", "open", "high", "low", "close", 
+      "change", "pct_chg", "volume", "amount", "adj_pre_close", "adj_open", "adj_high", 
+      "adj_low", "adj_close", "adj_factor", "avg_price", "trade_status"
+  ]
+} 

@@ -76,7 +76,7 @@ class MongoDBHandler:
         port = self.config.get("port", 27017)
         username = self.config.get("username", "")
         password = self.config.get("password", "")
-        db_name = self.config.get("database", "admin")
+        db_name = self.config.get("db_name", "admin")
         auth_source = self.config.get("auth_source", "admin")
         auth_mechanism = self.config.get("auth_mechanism", "DEFAULT")
         
@@ -268,12 +268,13 @@ class MongoDBHandler:
             self.logger.error(f"插入文档失败: {str(e)}")
             raise Exception(f"插入文档失败: {str(e)}")
 
-    def insert_many_documents(self, collection_name, documents):
+    def insert_many_documents(self, collection_name, documents, ordered=False):
         """批量插入文档
         
         Args:
             collection_name: 集合名称
             documents: 要插入的文档列表
+            ordered: 是否按顺序执行（默认False，提高性能）
             
         Returns:
             pymongo.results.InsertManyResult: 插入结果
@@ -283,7 +284,7 @@ class MongoDBHandler:
         """
         try:
             collection = self.get_collection(collection_name)
-            result = collection.insert_many(documents)
+            result = collection.insert_many(documents, ordered=ordered)
             return result.inserted_ids
         except Exception as e:
             self.logger.error(f"批量插入文档失败: {str(e)}")
@@ -510,6 +511,123 @@ class MongoDBHandler:
                 self.client = None
                 self.db = None
                 self.connected = False
+
+    def bulk_write(self, collection_name, operations, ordered=False):
+        """执行批量写入操作
+        
+        Args:
+            collection_name: 集合名称
+            operations: 操作列表（如UpdateOne, InsertOne等）
+            ordered: 是否按顺序执行（默认False，提高性能）
+            
+        Returns:
+            pymongo.results.BulkWriteResult: 批量写入结果
+            
+        Raises:
+            Exception: 如果批量写入失败
+        """
+        try:
+            collection = self.get_collection(collection_name)
+            result = collection.bulk_write(operations, ordered=ordered)
+            return result
+        except Exception as e:
+            self.logger.error(f"批量写入操作失败: {str(e)}")
+            raise Exception(f"批量写入操作失败: {str(e)}")
+            
+    def create_collection(self, collection_name, **options):
+        """创建集合
+        
+        Args:
+            collection_name: 集合名称
+            **options: 集合选项
+            
+        Returns:
+            pymongo.collection.Collection: 创建的集合
+            
+        Raises:
+            Exception: 如果创建集合失败
+        """
+        try:
+            db = self.get_database()
+            if collection_name in db.list_collection_names():
+                return db[collection_name]
+            return db.create_collection(collection_name, **options)
+        except Exception as e:
+            self.logger.error(f"创建集合失败: {str(e)}")
+            raise Exception(f"创建集合失败: {str(e)}")
+            
+    def collection_exists(self, collection_name):
+        """检查集合是否存在
+        
+        Args:
+            collection_name: 集合名称
+            
+        Returns:
+            bool: 是否存在
+        """
+        try:
+            db = self.get_database()
+            return collection_name in db.list_collection_names()
+        except Exception as e:
+            self.logger.error(f"检查集合是否存在失败: {str(e)}")
+            return False
+            
+    def create_standard_indexes(self, collection_name, field_mappings):
+        """为集合创建标准索引
+        
+        Args:
+            collection_name: 集合名称
+            field_mappings: 字段映射字典，格式为 {字段名: 索引类型}
+                索引类型可以为: 'date', 'code', 'number'等
+                
+        Returns:
+            list: 创建的索引名称列表
+        """
+        try:
+            collection = self.get_collection(collection_name)
+            indexes = []
+            
+            # 创建日期索引
+            date_fields = [field for field, type_ in field_mappings.items() if type_ == 'date']
+            if date_fields:
+                for field in date_fields:
+                    index_name = f"{field}_idx"
+                    collection.create_index([(field, 1)], background=True, name=index_name)
+                    indexes.append(index_name)
+                    
+            # 创建代码索引
+            code_fields = [field for field, type_ in field_mappings.items() if type_ == 'code']
+            if code_fields:
+                for field in code_fields:
+                    index_name = f"{field}_idx"
+                    collection.create_index([(field, 1)], background=True, name=index_name)
+                    indexes.append(index_name)
+                    
+            # 创建数值索引
+            number_fields = [field for field, type_ in field_mappings.items() if type_ == 'number']
+            if number_fields:
+                for field in number_fields:
+                    index_name = f"{field}_idx"
+                    collection.create_index([(field, 1)], background=True, name=index_name)
+                    indexes.append(index_name)
+                    
+            # 如果有多个代码/日期字段，创建复合索引
+            if len(code_fields) >= 1 and len(date_fields) >= 1:
+                # 创建(code, date)复合索引
+                code_field = code_fields[0]
+                date_field = date_fields[0]
+                index_name = f"{code_field}_{date_field}_idx"
+                collection.create_index(
+                    [(code_field, 1), (date_field, 1)], 
+                    background=True, 
+                    name=index_name
+                )
+                indexes.append(index_name)
+                
+            return indexes
+        except Exception as e:
+            self.logger.error(f"创建标准索引失败: {str(e)}")
+            return []
 
 
 # 全局单例实例
