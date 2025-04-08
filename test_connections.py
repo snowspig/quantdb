@@ -92,7 +92,7 @@ def test_mongodb_connection(config):
             from urllib.parse import quote_plus
             uri += f"{quote_plus(username)}:{quote_plus(password)}@"
         auth_mechanism = mongo_config.get("auth_mechanism", "SCRAM-SHA-256")
-        uri += f"{host}:{port}/{db_name}?authMechanism={auth_mechanism}"
+        uri += f"{host}:{port}/?authMechanism=DEFAULT"
         
         print_info(f"Connecting to MongoDB at {host}:{port}...")
         client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=5000)
