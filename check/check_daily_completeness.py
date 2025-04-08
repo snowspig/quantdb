@@ -34,7 +34,7 @@ root_dir = current_dir.parent
 sys.path.append(str(root_dir))
 
 # 导入daily_fetcher模块 (如果在根目录下)
-from daily_fetcher import DailyFetcher
+from data_fetcher.daily_fetcher import DailyFetcher
 DAILY_FETCHER_IMPORTABLE = True
 
 class DailyDataChecker:
