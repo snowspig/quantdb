@@ -43,7 +43,7 @@ class PortAllocator:
         port_ranges = {}
         
         # 从配置中获取端口范围
-        ranges_config = config_manager.get('wan', 'port_ranges', {})
+        ranges_config = config_manager.get('network.wan.port_ranges', {})
         
         if ranges_config:
             for wan_idx, port_range in ranges_config.items():
