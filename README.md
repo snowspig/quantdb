@@ -11,6 +11,7 @@ A comprehensive data platform for quantitative finance research and analysis bas
 - **MongoDB Storage**: Store and manage financial data in MongoDB
 - **Market Filtering**: Filter stocks by market (SSE, SZSE) and other criteria
 - **Comprehensive Logging**: Detailed logging for debugging and monitoring
+- **Connectivity Testing**: Built-in tools to test and verify multi-WAN functionality
 
 ## Project Structure
 
@@ -30,8 +31,15 @@ quantdb/
 │   ├── load_balancer.py       # Network load balancing
 │   ├── port_allocator.py      # Port allocation for multiple WANs
 │   └── wan_monitor.py         # WAN interface monitoring
+├── core/
+│   ├── mongodb_handler.py     # MongoDB connection handler
+│   └── network_manager.py     # Network connectivity manager
 ├── docs/
-│   └── stock_basic_fetcher_guide.md  # Documentation for stock basic fetcher
+│   ├── stock_basic_fetcher_guide.md  # Documentation for stock basic fetcher
+│   └── multi_wan_testing.md   # Guide for Multi-WAN functionality testing
+├── test_connections.py        # Test connections to APIs and databases
+├── test_wan_url.py           # Test WAN functionality through URL access
+├── test_wan_detection.py     # Detect and verify Multi-WAN configuration
 ├── stock_basic_fetcher.py     # Script to fetch stock basic information
 └── tushare_updater.py         # Comprehensive updater for all Tushare interfaces
 ```

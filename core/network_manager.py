@@ -132,8 +132,8 @@ class NetworkManager:
                 return False
                 
             # 简单连通性测试
-            test_host = "www.baidu.com"
-            test_port = 443
+            test_host = "106.14.185.239"
+            test_port = 29990
             
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(3)
@@ -460,7 +460,7 @@ class NetworkManager:
             
         return results
         
-    def check_connectivity(self, url: str = "https://www.baidu.com") -> bool:
+    def check_connectivity(self, url: str = "http://106.14.185.239:29990/test") -> bool:
         """
         检查网络连通性
         

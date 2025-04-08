@@ -1,0 +1,265 @@
+{
+  "timestamp": "2025-04-07 22:55:18",
+  "test_url": "http://106.14.185.239:29990/test",
+  "requests_per_wan": 10,
+  "port_ranges": [
+    {
+      "index": 0,
+      "range": [
+        50001,
+        51000
+      ]
+    },
+    {
+      "index": 1,
+      "range": [
+        51001,
+        52000
+      ]
+    },
+    {
+      "index": 2,
+      "range": [
+        52001,
+        53000
+      ]
+    }
+  ],
+  "summary": {
+    "total_requests": 30,
+    "successful_requests": 30,
+    "unique_ips": [
+      "150.107.38.161"
+    ],
+    "wan_count": 1
+  },
+  "results_by_range": {
+    "0": [
+      {
+        "local_port": 50771,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 50768,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 50492,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 50264,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 50955,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 50190,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 50336,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 50880,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 50167,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 50235,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      }
+    ],
+    "1": [
+      {
+        "local_port": 51850,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 51301,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 51885,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 51268,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 51055,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 51291,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 51470,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 51367,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 51228,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 51258,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      }
+    ],
+    "2": [
+      {
+        "local_port": 52947,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 52414,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 52181,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 52443,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 52765,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 52151,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 52133,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 52019,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 52787,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      },
+      {
+        "local_port": 52952,
+        "success": true,
+        "client_ip": "150.107.38.161",
+        "status_code": 200,
+        "error": null
+      }
+    ]
+  },
+  "ip_distributions": {
+    "0": {
+      "150.107.38.161": 10
+    },
+    "1": {
+      "150.107.38.161": 10
+    },
+    "2": {
+      "150.107.38.161": 10
+    }
+  }
+}

@@ -24,10 +24,14 @@ import logging
 import argparse
 import threading
 import subprocess
+from core.config_state_manager import config_state_manager
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Set, Tuple, Optional, Any, Union
 import multiprocessing
+
+# Import configuration state manager
+from core.config_state_manager import config_state_manager
 import concurrent.futures
 import queue
 
@@ -73,6 +77,12 @@ class TaskManager:
         self.result_lock = threading.RLock()
         self.start_time = None
         self.end_time = None
+        
+        # 使用配置状态管理器来检查配置是否已经验证过
+        self.config_state_manager = config_state_manager
+        validation_summary = self.config_state_manager.get_validation_summary()
+        # 检查是否所有配置都已验证
+        self.configurations_validated = validation_summary.get("all_valid", False)
         
         # 加载配置文件
         self.load_config()
@@ -195,6 +205,7 @@ class TaskManager:
             
         logger.info(f"开始执行 {len(self.init_programs)} 个初始化程序")
         all_success = True
+        validation_updates = {}
         
         for program in self.init_programs:
             if not RUNNING:
@@ -206,6 +217,13 @@ class TaskManager:
             with self.result_lock:
                 if success:
                     self.successful_tasks.append(program)
+                    # 如果是验证配置程序，更新状态
+                    if "validate_configurations.py" in program:
+                        logger.info("配置验证成功，更新配置验证状态")
+                        # 更新配置状态
+                        self.configurations_validated = True
+                        # 刷新配置状态管理器中的验证状态
+                        self.config_state_manager.update_validation_state(all_valid=True)
                 else:
                     self.failed_tasks.append(program)
                     all_success = False
@@ -329,6 +347,14 @@ class TaskManager:
         only_serial = options.get('only_serial', False)
         only_parallel = options.get('only_parallel', False)
         max_workers = options.get('max_workers', PARALLEL_WORKERS)
+        force_validation = options.get('force_validation', False)
+        
+        # 检查配置状态，如果需要强制验证或之前未验证过，将不跳过初始化
+        if force_validation or not self.configurations_validated:
+            logger.info("配置尚未验证或需要强制验证，将执行初始化程序")
+            skip_init = False
+        else:
+            logger.info("配置已验证，可以根据选项跳过初始化程序")
         
         # 记录开始时间
         self.start_time = datetime.now()
@@ -469,6 +495,8 @@ def parse_args() -> argparse.Namespace:
                         help=f"任务超时时间(秒) (默认: {DEFAULT_TIMEOUT})")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="显示详细日志")
+    parser.add_argument("--force-config-check", action="store_true",
+                        help="强制重新验证所有配置（MongoDB、Tushare、WAN等）")
                         
     return parser.parse_args()
 
@@ -508,6 +536,24 @@ def main() -> int:
     signal.signal(signal.SIGTERM, signal_handler)
     
     try:
+        # 检查配置状态，仅在需要时验证配置
+        validation_summary = config_state_manager.get_validation_summary()
+        logging.info(f"配置验证状态: MongoDB={validation_summary['mongodb']}, "
+                     f"Tushare={validation_summary['tushare']}, WAN={validation_summary['wan']}")
+                     
+        # 如果指定强制检查配置或配置尚未验证，则执行配置验证
+        if args.force_config_check or not validation_summary['all_valid']:
+            logging.info("开始验证系统配置...")
+            # 导入验证配置模块并执行验证
+            from validate_configurations import validate_all_configurations
+            validate_all_configurations()
+            # 重新获取验证状态用于记录
+            validation_summary = config_state_manager.get_validation_summary()
+            if not validation_summary['all_valid']:
+                logging.error("配置验证失败，部分组件可能无法正常工作")
+        else:
+            logging.info("使用已缓存的配置验证结果")
+            
         # 创建任务管理器
         manager = TaskManager(config_file=args.config)
         

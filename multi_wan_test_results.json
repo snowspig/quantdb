@@ -1,0 +1,13 @@
+{
+  "wan_config": {
+    "enabled": true,
+    "interfaces_count": 3
+  },
+  "server_connectivity": true,
+  "port_allocator": true,
+  "wan_connections": {
+    "wan_0": true,
+    "wan_1": true,
+    "wan_2": true
+  }
+}

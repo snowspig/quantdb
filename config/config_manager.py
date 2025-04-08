@@ -296,9 +296,15 @@ class ConfigManager:
         Returns:
             bool: 是否启用多WAN口
         """
+        # 优先检查network.wan配置
         network_config = self.get('network', {})
-        wan_config = network_config.get('wan', {})
-        return wan_config.get('enabled', False)
+        network_wan_config = network_config.get('wan', {})
+        if network_wan_config and 'enabled' in network_wan_config:
+            return network_wan_config.get('enabled', False)
+        
+        # 如果network.wan中没有找到，则检查根级别的wan配置
+        root_wan_config = self.get('wan', {})
+        return root_wan_config.get('enabled', False)
     
     def get_wan_config(self) -> Dict:
         """
@@ -307,8 +313,14 @@ class ConfigManager:
         Returns:
             Dict: WAN配置字典
         """
+        # 优先检查network.wan配置
         network_config = self.get('network', {})
-        return network_config.get('wan', {})
+        network_wan_config = network_config.get('wan', {})
+        if network_wan_config:
+            return network_wan_config
+        
+        # 如果network.wan中没有找到，则检查根级别的wan配置
+        return self.get('wan', {})
     
     def get_wan_interfaces(self) -> List[Dict]:
         """

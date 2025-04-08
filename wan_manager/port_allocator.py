@@ -42,18 +42,26 @@ class PortAllocator:
         """
         port_ranges = {}
         
-        # 从配置中获取端口范围
-        ranges_config = config_manager.get('network.wan.port_ranges', {})
+        # 获取WAN配置
+        wan_config = config_manager.get_wan_config()
         
-        if ranges_config:
-            for wan_idx, port_range in ranges_config.items():
-                try:
-                    wan_idx = int(wan_idx)
-                    if isinstance(port_range, list) and len(port_range) == 2:
-                        start_port, end_port = port_range
-                        port_ranges[wan_idx] = (int(start_port), int(end_port))
-                except (ValueError, TypeError) as e:
-                    logger.error(f"解析端口范围失败: {str(e)}")
+        # 如果有全局端口范围定义
+        global_port_range = wan_config.get('port_range')
+        if global_port_range and isinstance(global_port_range, list) and len(global_port_range) == 2:
+            start_port, end_port = global_port_range
+            # 设置默认WAN端口范围
+            port_ranges[0] = (int(start_port), int(end_port))
+            
+        # 处理interfaces中的端口范围
+        interfaces = wan_config.get('interfaces', [])
+        for idx, interface in enumerate(interfaces):
+            if interface.get('enabled', False):
+                port_range = interface.get('port_range')
+                if port_range and isinstance(port_range, list) and len(port_range) == 2:
+                    start_port, end_port = port_range
+                    port_ranges[idx] = (int(start_port), int(end_port))
+                    
+        return port_ranges
         
         return port_ranges
     
