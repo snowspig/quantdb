@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # test_connections.py
+
 import os
 import sys
 import yaml
-import time
 import pymongo
 import tushare as ts
 import pandas as pd
@@ -14,22 +14,11 @@ from colorama import Fore, Style, init
 init(autoreset=True)
 
 def load_config():
-    """Load configuration from config files"""
+    """Load configuration from config.yaml file"""
     try:
-        # Try to load the main config first
         config_path = os.path.join(os.path.dirname(__file__), "config", "config.yaml")
         with open(config_path, 'r', encoding='utf-8') as file:
             config = yaml.safe_load(file)
-        
-        # Check if Tushare token is a placeholder
-        if config["tushare"]["token"] == "your_tushare_token_here":
-            # Try to load the sample config as a fallback
-            sample_config_path = os.path.join(os.path.dirname(__file__), "config", "config.sample.yaml")
-            if os.path.exists(sample_config_path):
-                print_info("Using sample configuration file with test credentials")
-                with open(sample_config_path, 'r', encoding='utf-8') as file:
-                    config = yaml.safe_load(file)
-        
         return config
     except Exception as e:
         print(f"{Fore.RED}Error loading configuration: {e}{Style.RESET_ALL}")
@@ -62,15 +51,7 @@ def test_tushare_connection(config):
         if token == "your_tushare_token_here":
             print_error("Tushare token not set in config.yaml")
             print_info("Please replace 'your_tushare_token_here' with your actual Tushare token")
-            
-            # Try to get token from environment variable as a fallback
-            import os
-            env_token = os.environ.get('TUSHARE_TOKEN')
-            if env_token:
-                print_info(f"Using Tushare token from environment variable")
-                token = env_token
-            else:
-                return False
+            return False
         
         print_info("Initializing Tushare with token...")
         ts.set_token(token)
@@ -97,22 +78,6 @@ def test_mongodb_connection(config):
     """Test the connection to MongoDB and perform basic operations"""
     print_header("Testing MongoDB Connection")
     
-    # First, try with the provided configuration
-    success = _attempt_mongodb_connection(config)
-    
-    # If that fails, try with localhost
-    if not success:
-        print_info("Trying with alternative MongoDB configuration (localhost)...")
-        alt_config = config.copy()
-        alt_config["mongodb"] = alt_config["mongodb"].copy()
-        alt_config["mongodb"]["host"] = "localhost"
-        success = _attempt_mongodb_connection(alt_config)
-    
-    return success
-
-
-def _attempt_mongodb_connection(config):
-    """Helper function to attempt MongoDB connection with given config"""
     client = None
     try:
         mongo_config = config["mongodb"]
@@ -124,7 +89,8 @@ def _attempt_mongodb_connection(config):
         
         uri = f"mongodb://"
         if username and password:
-            uri += f"{username}:{password}@"
+            from urllib.parse import quote_plus
+            uri += f"{quote_plus(username)}:{quote_plus(password)}@"
         uri += f"{host}:{port}/{db_name}"
         
         print_info(f"Connecting to MongoDB at {host}:{port}...")
@@ -133,61 +99,6 @@ def _attempt_mongodb_connection(config):
         # Check connection
         client.server_info()
         print_success("Successfully connected to MongoDB server")
-        
-        # Access database
-        db = client[db_name]
-        print_success(f"Successfully accessed '{db_name}' database")
-        
-        # Test collection operations
-        test_collection = db["connection_test"]
-        
-        # Insert a test document
-        test_document = {
-            "test_id": "conn_test_" + datetime.now().strftime("%Y%m%d%H%M%S"),
-            "timestamp": datetime.now(),
-            "message": "MongoDB connection test"
-        }
-        insert_result = test_collection.insert_one(test_document)
-        print_success(f"Successfully inserted test document with ID: {insert_result.inserted_id}")
-        
-        # Read the document back
-        found_doc = test_collection.find_one({"_id": insert_result.inserted_id})
-        if found_doc:
-            print_success("Successfully read test document from MongoDB")
-        
-        # Update the document
-        update_result = test_collection.update_one(
-            {"_id": insert_result.inserted_id}, 
-            {"$set": {"updated": True}}
-        )
-        if update_result.modified_count > 0:
-            print_success("Successfully updated test document")
-        
-        # Delete the test document
-        delete_result = test_collection.delete_one({"_id": insert_result.inserted_id})
-        if delete_result.deleted_count > 0:
-            print_success("Successfully deleted test document")
-        
-        print_info("All MongoDB operations completed successfully")
-        return True
-        
-    except pymongo.errors.ServerSelectionTimeoutError:
-        print_error("MongoDB server selection timeout - server may not be running")
-        print_info("Check if MongoDB is running on the specified host and port")
-        return False
-    
-    except pymongo.errors.OperationFailure as e:
-        print_error(f"MongoDB authentication error: {e}")
-        print_info("Check your MongoDB username and password in the config")
-        return False
-    
-    except Exception as e:
-        print_error(f"Error testing MongoDB connection: {e}")
-        return False
-    
-    finally:
-        if client:
-            client.close()
         
         # Access database
         db = client[db_name]
@@ -256,19 +167,9 @@ def main():
     # Track overall success
     success = True
     
-    # Check if we're skipping Tushare tests
-    import argparse
-    parser = argparse.ArgumentParser(description='Test QuantDB connections')
-    parser.add_argument('--skip-tushare', action='store_true', help='Skip Tushare API tests')
-    args = parser.parse_args()
-    
-    tushare_success = True
-    if not args.skip_tushare:
-        # Test Tushare API connection
-        tushare_success = test_tushare_connection(config)
-        success = success and tushare_success
-    else:
-        print_info("Skipping Tushare API tests")
+    # Test Tushare API connection
+    tushare_success = test_tushare_connection(config)
+    success = success and tushare_success
     
     print("\n")  # Add spacing between tests
     
