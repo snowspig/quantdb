@@ -91,7 +91,8 @@ def test_mongodb_connection(config):
         if username and password:
             from urllib.parse import quote_plus
             uri += f"{quote_plus(username)}:{quote_plus(password)}@"
-        uri += f"{host}:{port}/{db_name}"
+        auth_mechanism = mongo_config.get("auth_mechanism", "SCRAM-SHA-256")
+        uri += f"{host}:{port}/{db_name}?authMechanism={auth_mechanism}"
         
         print_info(f"Connecting to MongoDB at {host}:{port}...")
         client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=5000)
