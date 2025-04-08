@@ -1,0 +1,101 @@
+# QuantDB System Configuration
+# This configuration file sets up the core components of the quantitative database system
+
+# Application settings
+app:
+  name: QuantDB
+  version: 0.1.0
+  environment: development  # development, production, testing
+
+# MongoDB connection settings
+mongodb:
+  host: localhost  # Using localhost for local development
+  port: 27017
+  username: ""  # Leave empty for no authentication
+  password: ""  # Leave empty for no authentication
+  database: quantdb
+  auth_source: admin
+  options:
+    connect_timeout_ms: 5000
+    socket_timeout_ms: 30000
+    server_selection_timeout_ms: 30000
+    w: 1
+    retryWrites: true
+
+# Tushare API settings
+tushare:
+  token: "e3dc59dc8819dd3cf7a28eae11866c8c2e3f740342e889932d9dceca"  # Sample token - replace with valid Tushare token
+  timeout: 60
+  max_retry: 3
+  retry_delay: 5
+  fields_limit: 4000  # Maximum number of fields to return in a single request
+  rate_limit:
+    minute_limit: 500  # Maximum requests per minute
+    day_limit: 10000   # Maximum requests per day
+  cache:
+    enabled: true
+    ttl: 3600  # Time to live in seconds for cached results
+
+# WAN connection settings
+wan:
+  enabled: false  # Set to true to enable multi-WAN support
+  port_range: [10000, 20000]  # Range of ports to use for WAN connections
+  allocation_strategy: round_robin  # round_robin, random, load_based
+  monitor_interval: 60  # Interval in seconds to monitor WAN status
+  max_concurrent_connections: 20  # Maximum concurrent connections per WAN
+  connection_timeout: 30  # Connection timeout in seconds
+  interfaces:
+    - name: wan0
+      ip: 192.168.1.1
+      port_range: [10000, 10999]
+      enabled: true
+    - name: wan1
+      ip: 192.168.2.1
+      port_range: [11000, 11999]
+      enabled: false
+
+# Network settings
+network:
+  timeout: 60
+  retry_count: 3
+  max_connections: 10
+  connection_pool_size: 20
+  proxy:
+    enabled: false
+    host: ""
+    port: 0
+    username: ""
+    password: ""
+
+# Data fetching settings
+data_fetcher:
+  default_batch_size: 100
+  default_thread_count: 5
+  fetch_retry_count: 3
+  fetch_retry_delay: 5
+  allow_incremental: true
+  save_raw_data: false
+  max_processing_threads: 8
+
+# Storage settings
+storage:
+  raw_data_dir: "data/raw"
+  processed_data_dir: "data/processed"
+  backup_dir: "data/backup"
+  backup_frequency: daily  # daily, weekly, monthly
+  backup_retention_days: 30
+  compression: true
+  compression_level: 6
+
+# Logging settings
+logging:
+  level: INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/quantdb.log"
+  max_size_mb: 10
+  backup_count: 5
+  console_output: true
+  log_performance: true
+  log_api_calls: true
+  log_data_operations: true
+  log_network_events: true
