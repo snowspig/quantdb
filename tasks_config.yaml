@@ -26,7 +26,7 @@ parallel_programs:
   - daily_fetcher.py          # 日线数据获取器
   # - weekly_fetcher.py         # 周线数据获取器
   # - monthly_fetcher.py        # 月线数据获取器
-  # - daily_basic_fetcher.py    # 每日指标获取器
+  - daily_basic_fetcher.py    # 每日指标获取器
   # - moneyflow_fetcher.py      # 资金流向数据获取器
   # - suspend_fetcher.py        # 停复牌信息获取器
   # - stk_rewards_fetcher.py    # 管理层薪酬和持股获取器

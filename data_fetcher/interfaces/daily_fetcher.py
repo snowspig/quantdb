@@ -22,10 +22,13 @@ import json
 import os
 import pandas as pd
 import pymongo
+import threading
+import queue
 from datetime import datetime, timedelta
-from typing import List, Set, Optional, Dict, Any
+from typing import List, Set, Optional, Dict, Any, Tuple
 from pathlib import Path
 from loguru import logger
+
 
 # 添加项目根目录到Python路径
 current_dir = Path(__file__).resolve().parent
@@ -177,6 +180,16 @@ class DailyFetcherV3(TushareFetcher):
         self.retry_count = retry_count
         self.retry_delay = retry_delay
         
+        # 添加WAN口端口缓存，记录每个WAN口已分配的端口号
+        # 格式为 {wan_idx: (port, is_in_use)}
+        self.wan_port_cache = {}
+        # 添加线程WAN口映射，记录每个线程使用的WAN口
+        self.thread_wan_mapping = {}
+        # 添加线程ID与WAN索引的映射，用于在fetch_data中找到正确的WAN口
+        self.thread_id_to_wan = {}
+        # 添加线程锁，防止并发访问WAN口缓存
+        self.wan_cache_lock = threading.Lock()
+        
         # 运行时统计信息
         self.stats = {
             "total_records": 0,
@@ -191,6 +204,74 @@ class DailyFetcherV3(TushareFetcher):
         # 日志输出
         logger.info(f"日线数据获取器初始化完成，目标市场代码: {', '.join(self.target_market_codes)}，最大并行数: {self.max_workers}")
         
+    def _get_wan_socket_cached(self, wan_idx: int) -> Optional[Tuple[int, int]]:
+        """
+        获取缓存的WAN接口端口，如果没有则分配新端口
+        
+        Args:
+            wan_idx: WAN接口索引
+            
+        Returns:
+            (wan_idx, port)元组，如果失败返回None
+        """
+        with self.wan_cache_lock:
+            # 检查缓存是否存在此WAN口的端口
+            if wan_idx in self.wan_port_cache:
+                port, is_in_use = self.wan_port_cache[wan_idx]
+                # 如果端口不在使用中，标记为使用中并返回
+                if not is_in_use:
+                    self.wan_port_cache[wan_idx] = (port, True)
+                    logger.debug(f"使用缓存的WAN接口 {wan_idx}，端口 {port}")
+                    return (wan_idx, port)
+                else:
+                    logger.debug(f"WAN接口 {wan_idx} 的端口 {port} 正在使用中，等待释放")
+                    return None
+            
+            # 缓存中没有此WAN口的端口，分配新端口
+            wan_info = self._get_wan_socket(wan_idx)
+            if wan_info:
+                wan_idx, port = wan_info
+                # 将新端口加入缓存并标记为使用中
+                self.wan_port_cache[wan_idx] = (port, True)
+                logger.debug(f"分配新的WAN接口 {wan_idx}，端口 {port}")
+                return wan_info
+            else:
+                logger.error(f"无法为WAN接口 {wan_idx} 分配端口")
+                return None
+    
+    def _release_wan_socket_cached(self, wan_idx: int, port: int) -> None:
+        """
+        释放缓存的WAN接口端口，但不释放实际端口，只标记为未使用
+        
+        Args:
+            wan_idx: WAN接口索引
+            port: 端口号
+        """
+        with self.wan_cache_lock:
+            if wan_idx in self.wan_port_cache:
+                cached_port, _ = self.wan_port_cache[wan_idx]
+                if cached_port == port:
+                    # 只修改使用状态，不释放实际端口
+                    self.wan_port_cache[wan_idx] = (port, False)
+                    logger.debug(f"标记WAN接口 {wan_idx} 的端口 {port} 为未使用")
+                else:
+                    logger.warning(f"释放的端口 {port} 与缓存的端口 {cached_port} 不匹配")
+            else:
+                logger.warning(f"尝试释放未缓存的WAN接口 {wan_idx}")
+    
+    def _clear_wan_port_cache(self) -> None:
+        """
+        清理所有缓存的WAN接口端口，释放实际端口
+        """
+        with self.wan_cache_lock:
+            for wan_idx, (port, _) in self.wan_port_cache.items():
+                try:
+                    self.port_allocator.release_port(wan_idx, port)
+                    logger.debug(f"释放WAN接口 {wan_idx} 的端口 {port}")
+                except Exception as e:
+                    logger.warning(f"释放WAN接口 {wan_idx} 的端口 {port} 时出错: {str(e)}")
+            self.wan_port_cache.clear()
+            
     def fetch_data(self, **kwargs) -> Optional[pd.DataFrame]:
         """
         从Tushare获取日线行情数据
@@ -226,20 +307,23 @@ class DailyFetcherV3(TushareFetcher):
             params = {}
             
             # 根据参数设置API调用方式
+            query_msg = ""
             if trade_date:
                 params["trade_date"] = trade_date
-                logger.info(f"获取交易日 {trade_date} 的日线数据")
+                query_msg = f"交易日 {trade_date}"
             elif ts_code:
                 params["ts_code"] = ts_code
                 if start_date and end_date:
                     params["start_date"] = start_date
                     params["end_date"] = end_date
-                    logger.info(f"获取股票 {ts_code} 从 {start_date} 至 {end_date} 的日线数据")
+                    query_msg = f"股票 {ts_code} 从 {start_date} 至 {end_date}"
                 else:
-                    logger.info(f"获取股票 {ts_code} 的日线数据")
+                    query_msg = f"股票 {ts_code}"
             else:
-                logger.error("缺少必要参数，至少需要提供trade_date或ts_code")
+                logger.error("【数据获取】缺少必要参数，至少需要提供trade_date或ts_code")
                 return None
+            
+            logger.info(f"【数据获取】正在获取{query_msg}的日线数据")
                 
             # 添加分页参数，处理大数据量问题
             params["offset"] = offset
@@ -248,99 +332,124 @@ class DailyFetcherV3(TushareFetcher):
             # 使用接口配置中的available_fields作为请求字段
             fields = self.available_fields
             if not fields:
-                logger.warning("接口配置中未定义available_fields，将获取所有字段")
+                logger.warning("【数据获取】接口配置中未定义available_fields，将获取所有字段")
             
-            # 创建并使用WAN接口的socket，实现多WAN请求支持
-            wan_info = self._get_wan_socket()
-            use_wan = wan_info is not None
+            # 获取当前线程ID并查找对应的WAN口
+            current_thread_id = threading.current_thread().ident
+            thread_info = ""
             
-            if use_wan:
-                wan_idx, port = wan_info
-                logger.debug(f"使用WAN接口 {wan_idx} 和本地端口 {port} 请求数据")
+            # 查找当前线程对应的WAN口
+            wan_idx = None
+            with self.wan_cache_lock:
+                if current_thread_id in self.thread_id_to_wan:
+                    wan_idx = self.thread_id_to_wan[current_thread_id]
+                    thread_info = f"线程ID {current_thread_id}"
+                    logger.debug(f"【数据获取】{thread_info} 使用映射的WAN接口 {wan_idx}")
+                else:
+                    # 对于主线程或未映射的线程，使用WAN接口0
+                    wan_idx = 0
+                    thread_info = "主线程或未映射线程"
+                    logger.debug(f"【数据获取】{thread_info} 未找到WAN映射，使用默认WAN接口0")
+            
+            # 获取WAN接口端口
+            wan_info = self._get_wan_socket_cached(wan_idx)
+            if wan_info is None:
+                # 如果获取缓存的WAN端口失败，尝试直接获取端口
+                logger.debug(f"【数据获取】{thread_info} 缓存中无可用端口，尝试直接分配")
+                wan_info = self._get_wan_socket(wan_idx)
+                if wan_info:
+                    # 将端口加入缓存
+                    self.wan_port_cache[wan_idx] = (wan_info[1], True)
+                    logger.debug(f"【数据获取】{thread_info} 成功直接分配WAN接口 {wan_idx} 端口 {wan_info[1]}")
+            
+            if wan_info is None:
+                logger.error(f"【数据获取】{thread_info} 无法获取WAN接口 {wan_idx} 的端口")
+                return None
+                
+            logger.debug(f"【数据获取】{thread_info} 使用WAN接口 {wan_idx} 和本地端口 {wan_info[1]} 请求数据")
             
             start_time = time.time()
             
             # 增加超时，设置为120秒
             self.client.set_timeout(120)
-            logger.debug(f"增加API请求超时时间为120秒，提高网络可靠性")
+            logger.debug(f"【数据获取】{thread_info} 设置API请求超时时间为120秒")
             
             # 添加重试机制
             retry = 0
             df = None
             last_error = None
             
-            while retry <= self.retry_count and df is None:
-                try:
-                    # 如果使用WAN接口，设置本地地址绑定
-                    if use_wan:
-                        wan_idx, port = wan_info
-                        self.client.set_local_address('0.0.0.0', port)
-                    
-                    df = self.client.get_data(api_name=api_name, params=params, fields=fields)
-                    
-                    # 重置客户端设置
-                    if use_wan:
-                        self.client.reset_local_address()
+            try:
+                while retry <= self.retry_count and df is None:
+                    try:
+                        logger.debug(f"【数据获取】{thread_info} 第 {retry+1}/{self.retry_count+1} 次尝试获取数据")
                         
-                    # 如果获取到数据，跳出重试循环
-                    if df is not None and not df.empty:
-                        break
-                    else:
-                        # 数据为空，可能需要重试
+                        # 使用绑定的WAN接口端口
+                        self.client.set_local_address('0.0.0.0', wan_info[1])
+                        logger.debug(f"【数据获取】{thread_info} 绑定本地地址 0.0.0.0:{wan_info[1]}")
+                        
+                        df = self.client.get_data(api_name=api_name, params=params, fields=fields)
+                        
+                        # 重置客户端设置
+                        self.client.reset_local_address()
+                        logger.debug(f"【数据获取】{thread_info} 重置本地地址绑定")
+                            
+                        # 如果获取到数据，跳出重试循环
+                        if df is not None and not df.empty:
+                            logger.debug(f"【数据获取】{thread_info} 成功获取数据，行数: {len(df)}")
+                            break
+                        else:
+                            # 数据为空，可能需要重试
+                            if retry < self.retry_count:
+                                retry += 1
+                                logger.warning(f"【数据获取】{thread_info} 获取数据为空，第{retry}次重试...")
+                                time.sleep(self.retry_delay)
+                            else:
+                                logger.warning(f"【数据获取】{thread_info} 已达到最大重试次数({self.retry_count})，获取数据为空")
+                                break
+                            
+                    except Exception as e:
+                        last_error = str(e)
                         if retry < self.retry_count:
                             retry += 1
-                            logger.warning(f"获取数据为空，第{retry}次重试...")
+                            logger.warning(f"【数据获取】{thread_info} 获取数据出错: {str(e)}，第{retry}次重试...")
                             time.sleep(self.retry_delay)
                         else:
-                            logger.warning(f"已达到最大重试次数({self.retry_count})，获取数据为空")
+                            logger.error(f"【数据获取】{thread_info} 获取数据失败，已达到最大重试次数: {str(e)}")
+                            import traceback
+                            logger.debug(f"【数据获取】{thread_info} 异常详情: {traceback.format_exc()}")
                             break
-                        
-                except Exception as e:
-                    last_error = str(e)
-                    if retry < self.retry_count:
-                        retry += 1
-                        logger.warning(f"获取数据出错: {str(e)}，第{retry}次重试...")
-                        time.sleep(self.retry_delay)
-                    else:
-                        logger.error(f"获取数据失败，已达到最大重试次数: {str(e)}")
-                        import traceback
-                        logger.debug(f"异常详情: {traceback.format_exc()}")
-                        break
-            
-            # 释放WAN端口（如果使用了）
-            if use_wan:
-                self.port_allocator.release_port(wan_idx, port)
+            finally:
+                # 释放WAN端口
+                self._release_wan_socket_cached(wan_info[0], wan_info[1])
+                logger.debug(f"【数据获取】{thread_info} 标记WAN接口 {wan_idx} 端口 {wan_info[1]} 为未使用")
             
             # 数据验证和处理
             if df is not None and not df.empty:
                 elapsed = time.time() - start_time
-                logger.success(f"成功获取 {len(df)} 条日线数据，耗时 {elapsed:.2f}s")
+                logger.success(f"【数据获取】{thread_info} 成功获取 {len(df)} 条日线数据，耗时 {elapsed:.2f}s")
                 
                 # 检查返回的数据包含的字段
                 if self.verbose:
-                    logger.debug(f"API返回的字段: {list(df.columns)}")
-                    logger.debug(f"数据示例：\n{df.head(3)}")
+                    logger.debug(f"【数据获取】{thread_info} API返回的字段: {list(df.columns)}")
+                    logger.debug(f"【数据获取】{thread_info} 数据示例：\n{df.head(3)}")
                 
                 return df
             else:
                 if last_error:
-                    logger.error(f"获取数据失败: {last_error}")
+                    logger.error(f"【数据获取】{thread_info} 获取数据失败: {last_error}")
                 else:
-                    logger.error("获取数据失败，数据为空")
+                    logger.error(f"【数据获取】{thread_info} 获取数据失败，数据为空")
                 return None
                 
         except Exception as e:
-            logger.error(f"获取日线数据失败: {str(e)}")
+            logger.error(f"【异常】获取日线数据失败: {str(e)}")
             import traceback
-            logger.debug(f"详细错误信息: {traceback.format_exc()}")
+            logger.debug(f"【异常详情】\n{traceback.format_exc()}")
             
             # 如果有WAN信息，确保释放端口
-            try:
-                if 'wan_info' in locals() and wan_info:
-                    wan_idx, port = wan_info
-                    self.port_allocator.release_port(wan_idx, port)
-            except Exception as release_error:
-                logger.warning(f"释放WAN端口时出错: {str(release_error)}")
+            if 'wan_info' in locals() and wan_info:
+                self._release_wan_socket_cached(wan_info[0], wan_info[1])
                 
             return None
             
@@ -626,138 +735,225 @@ class DailyFetcherV3(TushareFetcher):
         Returns:
             是否成功
         """
-        import threading
-        import queue
+        logger.info("==================== 并行抓取流程开始 ====================")
+        logger.info(f"【阶段1：初始化】准备并行处理 {len(trade_dates)} 个交易日数据")
         
         total_days = len(trade_dates)
-        # 设置最大并发数
+        # 获取可用WAN接口
         available_wans = self.port_allocator.get_available_wan_indices()
-        max_workers = min(len(available_wans), total_days, self.max_workers)
+        logger.info(f"【阶段1：初始化】可用WAN接口数量: {len(available_wans)}")
         
-        result_queue = queue.Queue()
-        threads = []
+        # 确定最大工作线程数不超过可用WAN接口数量
+        max_workers = min(len(available_wans), total_days, self.max_workers)
+        logger.info(f"【阶段1：初始化】实际使用线程数: {max_workers}")
+        
+        # 优化: 使用线程池而不是手动创建线程
+        import concurrent.futures
+        
+        # 创建线程池
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        
+        # 为每个线程分配固定的WAN接口 
+        self.thread_wan_mapping.clear()
+        self.thread_id_to_wan.clear()
+        for i in range(max_workers):
+            self.thread_wan_mapping[i] = available_wans[i % len(available_wans)]
+            logger.debug(f"【阶段1：初始化】线程 {i} 分配WAN接口 {self.thread_wan_mapping[i]}")
         
         # 线程锁用于日志和进度更新
         log_lock = threading.Lock()
+        
+        # 优化: 使用队列收集处理结果，统一提交到MongoDB
+        from queue import Queue
+        data_queue = Queue()
         
         processed_days = 0
         success_days = 0
         total_records = 0
         
+        # 创建MongoDB批量处理线程
+        mongo_thread = threading.Thread(
+            target=self._mongodb_consumer_thread, 
+            args=(data_queue, log_lock)
+        )
+        mongo_thread.daemon = True
+        mongo_thread.start()
+        
         # 线程函数
         def process_date(date_str, thread_idx):
+            thread_id = threading.current_thread().ident
+            # 获取分配给该线程的WAN接口
+            wan_idx = self.thread_wan_mapping[thread_idx % max_workers]
+            
+            with log_lock:
+                logger.info(f"【T{thread_idx}-WAN{wan_idx}】========== 开始处理日期[{date_str}] ==========")
+            
             try:
+                # 记录当前线程ID与WAN索引的映射
+                with self.wan_cache_lock:
+                    self.thread_id_to_wan[thread_id] = wan_idx
+                    logger.debug(f"【T{thread_idx}-WAN{wan_idx}】【阶段2：线程映射】线程ID[{thread_id}]映射到WAN接口[{wan_idx}]")
+                
+                # 获取缓存的WAN端口
+                wan_info = None
+                retries = 0
+                max_port_retries = 3
+                while wan_info is None and retries < max_port_retries:
+                    with log_lock:
+                        logger.debug(f"【T{thread_idx}-WAN{wan_idx}】【阶段3：端口分配】尝试[{retries+1}/{max_port_retries}]获取WAN端口")
+                    wan_info = self._get_wan_socket_cached(wan_idx)
+                    if wan_info is None:
+                        retries += 1
+                        time.sleep(0.5)
+                
+                if wan_info is None:
+                    with log_lock:
+                        logger.error(f"【T{thread_idx}-WAN{wan_idx}】【阶段3：端口分配】无法获取WAN接口端口，放弃处理日期[{date_str}]")
+                    return (date_str, False, 0)
+                
                 with log_lock:
-                    logger.debug(f"线程 {thread_idx} 开始处理日期 {date_str}")
-                
-                # 获取WAN端口
-                wan_idx = available_wans[thread_idx % len(available_wans)]
-                wan_info = self._get_wan_socket(wan_idx)
-                
-                success = False
-                records_count = 0
+                    logger.info(f"【T{thread_idx}-WAN{wan_idx}】【阶段3：端口分配】成功分配端口[{wan_info[1]}]")
                 
                 try:
+                    with log_lock:
+                        logger.info(f"【T{thread_idx}-WAN{wan_idx}】【阶段4：数据获取】开始获取日期[{date_str}]的数据")
+                    
                     # 获取当日数据
                     df = self.fetch_data(trade_date=date_str)
                     
                     if df is not None and not df.empty:
+                        with log_lock:
+                            logger.info(f"【T{thread_idx}-WAN{wan_idx}】【阶段5：数据处理】开始处理日期[{date_str}]的[{len(df)}]条原始数据")
+                        
                         # 处理数据
                         df_processed = self.process_data(df)
                         
-                        # 保存到MongoDB
+                        # 优化: 不是等待全部抓取完成，而是立即将处理好的数据放入队列
                         if df_processed is not None and not df_processed.empty:
-                            self.save_to_mongodb(df_processed)
                             records_count = len(df_processed)
-                            success = True
-                finally:
-                    # 释放WAN端口
-                    if wan_info:
-                        self.port_allocator.release_port(wan_info[0], wan_info[1])
-                
-                # 放入结果队列
-                result_queue.put((date_str, success, records_count))
-                
-                with log_lock:
-                    if success:
-                        logger.success(f"线程 {thread_idx}(WAN{wan_idx}) 成功处理日期 {date_str}，共 {records_count} 条记录")
+                            
+                            # 放入数据队列，由MongoDB线程消费
+                            data_queue.put((date_str, df_processed, thread_idx, wan_idx))
+                            
+                            with log_lock:
+                                logger.info(f"【T{thread_idx}-WAN{wan_idx}】【阶段6：数据入队】将日期[{date_str}]的[{records_count}]条处理后数据放入队列")
+                            
+                            return (date_str, True, records_count)
+                        else:
+                            with log_lock:
+                                logger.warning(f"【T{thread_idx}-WAN{wan_idx}】【阶段5：数据处理】日期[{date_str}]处理后数据为空")
+                            return (date_str, False, 0)
                     else:
-                        logger.warning(f"线程 {thread_idx} 处理日期 {date_str} 失败或无数据")
-                        
+                        with log_lock:
+                            logger.warning(f"【T{thread_idx}-WAN{wan_idx}】【阶段4：数据获取】日期[{date_str}]获取数据为空或失败")
+                        return (date_str, False, 0)
+                finally:
+                    # 标记WAN端口为未使用
+                    if wan_info:
+                        self._release_wan_socket_cached(wan_info[0], wan_info[1])
+                        with log_lock:
+                            logger.debug(f"【T{thread_idx}-WAN{wan_idx}】【阶段7：资源释放】释放端口[{wan_info[1]}]")
+                    
+                    # 移除线程ID到WAN的映射
+                    with self.wan_cache_lock:
+                        if thread_id in self.thread_id_to_wan:
+                            del self.thread_id_to_wan[thread_id]
+                            with log_lock:
+                                logger.debug(f"【T{thread_idx}-WAN{wan_idx}】【阶段7：资源释放】清除线程[{thread_id}]映射")
+            
             except Exception as e:
                 with log_lock:
-                    logger.error(f"线程 {thread_idx} 处理日期 {date_str} 出错: {str(e)}")
-                    import traceback
-                    logger.debug(f"详细错误信息: {traceback.format_exc()}")
-                
-                # 确保释放WAN端口
-                if 'wan_info' in locals() and wan_info:
-                    try:
-                        self.port_allocator.release_port(wan_info[0], wan_info[1])
-                    except:
-                        pass
-                        
-                result_queue.put((date_str, False, 0))
-        
-        # 启动线程
-        start_time = time.time()
-        
-        # 创建并启动所有线程
-        for i, date_str in enumerate(trade_dates):
-            thread = threading.Thread(
-                target=process_date,
-                args=(date_str, i % max_workers)
-            )
-            thread.start()
-            threads.append(thread)
+                    logger.error(f"【T{thread_idx}-WAN{wan_idx}】【错误】处理日期[{date_str}]出错: {str(e)}")
+                import traceback
+                logger.debug(f"【T{thread_idx}-WAN{wan_idx}】【错误详情】\n{traceback.format_exc()}")
             
-            # 控制同时运行的线程数
-            if len(threads) >= max_workers:
-                # 等待一个线程完成
-                while result_queue.empty():
-                    time.sleep(0.1)
-                
-                # 处理结果
-                date_str, success, records_count = result_queue.get()
-                processed_days += 1
-                if success:
-                    success_days += 1
-                    total_records += records_count
-                
-                # 更新进度
-                progress = processed_days / total_days * 100
-                elapsed = time.time() - start_time
-                remaining = elapsed / processed_days * (total_days - processed_days) if processed_days > 0 else 0
-                logger.info(f"进度: {processed_days}/{total_days} ({progress:.1f}%)，"
-                           f"成功: {success_days}，"
-                           f"已耗时: {elapsed:.1f}s，"
-                           f"预估剩余: {remaining:.1f}s")
-                
-                # 清理已完成的线程
-                threads = [t for t in threads if t.is_alive()]
-                
-                # 控制启动新线程的间隔
-                time.sleep(0.5)
+            # 确保释放WAN端口
+            if 'wan_info' in locals() and wan_info:
+                self._release_wan_socket_cached(wan_info[0], wan_info[1])
+                with log_lock:
+                    logger.debug(f"【T{thread_idx}-WAN{wan_idx}】【错误恢复】释放端口[{wan_info[1]}]")
+            
+            # 移除线程ID到WAN的映射
+            with self.wan_cache_lock:
+                if thread_id in self.thread_id_to_wan:
+                    del self.thread_id_to_wan[thread_id]
+                    with log_lock:
+                        logger.debug(f"【T{thread_idx}-WAN{wan_idx}】【错误恢复】清除线程[{thread_id}]映射")
+            
+            return (date_str, False, 0)
         
-        # 等待所有线程完成
-        for thread in threads:
-            thread.join()
-        
-        # 处理剩余结果
-        while not result_queue.empty():
-            date_str, success, records_count = result_queue.get()
-            processed_days += 1
-            if success:
-                success_days += 1
-                total_records += records_count
-        
-        # 记录最终结果
-        elapsed_total = time.time() - start_time
-        logger.success(f"并行处理完成，成功处理 {success_days}/{total_days} 个交易日，"
-                       f"共获取 {total_records} 条记录，"
-                       f"总耗时: {elapsed_total:.1f}s")
-        
-        return success_days > 0
+        try:
+            # 启动线程池执行任务，但使用分批提交的方式
+            logger.info(f"【阶段2：启动线程池】开始处理 {total_days} 个交易日数据")
+            start_time = time.time()
+            
+            # 创建任务分组，避免一次提交过多任务
+            batch_submit_size = max(1, min(5, max_workers))  # 每次提交的任务数量
+            tasks_groups = [trade_dates[i:i+batch_submit_size] for i in range(0, len(trade_dates), batch_submit_size)]
+            
+            # 记录所有future对象
+            all_futures = []
+            
+            # 分批提交任务
+            for batch_idx, batch_tasks in enumerate(tasks_groups):
+                logger.info(f"【阶段2：任务提交】提交第 {batch_idx+1}/{len(tasks_groups)} 批任务，包含 {len(batch_tasks)} 个交易日")
+                
+                # 创建当前批次的任务参数和future对象
+                batch_futures = {}
+                for i, date_str in enumerate(batch_tasks):
+                    thread_idx = (batch_idx * batch_submit_size + i) % max_workers
+                    future = executor.submit(process_date, date_str, thread_idx)
+                    batch_futures[future] = date_str
+                    all_futures.append(future)
+                
+                # 等待当前批次完成，同时处理结果，避免阻塞MongoDB线程
+                for future in concurrent.futures.as_completed(batch_futures):
+                    date_str = batch_futures[future]
+                    try:
+                        date_str, success, records_count = future.result()
+                        processed_days += 1
+                        if success:
+                            success_days += 1
+                            total_records += records_count
+                        
+                        # 更新进度
+                        progress = processed_days / total_days * 100
+                        elapsed = time.time() - start_time
+                        remaining = elapsed / processed_days * (total_days - processed_days) if processed_days > 0 else 0
+                        logger.info(f"【阶段3：进度更新】已处理: {processed_days}/{total_days} ({progress:.1f}%)，"
+                                   f"成功: {success_days}，"
+                                   f"已获取: {total_records}条记录，"
+                                   f"已耗时: {elapsed:.1f}s，"
+                                   f"预估剩余: {remaining:.1f}s")
+                    except Exception as e:
+                        logger.error(f"【错误】处理交易日 {date_str} 任务失败: {str(e)}")
+                
+                # 每批次结束后添加短暂延迟，避免请求过于密集
+                if batch_idx < len(tasks_groups) - 1:
+                    time.sleep(0.5)
+            
+            # 通知MongoDB线程所有数据都已入队
+            logger.info("【阶段4：数据抓取完成】所有交易日数据已处理完毕，等待MongoDB处理剩余数据...")
+            data_queue.put(None)  # 结束信号
+            
+            # 等待MongoDB线程完成处理
+            mongo_thread.join()
+            
+            # 记录最终结果
+            elapsed_total = time.time() - start_time
+            logger.success(f"【阶段5：总结】并行处理完成，成功处理 {success_days}/{total_days} 个交易日，"
+                           f"共获取 {total_records} 条记录，"
+                           f"总耗时: {elapsed_total:.1f}s")
+            logger.info("==================== 并行抓取流程结束 ====================")
+            
+            return success_days > 0
+        finally:
+            # 关闭线程池
+            executor.shutdown()
+            
+            # 确保清理所有WAN端口缓存
+            logger.info("【清理】释放所有WAN端口资源")
+            self._clear_wan_port_cache()
     
     def _fetch_dates_sequential(self, trade_dates: List[str]) -> bool:
         """
@@ -933,16 +1129,27 @@ class DailyFetcherV3(TushareFetcher):
         Returns:
             是否成功
         """
-        import threading
-        import queue
+        logger.info("==================== 并行抓取股票历史数据开始 ====================")
+        logger.info(f"【阶段1：初始化】准备并行处理 {len(stock_codes)} 个股票历史数据")
         
         total_stocks = len(stock_codes)
-        # 设置最大并发数
+        # 获取可用WAN接口
         available_wans = self.port_allocator.get_available_wan_indices()
+        logger.info(f"【阶段1：初始化】可用WAN接口数量: {len(available_wans)}")
+        
+        # 确定最大工作线程数不超过可用WAN接口数量
         max_workers = min(len(available_wans), total_stocks, self.max_workers)
+        logger.info(f"【阶段1：初始化】实际使用线程数: {max_workers}")
         
         result_queue = queue.Queue()
         threads = []
+        
+        # 为每个线程分配固定的WAN接口
+        self.thread_wan_mapping.clear()
+        self.thread_id_to_wan.clear()  # 清除旧的线程ID与WAN索引映射
+        for i in range(max_workers):
+            self.thread_wan_mapping[i] = available_wans[i % len(available_wans)]
+            logger.debug(f"【阶段1：初始化】线程 {i} 分配WAN接口 {self.thread_wan_mapping[i]}")
         
         # 线程锁用于日志和进度更新
         log_lock = threading.Lock()
@@ -954,12 +1161,34 @@ class DailyFetcherV3(TushareFetcher):
         # 线程函数
         def process_stock(ts_code, thread_idx):
             try:
-                with log_lock:
-                    logger.debug(f"线程 {thread_idx}(WAN{thread_idx % len(available_wans)}) 开始处理股票 {ts_code}")
+                thread_id = threading.current_thread().ident
+                # 获取分配给该线程的WAN接口
+                wan_idx = self.thread_wan_mapping[thread_idx % max_workers]
                 
-                # 获取WAN端口
-                wan_idx = available_wans[thread_idx % len(available_wans)]
-                wan_info = self._get_wan_socket(wan_idx)
+                with log_lock:
+                    logger.info(f"【T{thread_idx}-WAN{wan_idx}】========== 开始处理股票 {ts_code} ==========")
+                
+                # 记录当前线程ID与WAN索引的映射
+                with self.wan_cache_lock:
+                    self.thread_id_to_wan[thread_id] = wan_idx
+                    logger.debug(f"【T{thread_idx}-WAN{wan_idx}】【阶段2：线程映射】线程ID {thread_id} 映射到WAN接口 {wan_idx}")
+                
+                # 获取缓存的WAN端口
+                wan_info = None
+                retries = 0
+                while wan_info is None and retries < 3:
+                    with log_lock:
+                        logger.debug(f"【T{thread_idx}-WAN{wan_idx}】【阶段3：端口分配】尝试获取WAN端口 (尝试 {retries+1}/3)")
+                    
+                    wan_info = self._get_wan_socket_cached(wan_idx)
+                    if wan_info is None:
+                        retries += 1
+                        time.sleep(0.5)  # 短暂等待后重试
+                
+                if wan_info is None:
+                    logger.error(f"线程 {thread_idx} 无法获取WAN接口 {wan_idx} 的端口")
+                    result_queue.put((ts_code, False, 0))
+                    return
                 
                 success = False
                 records_count = 0
@@ -978,9 +1207,13 @@ class DailyFetcherV3(TushareFetcher):
                             records_count = len(df_processed)
                             success = True
                 finally:
-                    # 释放WAN端口
+                    # 标记WAN端口为未使用
                     if wan_info:
-                        self.port_allocator.release_port(wan_info[0], wan_info[1])
+                        self._release_wan_socket_cached(wan_info[0], wan_info[1])
+                    # 移除线程ID到WAN的映射
+                    with self.wan_cache_lock:
+                        if threading.current_thread().ident in self.thread_id_to_wan:
+                            del self.thread_id_to_wan[threading.current_thread().ident]
                 
                 # 放入结果队列
                 result_queue.put((ts_code, success, records_count))
@@ -999,73 +1232,79 @@ class DailyFetcherV3(TushareFetcher):
                 
                 # 确保释放WAN端口
                 if 'wan_info' in locals() and wan_info:
-                    try:
-                        self.port_allocator.release_port(wan_info[0], wan_info[1])
-                    except:
-                        pass
-                        
+                    self._release_wan_socket_cached(wan_info[0], wan_info[1])
+                
+                # 移除线程ID到WAN的映射
+                with self.wan_cache_lock:
+                    if threading.current_thread().ident in self.thread_id_to_wan:
+                        del self.thread_id_to_wan[threading.current_thread().ident]
+                    
                 result_queue.put((ts_code, False, 0))
         
-        # 启动线程
-        start_time = time.time()
-        
-        # 创建并启动所有线程
-        for i, ts_code in enumerate(stock_codes):
-            thread = threading.Thread(
-                target=process_stock,
-                args=(ts_code, i % max_workers)
-            )
-            thread.start()
-            threads.append(thread)
+        try:
+            # 启动线程
+            start_time = time.time()
             
-            # 控制同时运行的线程数
-            if len(threads) >= max_workers:
-                # 等待一个线程完成
-                while result_queue.empty():
-                    time.sleep(0.1)
+            # 创建并启动所有线程
+            for i, ts_code in enumerate(stock_codes):
+                thread = threading.Thread(
+                    target=process_stock,
+                    args=(ts_code, i % max_workers)
+                )
+                thread.start()
+                threads.append(thread)
                 
-                # 处理结果
+                # 控制同时运行的线程数
+                if len(threads) >= max_workers:
+                    # 等待一个线程完成
+                    while result_queue.empty():
+                        time.sleep(0.1)
+                    
+                    # 处理结果
+                    ts_code, success, records_count = result_queue.get()
+                    processed_stocks += 1
+                    if success:
+                        success_stocks += 1
+                        total_records += records_count
+                    
+                    # 更新进度
+                    progress = processed_stocks / total_stocks * 100
+                    elapsed = time.time() - start_time
+                    remaining = elapsed / processed_stocks * (total_stocks - processed_stocks) if processed_stocks > 0 else 0
+                    logger.info(f"进度: {processed_stocks}/{total_stocks} ({progress:.1f}%)，"
+                              f"成功: {success_stocks}，"
+                              f"已获取记录: {total_records}，"
+                              f"已耗时: {elapsed:.1f}s，"
+                              f"预估剩余: {remaining:.1f}s")
+                    
+                    # 清理已完成的线程
+                    threads = [t for t in threads if t.is_alive()]
+                    
+                    # 控制启动新线程的间隔
+                    time.sleep(0.2)
+            
+            # 等待所有线程完成
+            for thread in threads:
+                thread.join()
+            
+            # 处理剩余结果
+            while not result_queue.empty():
                 ts_code, success, records_count = result_queue.get()
                 processed_stocks += 1
                 if success:
                     success_stocks += 1
                     total_records += records_count
-                
-                # 更新进度
-                progress = processed_stocks / total_stocks * 100
-                elapsed = time.time() - start_time
-                remaining = elapsed / processed_stocks * (total_stocks - processed_stocks) if processed_stocks > 0 else 0
-                logger.info(f"进度: {processed_stocks}/{total_stocks} ({progress:.1f}%)，"
-                           f"成功: {success_stocks}，"
-                           f"已获取记录: {total_records}，"
-                           f"已耗时: {elapsed:.1f}s，"
-                           f"预估剩余: {remaining:.1f}s")
-                
-                # 清理已完成的线程
-                threads = [t for t in threads if t.is_alive()]
-                
-                # 控制启动新线程的间隔
-                time.sleep(0.2)
-        
-        # 等待所有线程完成
-        for thread in threads:
-            thread.join()
-        
-        # 处理剩余结果
-        while not result_queue.empty():
-            ts_code, success, records_count = result_queue.get()
-            processed_stocks += 1
-            if success:
-                success_stocks += 1
-                total_records += records_count
-        
-        # 记录最终结果
-        elapsed_total = time.time() - start_time
-        logger.success(f"并行处理完成，成功处理 {success_stocks}/{total_stocks} 个股票，"
-                       f"共获取 {total_records} 条记录，"
-                       f"总耗时: {elapsed_total:.1f}s")
-        
-        return success_stocks > 0
+            
+            # 记录最终结果
+            elapsed_total = time.time() - start_time
+            logger.success(f"并行处理完成，成功处理 {success_stocks}/{total_stocks} 个股票，"
+                         f"共获取 {total_records} 条记录，"
+                         f"总耗时: {elapsed_total:.1f}s")
+            
+            return success_stocks > 0
+        finally:
+            # 确保清理所有WAN端口缓存
+            self._clear_wan_port_cache()
     
     def run(self, **kwargs) -> bool:
         """
@@ -1424,6 +1663,133 @@ class DailyFetcherV3(TushareFetcher):
             import traceback
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return False
+
+def _mongodb_consumer_thread(self, data_queue, log_lock):
+    """
+    MongoDB数据处理线程，负责批量保存数据到MongoDB
+    
+    Args:
+        data_queue: 数据队列
+        log_lock: 日志锁
+    """
+    try:
+        # 等待队列中的数据
+        batch_data = []
+        processed_count = 0
+        date_records = {}  # 记录每个交易日的记录数
+        last_process_time = time.time()  # 记录上次处理时间
+        batch_timeout = 2.0  # 批次超时时间（秒）
+        
+        while True:
+            try:
+                # 等待数据，但设置超时以便定期检查是否应该处理积累的数据
+                item = data_queue.get(timeout=0.5)
+                
+                # 检查结束信号
+                if item is None:
+                    with log_lock:
+                        logger.info(f"【MongoDB线程】收到结束信号，处理剩余[{len(batch_data)}]条数据")
+                        if date_records:
+                            for date_str, count in date_records.items():
+                                logger.debug(f"【MongoDB线程】交易日[{date_str}]数据：[{count}]条")
+                    
+                    # 处理剩余数据
+                    if batch_data:
+                        self._save_batch_to_mongodb(batch_data, date_records, log_lock)
+                    
+                    break
+                
+                # 解析数据
+                date_str, df, thread_idx, wan_idx = item
+                records = df.to_dict('records')
+                batch_data.extend(records)
+                processed_count += len(records)
+                
+                # 更新交易日记录统计
+                if date_str in date_records:
+                    date_records[date_str] += len(records)
+                else:
+                    date_records[date_str] = len(records)
+                
+                with log_lock:
+                    logger.debug(f"【MongoDB线程】从队列接收交易日[{date_str}]的[{len(records)}]条数据，当前批次大小:[{len(batch_data)}]")
+                
+                # 当批次数据达到一定大小或超过最大等待时间时，立即处理一批数据
+                current_time = time.time()
+                timeout_reached = (current_time - last_process_time) > batch_timeout
+                
+                if len(batch_data) >= self.mongo_batch_size or timeout_reached:
+                    if batch_data:
+                        with log_lock:
+                            logger.info(f"【MongoDB线程】开始处理批次数据，大小:[{len(batch_data)}]条 "
+                                       f"({'超时触发' if timeout_reached else '达到批次大小'})")
+                            dates_summary = ', '.join([f"{d}:{c}条" for d, c in date_records.items()])
+                            logger.debug(f"【MongoDB线程】批次包含交易日数据：{dates_summary}")
+                        
+                        self._save_batch_to_mongodb(batch_data, date_records, log_lock)
+                        batch_data = []
+                        date_records = {}  # 重置交易日记录
+                        last_process_time = current_time  # 更新处理时间
+            
+            except queue.Empty:
+                # 队列暂时为空，检查是否需要处理当前批次
+                current_time = time.time()
+                # 如果有数据且超过超时时间，则处理当前批次
+                if batch_data and (current_time - last_process_time) > batch_timeout:
+                    with log_lock:
+                        logger.info(f"【MongoDB线程】队列暂时为空，处理当前批次数据，大小:[{len(batch_data)}]条 (超时触发)")
+                        dates_summary = ', '.join([f"{d}:{c}条" for d, c in date_records.items()])
+                        logger.debug(f"【MongoDB线程】批次包含交易日数据：{dates_summary}")
+                    
+                    self._save_batch_to_mongodb(batch_data, date_records, log_lock)
+                    batch_data = []
+                    date_records = {}  # 重置交易日记录
+                    last_process_time = current_time  # 更新处理时间
+        
+        with log_lock:
+            logger.success(f"【MongoDB线程】处理完成，共处理[{processed_count}]条数据")
+            
+    except Exception as e:
+        with log_lock:
+            logger.error(f"【MongoDB线程】处理数据出错: {str(e)}")
+            import traceback
+            logger.debug(f"【MongoDB线程】异常详情: {traceback.format_exc()}")
+
+def _save_batch_to_mongodb(self, batch_data, date_records, log_lock):
+    """
+    将批量数据保存到MongoDB
+    
+    Args:
+        batch_data: 批量数据列表
+        date_records: 交易日记录计数字典
+        log_lock: 日志锁
+    """
+    if not batch_data:
+        return
+        
+    try:
+        dates_info = ', '.join([f"[{d}:{c}条]" for d, c in date_records.items()])
+        with log_lock:
+            logger.info(f"【MongoDB批处理】保存[{len(batch_data)}]条数据到MongoDB，交易日:{dates_info}")
+        
+        # 使用DataFrame处理批量数据
+        df_batch = pd.DataFrame(batch_data)
+        
+        # 添加批次ID等调试信息
+        batch_id = f"batch_{int(time.time())}"
+        result = self._optimized_save_to_mongodb(df_batch, batch_id)
+        
+        with log_lock:
+            if result:
+                logger.success(f"【MongoDB批处理】成功保存批次[{batch_id}]，[{len(batch_data)}]条数据")
+            else:
+                logger.error(f"【MongoDB批处理】保存批次[{batch_id}]失败")
+                
+    except Exception as e:
+        with log_lock:
+            logger.error(f"【MongoDB批处理】保存数据出错: {str(e)}")
+            import traceback
+            logger.debug(f"【MongoDB批处理】异常详情: {traceback.format_exc()}")
 
 def main():
     """主函数"""

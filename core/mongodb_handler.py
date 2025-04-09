@@ -482,6 +482,24 @@ class MongoDBHandler:
             self.logger.error(f"获取索引列表失败: {str(e)}")
             raise Exception(f"获取索引列表失败: {str(e)}")
 
+    def get_collection_indexes(self, collection_name):
+        """获取集合的所有索引
+        
+        Args:
+            collection_name: 集合名称
+            
+        Returns:
+            list: 索引列表
+            
+        Raises:
+            Exception: 如果获取索引失败
+        """
+        try:
+            return self.list_indexes(collection_name)
+        except Exception as e:
+            self.logger.error(f"获取集合索引失败: {str(e)}")
+            raise Exception(f"获取集合索引失败: {str(e)}")
+
     def drop_index(self, collection_name, index_name):
         """删除索引
         
