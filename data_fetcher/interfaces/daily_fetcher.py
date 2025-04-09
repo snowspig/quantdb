@@ -18,10 +18,12 @@
 
 import sys
 import time
+import json
+import os
 import pandas as pd
 import pymongo
 from datetime import datetime, timedelta
-from typing import List, Set, Optional
+from typing import List, Set, Optional, Dict, Any
 from pathlib import Path
 from loguru import logger
 
@@ -33,6 +35,60 @@ sys.path.append(str(project_root))
 # 导入平台核心模块
 from core.tushare_fetcher import TushareFetcher
 from core import mongodb_handler
+
+# 共享配置加载函数
+def load_shared_config(shared_config_path=None) -> Dict[str, Any]:
+    """
+    加载共享配置
+    
+    如果指定了共享配置路径，直接从文件加载
+    否则尝试从环境变量获取路径
+    
+    Args:
+        shared_config_path: 共享配置文件路径
+        
+    Returns:
+        Dict[str, Any]: 共享配置字典
+    """
+    # 首先检查参数
+    if shared_config_path:
+        config_path = shared_config_path
+    # 其次检查环境变量
+    elif "QUANTDB_SHARED_CONFIG" in os.environ:
+        config_path = os.environ.get("QUANTDB_SHARED_CONFIG")
+    else:
+        # 如果没有共享配置，返回空字典
+        logger.debug("没有找到共享配置路径")
+        return {}
+    
+    try:
+        # 检查文件是否存在
+        if not os.path.exists(config_path):
+            logger.warning(f"共享配置文件不存在：{config_path}")
+            return {}
+        
+        # 加载配置
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        
+        logger.info(f"成功从共享配置中加载设置：{config_path}")
+        return config
+    except Exception as e:
+        logger.error(f"加载共享配置失败：{str(e)}")
+        return {}
+
+def get_validation_status(shared_config: Dict[str, Any]) -> Dict[str, bool]:
+    """
+    从共享配置中获取验证状态
+    
+    Args:
+        shared_config: 共享配置字典
+        
+    Returns:
+        Dict[str, bool]: 验证状态字典
+    """
+    validation_summary = shared_config.get("validation_summary", {})
+    return validation_summary
 
 class DailyFetcherV3(TushareFetcher):
     """
@@ -58,7 +114,9 @@ class DailyFetcherV3(TushareFetcher):
         verbose: bool = False,
         max_workers: int = 3,  # 并行工作线程数
         retry_count: int = 3,  # 数据获取重试次数
-        retry_delay: int = 5   # 重试延迟时间(秒)
+        retry_delay: int = 5,   # 重试延迟时间(秒)
+        shared_config: Dict[str, Any] = None,
+        skip_validation: bool = False
     ):
         """
         初始化日线行情数据获取器
@@ -74,16 +132,45 @@ class DailyFetcherV3(TushareFetcher):
             max_workers: 并行工作线程数
             retry_count: 数据获取重试次数
             retry_delay: 重试延迟时间(秒)
+            shared_config: 共享配置字典
+            skip_validation: 是否跳过验证
         """
+        # 使用共享配置中的设置（如果有）
+        if shared_config:
+            # 可以从共享配置中获取配置文件路径
+            config_path = shared_config.get("config_file", config_path)
+            # 获取验证状态
+            validation_status = get_validation_status(shared_config)
+            skip_validation = skip_validation or validation_status.get("all_valid", False)
+            
+            logger.info(f"使用共享配置：配置文件={config_path}, 跳过验证={skip_validation}")
+        
+        # 保存skip_validation状态，但不传递给父类
+        self.skip_validation = skip_validation
+        
+        # 检查TushareFetcher是否支持skip_validation参数
+        import inspect
+        parent_params = inspect.signature(TushareFetcher.__init__).parameters
+        parent_args = {}
+        
+        # 基本参数
+        parent_args['config_path'] = config_path
+        parent_args['interface_dir'] = interface_dir
+        parent_args['interface_name'] = interface_name
+        parent_args['db_name'] = db_name
+        parent_args['collection_name'] = collection_name
+        parent_args['verbose'] = verbose
+        
+        # 如果父类支持skip_validation，则添加
+        if 'skip_validation' in parent_params:
+            parent_args['skip_validation'] = skip_validation
+            if verbose:
+                logger.debug("TushareFetcher支持skip_validation参数")
+        else:
+            logger.debug("TushareFetcher不支持skip_validation参数，将在子类中处理")
+        
         # 调用父类初始化方法
-        super().__init__(
-            config_path=config_path,
-            interface_dir=interface_dir,
-            interface_name=interface_name,
-            db_name=db_name,
-            collection_name=collection_name,
-            verbose=verbose
-        )
+        super().__init__(**parent_args)
         
         self.target_market_codes = target_market_codes
         self.max_workers = max_workers
@@ -1002,6 +1089,61 @@ class DailyFetcherV3(TushareFetcher):
         Returns:
             是否成功
         """
+        # 如果需要跳过验证，检查父类是否已支持
+        # 如果父类不支持，则自己处理跳过验证
+        if hasattr(self, 'skip_validation') and self.skip_validation:
+            import inspect
+            parent_run = super().run
+            parent_params = inspect.signature(parent_run).parameters
+            
+            # 如果父类run()不支持skip_validation参数，实现自己的逻辑
+            if 'skip_validation' not in parent_params:
+                logger.info("父类不支持跳过验证，使用自定义逻辑跳过验证过程")
+                
+                try:
+                    mode = kwargs.get('mode', 'recent')
+                    use_parallel = kwargs.get('use_parallel', True)
+                    
+                    logger.info(f"开始运行日线数据获取器，模式: {mode}")
+                    
+                    # 对于非full模式，预先确保集合和索引存在
+                    if mode != 'full':
+                        if not self._ensure_collection_and_indexes():
+                            logger.error("集合和索引初始化失败")
+                            return False
+                        
+                    if mode == 'recent':
+                        days = kwargs.get('days', 7)
+                        return self.fetch_by_recent(days)
+                    elif mode == 'full':
+                        # full模式下使用按股票代码抓取的方式
+                        return self.fetch_full_history()
+                    elif mode == 'date_range':
+                        start_date = kwargs.get('start_date')
+                        end_date = kwargs.get('end_date')
+                        if not start_date or not end_date:
+                            logger.error("date_range模式需要提供start_date和end_date参数")
+                            return False
+                        return self.fetch_by_date_range(start_date, end_date, use_parallel)
+                    elif mode == 'stock':
+                        ts_code = kwargs.get('ts_code')
+                        if not ts_code:
+                            logger.error("stock模式需要提供ts_code参数")
+                            return False
+                        start_date = kwargs.get('start_date')
+                        end_date = kwargs.get('end_date')
+                        return self.fetch_by_stock(ts_code, start_date, end_date)
+                    else:
+                        logger.error(f"不支持的运行模式: {mode}")
+                        return False
+                    
+                except Exception as e:
+                    logger.error(f"运行过程中发生异常: {str(e)}")
+                    import traceback
+                    logger.debug(f"详细错误信息: {traceback.format_exc()}")
+                    return False
+        
+        # 如果没有skip_validation标志或父类支持，使用原始的run方法
         mode = kwargs.get('mode', 'recent')
         use_parallel = kwargs.get('use_parallel', True)
         
@@ -1301,14 +1443,35 @@ def main():
     parser.add_argument('--collection-name', default='daily', help='MongoDB集合名称')
     parser.add_argument('--verbose', action='store_true', help='输出详细日志')
     parser.add_argument('--no-parallel', dest='use_parallel', action='store_false', help='禁用并行处理')
+    parser.add_argument('--shared-config', type=str, default=None, help='共享配置文件路径')
+    parser.add_argument('--skip-validation', action='store_true', help='跳过配置验证')
     parser.set_defaults(use_parallel=True)
     
     args = parser.parse_args()
+    
+    # 根据verbose参数设置日志级别
+    if not args.verbose:
+        # 非详细模式下，设置日志级别为INFO，不显示DEBUG消息
+        logger.remove()  # 移除所有处理器
+        logger.add(sys.stderr, level="INFO")  # 添加标准错误输出处理器，级别为INFO
     
     # 解析市场代码
     target_market_codes = set(args.market_codes.split(','))
     
     try:
+        # 加载共享配置（如果有）
+        shared_config = load_shared_config(args.shared_config)
+        
+        # 使用共享配置中的验证状态
+        if shared_config:
+            validation_status = get_validation_status(shared_config)
+            logger.info(f"从共享配置获取验证状态：{validation_status}")
+            
+            # 如果共享配置中指定了配置文件路径，优先使用
+            if "config_file" in shared_config and not args.config:
+                args.config = shared_config.get("config_file")
+                logger.info(f"从共享配置获取配置文件路径：{args.config}")
+        
         # 创建获取器
         fetcher = DailyFetcherV3(
             config_path=args.config,
@@ -1316,7 +1479,9 @@ def main():
             target_market_codes=target_market_codes,
             db_name=args.db_name,
             collection_name=args.collection_name,
-            verbose=args.verbose
+            verbose=args.verbose,
+            shared_config=shared_config,
+            skip_validation=args.skip_validation
         )
         
         # 确定运行模式和参数

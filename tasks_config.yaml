@@ -12,20 +12,22 @@
 init_programs:
   - trade_cal_fetcher.py      # 交易日历获取器
   - stock_basic_fetcher.py    # 股票基本信息获取器
-  - stock_company_fetcher.py  # 上市公司基本信息获取器
+
 
 # 串行程序 - 按顺序执行，但可以有多个工作进程
 # 这些程序需要按特定顺序执行，但内部可以并行处理
 serial_programs:
-  - basic_indicator_fetcher.py  # 基本面指标数据获取器
+  # - basic_indicator_fetcher.py  # 基本面指标数据获取器
+  - daily_fetcher.py          # 日线数据获取器
 
 # 并行程序 - 可以并行执行
 # 这些程序可以同时执行，通常为大量数据获取任务
 parallel_programs:
   - daily_fetcher.py          # 日线数据获取器
-  - weekly_fetcher.py         # 周线数据获取器
-  - monthly_fetcher.py        # 月线数据获取器
-  - daily_basic_fetcher.py    # 每日指标获取器
-  - moneyflow_fetcher.py      # 资金流向数据获取器
-  - suspend_fetcher.py        # 停复牌信息获取器
-  - stk_rewards_fetcher.py    # 管理层薪酬和持股获取器
+  # - weekly_fetcher.py         # 周线数据获取器
+  # - monthly_fetcher.py        # 月线数据获取器
+  # - daily_basic_fetcher.py    # 每日指标获取器
+  # - moneyflow_fetcher.py      # 资金流向数据获取器
+  # - suspend_fetcher.py        # 停复牌信息获取器
+  # - stk_rewards_fetcher.py    # 管理层薪酬和持股获取器
+  # - stock_company_fetcher.py  # 上市公司基本信息获取器  

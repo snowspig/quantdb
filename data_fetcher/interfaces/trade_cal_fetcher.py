@@ -15,9 +15,11 @@ Trade Calendar Fetcher V2 - 获取交易日历数据并保存到MongoDB
 """
 import sys
 import time
+import json
+import os
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from pathlib import Path
 from loguru import logger
 
@@ -28,6 +30,60 @@ sys.path.append(str(project_root))
 
 # 导入平台核心模块
 from core.tushare_fetcher import TushareFetcher
+
+# 共享配置加载函数
+def load_shared_config(shared_config_path=None) -> Dict[str, Any]:
+    """
+    加载共享配置
+    
+    如果指定了共享配置路径，直接从文件加载
+    否则尝试从环境变量获取路径
+    
+    Args:
+        shared_config_path: 共享配置文件路径
+        
+    Returns:
+        Dict[str, Any]: 共享配置字典
+    """
+    # 首先检查参数
+    if shared_config_path:
+        config_path = shared_config_path
+    # 其次检查环境变量
+    elif "QUANTDB_SHARED_CONFIG" in os.environ:
+        config_path = os.environ.get("QUANTDB_SHARED_CONFIG")
+    else:
+        # 如果没有共享配置，返回空字典
+        logger.debug("没有找到共享配置路径")
+        return {}
+    
+    try:
+        # 检查文件是否存在
+        if not os.path.exists(config_path):
+            logger.warning(f"共享配置文件不存在：{config_path}")
+            return {}
+        
+        # 加载配置
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        
+        logger.info(f"成功从共享配置中加载设置：{config_path}")
+        return config
+    except Exception as e:
+        logger.error(f"加载共享配置失败：{str(e)}")
+        return {}
+
+def get_validation_status(shared_config: Dict[str, Any]) -> Dict[str, bool]:
+    """
+    从共享配置中获取验证状态
+    
+    Args:
+        shared_config: 共享配置字典
+        
+    Returns:
+        Dict[str, bool]: 验证状态字典
+    """
+    validation_summary = shared_config.get("validation_summary", {})
+    return validation_summary
 
 class TradeCalFetcher(TushareFetcher):
     """
@@ -47,7 +103,9 @@ class TradeCalFetcher(TushareFetcher):
         start_date: str = None,
         end_date: str = None,
         exchange: str = "SSE",  # 默认上交所
-        verbose: bool = False
+        verbose: bool = False,
+        shared_config: Dict[str, Any] = None,
+        skip_validation: bool = False
     ):
         """
         初始化交易日历数据获取器
@@ -62,16 +120,45 @@ class TradeCalFetcher(TushareFetcher):
             end_date: 结束日期（格式：YYYYMMDD，默认为当前日期）
             exchange: 交易所代码（SSE：上交所，SZSE：深交所，默认SSE）
             verbose: 是否输出详细日志
+            shared_config: 共享配置字典
+            skip_validation: 是否跳过验证
         """
+        # 使用共享配置中的设置（如果有）
+        if shared_config:
+            # 可以从共享配置中获取配置文件路径
+            config_path = shared_config.get("config_file", config_path)
+            # 获取验证状态
+            validation_status = get_validation_status(shared_config)
+            skip_validation = skip_validation or validation_status.get("all_valid", False)
+            
+            logger.info(f"使用共享配置：配置文件={config_path}, 跳过验证={skip_validation}")
+        
+        # 保存skip_validation状态，但不传递给父类
+        self.skip_validation = skip_validation
+        
+        # 检查TushareFetcher是否支持skip_validation参数
+        import inspect
+        parent_params = inspect.signature(TushareFetcher.__init__).parameters
+        parent_args = {}
+        
+        # 基本参数
+        parent_args['config_path'] = config_path
+        parent_args['interface_dir'] = interface_dir
+        parent_args['interface_name'] = interface_name
+        parent_args['db_name'] = db_name
+        parent_args['collection_name'] = collection_name
+        parent_args['verbose'] = verbose
+        
+        # 如果父类支持skip_validation，则添加
+        if 'skip_validation' in parent_params:
+            parent_args['skip_validation'] = skip_validation
+            if verbose:
+                logger.debug("TushareFetcher支持skip_validation参数")
+        else:
+            logger.debug("TushareFetcher不支持skip_validation参数，将在子类中处理")
+        
         # 调用父类初始化方法
-        super().__init__(
-            config_path=config_path,
-            interface_dir=interface_dir,
-            interface_name=interface_name,
-            db_name=db_name,
-            collection_name=collection_name,
-            verbose=verbose
-        )
+        super().__init__(**parent_args)
         
         self.exchange = exchange
         
@@ -341,7 +428,80 @@ class TradeCalFetcher(TushareFetcher):
         Returns:
             是否成功
         """
-        # 使用父类的通用流程
+        # 如果需要跳过验证，检查父类是否已支持
+        # 如果父类不支持，则自己处理跳过验证
+        if hasattr(self, 'skip_validation') and self.skip_validation:
+            import inspect
+            parent_run = super().run
+            parent_params = inspect.signature(parent_run).parameters
+            
+            # 如果父类run()不支持skip_validation参数，实现自己的逻辑
+            if 'skip_validation' not in parent_params:
+                logger.info("父类不支持跳过验证，使用自定义逻辑跳过验证过程")
+                
+                try:
+                    # 获取数据
+                    logger.info("开始获取数据...")
+                    df = self.fetch_data()
+                    if df is None or df.empty:
+                        logger.error("获取数据失败或数据为空")
+                        return False
+                    
+                    # 处理数据
+                    logger.info("开始处理数据...")
+                    processed_df = self.process_data(df)
+                    if processed_df is None or processed_df.empty:
+                        logger.warning("处理后的数据为空")
+                        return False
+                    
+                    # 存储数据 - 不直接调用save_data，而是尝试使用父类的save_to_mongodb方法
+                    # 或者直接调用父类的run方法来处理保存逻辑
+                    logger.info("开始保存数据...")
+                    
+                    # 方法1：尝试使用save_to_mongodb方法（如果存在）
+                    if hasattr(self, 'save_to_mongodb'):
+                        return self.save_to_mongodb(processed_df)
+                    
+                    # 方法2：尝试其他可能的方法名
+                    for method_name in ['store_data', 'insert_data', 'save']:
+                        if hasattr(self, method_name):
+                            method = getattr(self, method_name)
+                            return method(processed_df)
+                    
+                    # 方法3：如果没有找到合适的保存方法，则使用父类的run方法
+                    logger.info("未找到直接保存方法，回退到父类的run方法...")
+                    
+                    # 保存处理后的数据供父类使用
+                    self._processed_data = processed_df
+                    
+                    # 创建一个子类，覆盖fetch_data和process_data方法来使用已处理的数据
+                    class TempFetcher(TushareFetcher):
+                        def __init__(self, parent):
+                            self.__dict__ = parent.__dict__
+                        
+                        def fetch_data(self, **kwargs):
+                            # 直接返回原始数据
+                            return self._processed_data
+                        
+                        def process_data(self, df):
+                            # 直接返回，因为数据已经处理过
+                            return df
+                    
+                    # 创建临时对象
+                    temp_fetcher = TempFetcher(self)
+                    
+                    # 调用原始的父类run方法
+                    from types import MethodType
+                    original_run = super(TempFetcher, temp_fetcher).run
+                    return original_run()
+                    
+                except Exception as e:
+                    logger.error(f"运行过程中发生异常: {str(e)}")
+                    import traceback
+                    logger.error(f"详细错误信息: {traceback.format_exc()}")
+                    return False
+        
+        # 否则使用父类的通用流程
         return super().run()
 
 def main():
@@ -357,10 +517,31 @@ def main():
     parser.add_argument('--db-name', help='MongoDB数据库名称')
     parser.add_argument('--collection-name', default='trade_cal', help='MongoDB集合名称')
     parser.add_argument('--verbose', action='store_true', help='输出详细日志')
+    parser.add_argument('--shared-config', type=str, default=None, help='共享配置文件路径')
+    parser.add_argument('--skip-validation', action='store_true', help='跳过配置验证')
     
     args = parser.parse_args()
     
+    # 根据verbose参数设置日志级别
+    if not args.verbose:
+        # 非详细模式下，设置日志级别为INFO，不显示DEBUG消息
+        logger.remove()  # 移除所有处理器
+        logger.add(sys.stderr, level="INFO")  # 添加标准错误输出处理器，级别为INFO
+    
     try:
+        # 加载共享配置（如果有）
+        shared_config = load_shared_config(args.shared_config)
+        
+        # 使用共享配置中的验证状态
+        if shared_config:
+            validation_status = get_validation_status(shared_config)
+            logger.info(f"从共享配置获取验证状态：{validation_status}")
+            
+            # 如果共享配置中指定了配置文件路径，优先使用
+            if "config_file" in shared_config and not args.config:
+                args.config = shared_config.get("config_file")
+                logger.info(f"从共享配置获取配置文件路径：{args.config}")
+        
         # 创建获取器并运行
         fetcher = TradeCalFetcher(
             config_path=args.config,
@@ -370,7 +551,9 @@ def main():
             end_date=args.end_date,
             db_name=args.db_name,
             collection_name=args.collection_name,
-            verbose=args.verbose
+            verbose=args.verbose,
+            shared_config=shared_config,
+            skip_validation=args.skip_validation
         )
         
         success = fetcher.run()

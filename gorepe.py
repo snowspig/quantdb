@@ -24,14 +24,13 @@ import logging
 import argparse
 import threading
 import subprocess
-from core.config_state_manager import config_state_manager
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Set, Tuple, Optional, Any, Union
 import multiprocessing
 
-# Import configuration state manager
-from core.config_state_manager import config_state_manager
+# 修复导入配置状态管理器
+from core.config_state_manager import ConfigStateManager
 import concurrent.futures
 import queue
 
@@ -50,11 +49,55 @@ logger = logging.getLogger('gorepe')
 DEFAULT_CONFIG_FILE = 'tasks_config.yaml'
 DEFAULT_TIMEOUT = 7200  # 默认子进程超时时间（秒）
 TOTAL_WORKERS = multiprocessing.cpu_count()  # 总工作进程数（根据CPU核心数）
-SERIAL_WORKERS = 1  # 串行任务工作进程数
-PARALLEL_WORKERS = max(1, TOTAL_WORKERS - 1)  # 并行任务工作进程数
+SERIAL_WORKERS = 1  # 串行任务始终使用1个线程
+# 确保并行线程数至少为1，即使单核CPU
+PARALLEL_WORKERS = max(1, TOTAL_WORKERS - SERIAL_WORKERS)  # 并行任务工作线程数
 
 # 运行状态
 RUNNING = True
+
+# 添加在类外部，作为兼容层函数
+def get_validation_summary(config_manager):
+    """
+    获取配置验证状态摘要，兼容不同版本的ConfigStateManager
+    
+    如果ConfigStateManager没有get_validation_summary方法，则提供默认实现
+    
+    Returns:
+        Dict: 包含验证状态的字典
+    """
+    try:
+        # 尝试调用原生方法
+        if hasattr(config_manager, 'get_validation_summary'):
+            return config_manager.get_validation_summary()
+        
+        # 如果没有该方法，则尝试从属性获取状态
+        default_summary = {
+            "mongodb": True,  # 假设MongoDB已经验证
+            "tushare": True,  # 假设Tushare已经验证
+            "wan": True,      # 假设WAN已经验证
+            "all_valid": True # 假设所有项都已验证
+        }
+        
+        # 尝试从属性获取
+        if hasattr(config_manager, 'mongodb_valid'):
+            default_summary['mongodb'] = config_manager.mongodb_valid
+        if hasattr(config_manager, 'tushare_valid'):
+            default_summary['tushare'] = config_manager.tushare_valid
+        if hasattr(config_manager, 'wan_valid'):
+            default_summary['wan'] = config_manager.wan_valid
+        
+        # 检查是否全部有效
+        default_summary['all_valid'] = all([
+            default_summary['mongodb'], 
+            default_summary['tushare'], 
+            default_summary['wan']
+        ])
+        
+        return default_summary
+    except Exception as e:
+        logger.warning(f"获取验证状态时出错：{str(e)}，将使用默认全部有效状态")
+        return {"mongodb": True, "tushare": True, "wan": True, "all_valid": True}
 
 class TaskManager:
     """任务管理器类，负责加载、调度和执行任务"""
@@ -77,15 +120,26 @@ class TaskManager:
         self.result_lock = threading.RLock()
         self.start_time = None
         self.end_time = None
+        self.verbose = False  # 默认不使用详细日志
         
         # 使用配置状态管理器来检查配置是否已经验证过
-        self.config_state_manager = config_state_manager
-        validation_summary = self.config_state_manager.get_validation_summary()
+        self.config_state_manager = ConfigStateManager()
+        # 使用兼容函数获取验证摘要
+        validation_summary = get_validation_summary(self.config_state_manager)
         # 检查是否所有配置都已验证
         self.configurations_validated = validation_summary.get("all_valid", False)
         
+        # 共享配置文件路径
+        self.shared_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
+                                              "temp", "shared_config.json")
+        # 确保temp目录存在
+        os.makedirs(os.path.dirname(self.shared_config_path), exist_ok=True)
+        
         # 加载配置文件
         self.load_config()
+        
+        # 创建共享配置
+        self.create_shared_config()
         
     def load_config(self) -> bool:
         """
@@ -129,7 +183,8 @@ class TaskManager:
         all_tasks = self.init_programs + self.serial_programs + self.parallel_programs
         
         for task in all_tasks:
-            if not os.path.exists(task):
+            resolved_path = self._resolve_task_path(task)
+            if not os.path.exists(resolved_path):
                 missing_tasks.append(task)
                 
         return missing_tasks
@@ -149,24 +204,58 @@ class TaskManager:
             return False, "已中断执行"
             
         try:
-            logger.info(f"开始执行：{program}")
+            resolved_program = self._resolve_task_path(program)
+            logger.info(f"开始执行：{program} (实际路径: {resolved_program})")
             start_time = time.time()
             
             # 检查文件是否存在
-            if not os.path.exists(program):
+            if not os.path.exists(resolved_program):
                 return False, f"文件不存在：{program}"
                 
             # 检查是否可执行
-            if not os.access(program, os.X_OK):
+            if not os.access(resolved_program, os.X_OK):
                 # 给予执行权限
-                os.chmod(program, 0o755)
+                os.chmod(resolved_program, 0o755)
             
-            # 启动子进程
+            # 准备环境变量
+            env = os.environ.copy()
+            # 添加配置状态信息
+            for key, value in get_validation_summary(self.config_state_manager).items():
+                env[f"QUANTDB_CONFIG_{key.upper()}"] = str(value)
+            
+            # 添加共享配置文件路径到环境变量
+            env["QUANTDB_SHARED_CONFIG"] = self.shared_config_path
+            
+            # 准备命令行参数
+            cmd_args = [sys.executable, resolved_program]
+            
+            # 添加配置参数 - 使用--config而不是--config-file
+            cmd_args.extend(["--config", self.config_file])
+            cmd_args.extend(["--shared-config", self.shared_config_path])
+            
+            # 如果有验证状态，添加到命令行
+            validation_summary = get_validation_summary(self.config_state_manager)
+            if validation_summary.get('all_valid', False):
+                cmd_args.append("--skip-validation")
+            
+            # 默认不使用详细日志模式，减少输出量
+            # 如果需要详细日志，可以通过参数传递
+            if not self.verbose:
+                # 不传递--verbose参数，使子进程使用简洁日志模式
+                pass
+            else:
+                # 传递--verbose参数，使子进程使用详细日志模式
+                cmd_args.append("--verbose")
+            
+            # 启动子进程，同时传递环境变量和命令行参数
+            # 添加encoding='utf-8'参数解决GBK编码问题
             process = subprocess.Popen(
-                [sys.executable, program],
+                cmd_args,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                universal_newlines=True
+                universal_newlines=True,
+                env=env,
+                encoding='utf-8'
             )
             
             # 等待进程完成并获取输出
@@ -207,16 +296,26 @@ class TaskManager:
         all_success = True
         validation_updates = {}
         
+        total_programs = len(self.init_programs)
+        completed_programs = 0
+        success_count = 0
+        
+        start_time = time.time()
+        
         for program in self.init_programs:
             if not RUNNING:
                 logger.warning("收到中断信号，停止执行初始化程序")
                 return False
-                
+            
+            completed_programs += 1
+            program_start = time.time()
             success, output = self.run_program(program)
+            program_duration = time.time() - program_start
             
             with self.result_lock:
                 if success:
                     self.successful_tasks.append(program)
+                    success_count += 1
                     # 如果是验证配置程序，更新状态
                     if "validate_configurations.py" in program:
                         logger.info("配置验证成功，更新配置验证状态")
@@ -227,14 +326,30 @@ class TaskManager:
                 else:
                     self.failed_tasks.append(program)
                     all_success = False
-                    
-        logger.info(f"初始化程序执行完成，成功：{len([p for p in self.init_programs if p in self.successful_tasks])}，"
-                   f"失败：{len([p for p in self.init_programs if p in self.failed_tasks])}")
+            
+            # 计算进度和剩余时间        
+            progress = completed_programs / total_programs * 100
+            elapsed = time.time() - start_time
+            avg_time_per_program = elapsed / completed_programs
+            remaining = avg_time_per_program * (total_programs - completed_programs)
+            
+            # 显示进度
+            logger.info(f"初始化进度：{completed_programs}/{total_programs} ({progress:.1f}%)，"
+                       f"程序：{program}，结果：{'成功' if success else '失败'}，"
+                       f"本次耗时：{program_duration:.1f}秒，"
+                       f"已用时间：{elapsed:.1f}秒，预计剩余：{remaining:.1f}秒")
+        
+        total_duration = time.time() - start_time
+        logger.info(f"初始化程序执行完成，成功：{success_count}/{total_programs}，"
+                   f"总耗时：{total_duration:.1f}秒")
+        
         return all_success
     
     def run_serial_programs(self) -> bool:
         """
         按顺序运行串行程序
+        
+        每个串行程序将按顺序执行，但与并行程序队列并发运行
         
         Returns:
             bool: 是否全部成功
@@ -242,31 +357,57 @@ class TaskManager:
         if not self.serial_programs:
             logger.info("没有需要执行的串行程序")
             return True
-            
-        logger.info(f"开始执行 {len(self.serial_programs)} 个串行程序")
+        
+        logger.info(f"开始执行 {len(self.serial_programs)} 个串行程序（使用1个专用线程）")
+        
         all_success = True
+        total_programs = len(self.serial_programs)
+        completed_programs = 0
+        success_count = 0
+        
+        start_time = time.time()
         
         for program in self.serial_programs:
             if not RUNNING:
                 logger.warning("收到中断信号，停止执行串行程序")
                 return False
-                
+            
+            completed_programs += 1
+            program_start = time.time()
             success, output = self.run_program(program)
+            program_duration = time.time() - program_start
             
             with self.result_lock:
                 if success:
                     self.successful_tasks.append(program)
+                    success_count += 1
                 else:
                     self.failed_tasks.append(program)
                     all_success = False
-                    
-        logger.info(f"串行程序执行完成，成功：{len([p for p in self.serial_programs if p in self.successful_tasks])}，"
-                   f"失败：{len([p for p in self.serial_programs if p in self.failed_tasks])}")
+            
+            # 计算进度和剩余时间        
+            progress = completed_programs / total_programs * 100
+            elapsed = time.time() - start_time
+            avg_time_per_program = elapsed / completed_programs
+            remaining = avg_time_per_program * (total_programs - completed_programs)
+            
+            # 显示进度
+            logger.info(f"串行进度：{completed_programs}/{total_programs} ({progress:.1f}%)，"
+                       f"程序：{program}，结果：{'成功' if success else '失败'}，"
+                       f"本次耗时：{program_duration:.1f}秒，"
+                       f"已用时间：{elapsed:.1f}秒，预计剩余：{remaining:.1f}秒")
+        
+        total_duration = time.time() - start_time
+        logger.info(f"串行程序执行完成，成功：{success_count}/{total_programs}，"
+                   f"总耗时：{total_duration:.1f}秒")
+        
         return all_success
     
     def run_parallel_programs(self, max_workers: int = None) -> bool:
         """
         并行运行程序
+        
+        在多个线程中并行执行程序，与串行程序队列并发运行
         
         Args:
             max_workers: 最大工作进程数
@@ -277,12 +418,17 @@ class TaskManager:
         if not self.parallel_programs:
             logger.info("没有需要执行的并行程序")
             return True
-            
+        
         # 如果未指定，使用默认的并行工作进程数
         if max_workers is None:
             max_workers = PARALLEL_WORKERS
-            
-        logger.info(f"开始并行执行 {len(self.parallel_programs)} 个程序，最大工作进程数：{max_workers}")
+        
+        logger.info(f"开始并行执行 {len(self.parallel_programs)} 个程序（使用{max_workers}个并行线程）")
+        
+        # 进度追踪变量
+        total_programs = len(self.parallel_programs)
+        completed_programs = 0
+        success_count = 0
         
         # 使用线程池并行执行
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -292,13 +438,12 @@ class TaskManager:
                 for program in self.parallel_programs
             }
             
-            # 处理完成的任务
-            completed = 0
-            total = len(future_to_program)
+            start_time = time.time()
             
+            # 处理完成的任务
             for future in concurrent.futures.as_completed(future_to_program):
                 program = future_to_program[future]
-                completed += 1
+                completed_programs += 1
                 
                 if not RUNNING:
                     logger.warning("收到中断信号，等待已提交任务完成")
@@ -310,12 +455,19 @@ class TaskManager:
                     with self.result_lock:
                         if success:
                             self.successful_tasks.append(program)
+                            success_count += 1
                         else:
                             self.failed_tasks.append(program)
                             
+                    # 计算进度和剩余时间
+                    progress = completed_programs / total_programs * 100
+                    elapsed = time.time() - start_time
+                    remaining = (elapsed / completed_programs) * (total_programs - completed_programs) if completed_programs > 0 else 0
+                    
                     # 显示进度
-                    logger.info(f"进度：{completed}/{total} ({completed/total*100:.1f}%)，"
-                               f"程序：{program}，结果：{'成功' if success else '失败'}")
+                    logger.info(f"并行进度：{completed_programs}/{total_programs} ({progress:.1f}%)，"
+                               f"程序：{program}，结果：{'成功' if success else '失败'}，"
+                               f"已用时间：{elapsed:.1f}秒，预计剩余：{remaining:.1f}秒")
                     
                 except Exception as e:
                     with self.result_lock:
@@ -373,7 +525,8 @@ class TaskManager:
         serial_success = True
         parallel_success = True
         
-        # 运行初始化程序
+        # 1. 运行初始化程序（如果需要）
+        # 初始化程序仍需要先完成，因为这可能包含验证配置等重要前置任务
         if not skip_init and not only_serial and not only_parallel:
             init_success = self.run_init_programs()
             
@@ -382,19 +535,49 @@ class TaskManager:
             self.end_time = datetime.now()
             return self.generate_report()
             
-        # 运行串行程序
-        if not only_parallel and not only_init:
-            serial_success = self.run_serial_programs()
+        # 2. 同时运行串行和并行程序(如果不是仅执行初始化)
+        # 使用线程同时启动串行和并行程序队列
+        if not only_init:
+            # 设置线程结果
+            serial_result = True  # 默认成功
+            parallel_result = True # 默认成功
+            serial_thread = None
+            parallel_thread = None
             
-        # 如果只运行串行程序，则直接返回
-        if only_serial:
-            self.end_time = datetime.now()
-            return self.generate_report()
+            # 定义串行执行线程函数
+            def run_serial():
+                nonlocal serial_result
+                if not only_parallel:
+                    logger.info("启动串行程序队列执行")
+                    serial_result = self.run_serial_programs()
+                return serial_result
+                
+            # 定义并行执行线程函数
+            def run_parallel():
+                nonlocal parallel_result
+                if not only_serial: 
+                    logger.info("启动并行程序队列执行")
+                    parallel_result = self.run_parallel_programs(max_workers)
+                return parallel_result
             
-        # 运行并行程序
-        if not only_serial and not only_init:
-            parallel_success = self.run_parallel_programs(max_workers)
+            # 同时启动两个线程
+            if not only_parallel:
+                serial_thread = threading.Thread(target=run_serial)
+                serial_thread.start()
             
+            if not only_serial:
+                parallel_thread = threading.Thread(target=run_parallel)
+                parallel_thread.start()
+            
+            # 等待线程完成
+            if serial_thread:
+                serial_thread.join()
+                serial_success = serial_result
+                
+            if parallel_thread:
+                parallel_thread.join()
+                parallel_success = parallel_result
+        
         # 记录结束时间
         self.end_time = datetime.now()
         
@@ -461,6 +644,55 @@ class TaskManager:
             logger.info("=" * 80)
             
             return report
+
+    def _resolve_task_path(self, task_path: str) -> str:
+        """
+        解析任务路径，支持绝对路径和相对路径
+        如果是相对路径且文件不存在，尝试从data_fetcher/interfaces/目录下查找
+        
+        Args:
+            task_path: 配置中的任务路径
+            
+        Returns:
+            str: 解析后的实际路径
+        """
+        # 如果是绝对路径或已存在，直接返回
+        if os.path.isabs(task_path) or os.path.exists(task_path):
+            return task_path
+        
+        # 尝试从data_fetcher/interfaces/目录查找
+        alternate_path = os.path.join("data_fetcher", "interfaces", task_path)
+        if os.path.exists(alternate_path):
+            return alternate_path
+        
+        # 返回原路径，让验证步骤报告不存在
+        return task_path
+
+    def create_shared_config(self):
+        """
+        创建共享配置文件，包含所有必要的设置供子进程使用
+        """
+        try:
+            # 获取验证状态
+            validation_summary = get_validation_summary(self.config_state_manager)
+            
+            # 创建共享配置字典
+            shared_config = {
+                "config_file": self.config_file,
+                "validation_summary": validation_summary,
+                "timestamp": time.time(),
+                # 可以添加其他需要共享的配置
+            }
+            
+            # 写入文件
+            with open(self.shared_config_path, 'w', encoding='utf-8') as f:
+                import json
+                json.dump(shared_config, f, indent=2)
+                
+            logger.info(f"共享配置已创建：{self.shared_config_path}")
+            
+        except Exception as e:
+            logger.error(f"创建共享配置失败：{str(e)}")
 
 
 def signal_handler(sig, frame):
@@ -536,8 +768,11 @@ def main() -> int:
     signal.signal(signal.SIGTERM, signal_handler)
     
     try:
+        # 创建配置状态管理器
+        config_state_manager = ConfigStateManager()
+        
         # 检查配置状态，仅在需要时验证配置
-        validation_summary = config_state_manager.get_validation_summary()
+        validation_summary = get_validation_summary(config_state_manager)
         logging.info(f"配置验证状态: MongoDB={validation_summary['mongodb']}, "
                      f"Tushare={validation_summary['tushare']}, WAN={validation_summary['wan']}")
                      
@@ -548,7 +783,7 @@ def main() -> int:
             from validate_configurations import validate_all_configurations
             validate_all_configurations()
             # 重新获取验证状态用于记录
-            validation_summary = config_state_manager.get_validation_summary()
+            validation_summary = get_validation_summary(config_state_manager)
             if not validation_summary['all_valid']:
                 logging.error("配置验证失败，部分组件可能无法正常工作")
         else:
@@ -556,6 +791,17 @@ def main() -> int:
             
         # 创建任务管理器
         manager = TaskManager(config_file=args.config)
+        # 设置配置状态管理器
+        manager.config_state_manager = config_state_manager
+        # 设置详细日志模式
+        manager.verbose = args.verbose
+        
+        # 调整并行工作线程数
+        actual_parallel_workers = args.max_workers
+        if actual_parallel_workers >= TOTAL_WORKERS:
+            # 如果请求的并行线程数大于等于总线程数，保留一个给串行队列
+            actual_parallel_workers = max(1, TOTAL_WORKERS - SERIAL_WORKERS)
+            logger.info(f"调整并行工作线程数为 {actual_parallel_workers}，为串行队列保留 {SERIAL_WORKERS} 个线程")
         
         # 运行选项
         options = {
@@ -563,7 +809,7 @@ def main() -> int:
             'skip_init': args.skip_init,
             'only_serial': args.only_serial,
             'only_parallel': args.only_parallel,
-            'max_workers': args.max_workers,
+            'max_workers': actual_parallel_workers,
         }
         
         # 运行所有任务

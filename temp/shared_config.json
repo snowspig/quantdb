@@ -1,0 +1,10 @@
+{
+  "config_file": "tasks_config.yaml",
+  "validation_summary": {
+    "mongodb": true,
+    "tushare": true,
+    "wan": true,
+    "all_valid": true
+  },
+  "timestamp": 1744145115.8661227
+}
