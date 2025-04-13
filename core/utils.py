@@ -15,7 +15,11 @@ import calendar
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Union, Tuple, Set
+from typing import Dict, List, Tuple
+import socket
+import ipaddress
+from functools import wraps
+import multiprocessing
 
 # 设置日志
 logger = logging.getLogger("core.utils")
@@ -444,53 +448,66 @@ def list_files(directory: str, pattern: str = None, recursive: bool = False) -> 
         return []
 
 # 配置和性能相关函数
-def retry(times: int, exceptions=Exception, delay=0):
+def retry(max_attempts=3, delay=1.0, backoff=2.0, exceptions=(Exception,), logger=None):
     """
-    重试装饰器
-    
+    重试装饰器，用于自动重试可能失败的函数
+
     Args:
-        times: 重试次数
-        exceptions: 捕获的异常类型
-        delay: 重试间隔（秒）
-        
+        max_attempts: 最大尝试次数
+        delay: 初始延迟时间（秒）
+        backoff: 退避倍数，每次失败后延迟时间 = delay * (backoff ^ attempt)
+        exceptions: 需要重试的异常类型
+        logger: 日志记录器
+
     Returns:
-        装饰后的函数
+        装饰器函数
     """
     def decorator(func):
+        @wraps(func)
         def wrapper(*args, **kwargs):
-            attempt = 0
-            while attempt < times:
+            mtries, mdelay = max_attempts, delay
+            last_exception = None
+            for attempt in range(1, mtries + 1):
                 try:
                     return func(*args, **kwargs)
                 except exceptions as e:
-                    attempt += 1
-                    if attempt == times:
-                        raise e
-                    if delay > 0:
-                        time.sleep(delay)
+                    last_exception = e
+                    if logger:
+                        logger.warning(f"重试 {func.__name__}, 尝试 {attempt}/{mtries}, 发生异常: {e}")
+                    else:
+                        print(f"重试 {func.__name__}, 尝试 {attempt}/{mtries}, 发生异常: {e}")
+                    
+                    if attempt < mtries:
+                        time.sleep(mdelay)
+                        mdelay *= backoff
+                    else:
+                        if logger:
+                            logger.error(f"{func.__name__} 失败，已达到最大重试次数: {mtries}")
+                        else:
+                            print(f"{func.__name__} 失败，已达到最大重试次数: {mtries}")
+                        raise last_exception
+            return func(*args, **kwargs)
         return wrapper
     return decorator
 
-def timeit(method):
+def timeit(func):
     """
-    函数执行时间计时器装饰器
-    
+    计时装饰器，用于测量函数执行时间
+
     Args:
-        method: 被装饰的方法
-        
+        func: 要计时的函数
+
     Returns:
         装饰后的函数
     """
-    def timed(*args, **kw):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
         start_time = time.time()
-        result = method(*args, **kw)
+        result = func(*args, **kwargs)
         end_time = time.time()
-        
-        execution_time = end_time - start_time
-        logger.debug(f"{method.__name__} 执行用时: {execution_time:.2f} 秒")
-        
+        print(f"函数 {func.__name__} 执行时间: {end_time - start_time:.4f} 秒")
         return result
-    return timed
+    return wrapper
 
 def chunks(lst: List, n: int):
     """
@@ -506,18 +523,14 @@ def chunks(lst: List, n: int):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
-def get_cpu_count() -> int:
+def get_cpu_count():
     """
-    获取可用CPU核心数
-    
+    获取系统CPU核心数
+
     Returns:
         int: CPU核心数
     """
-    import os
-    try:
-        return os.cpu_count() or 4
-    except:
-        return 4
+    return multiprocessing.cpu_count()
 
 # JSON处理函数
 def load_json(file_path: str) -> Dict:
@@ -591,3 +604,108 @@ def is_numeric_string(text: str) -> bool:
         return True
     except:
         return False
+
+# 网络相关工具函数
+def is_valid_ip(ip_str):
+    """
+    检查字符串是否为有效的IP地址
+    
+    Args:
+        ip_str: IP地址字符串
+        
+    Returns:
+        bool: 是否为有效IP地址
+    """
+    try:
+        ipaddress.ip_address(ip_str)
+        return True
+    except ValueError:
+        return False
+
+def is_valid_ipv4(ip_str):
+    """
+    检查字符串是否为有效的IPv4地址
+    
+    Args:
+        ip_str: IP地址字符串
+        
+    Returns:
+        bool: 是否为有效IPv4地址
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return ip.version == 4
+    except ValueError:
+        return False
+
+def is_valid_ipv6(ip_str):
+    """
+    检查字符串是否为有效的IPv6地址
+    
+    Args:
+        ip_str: IP地址字符串
+        
+    Returns:
+        bool: 是否为有效IPv6地址
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return ip.version == 6
+    except ValueError:
+        return False
+
+def is_local_ip(ip_str):
+    """
+    检查IP地址是否为本地地址
+    
+    Args:
+        ip_str: IP地址字符串
+        
+    Returns:
+        bool: 是否为本地IP地址
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return ip.is_private or ip.is_loopback
+    except ValueError:
+        return False
+
+def get_local_ip():
+    """
+    获取本机IP地址
+    
+    Returns:
+        str: 本机IP地址
+    """
+    try:
+        # 通过向外部连接获取本机IP
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        # 备用方案，可能会返回127.0.0.1
+        return socket.gethostbyname(socket.gethostname())
+
+# 导出模块中的公共函数
+__all__ = [
+    # 日期相关
+    'get_current_date', 'get_last_trade_date', 'get_date_range',
+    'is_trade_date', 'get_trade_dates', 'date_to_str', 'str_to_date',
+    
+    # 文件操作
+    'ensure_dir', 'list_files', 'get_file_md5', 'load_json', 'save_json',
+    
+    # 字符串处理
+    'normalize_code', 'split_stock_code', 'remove_spaces', 'is_number',
+    
+    # 装饰器
+    'retry', 'timeit',
+    
+    # 系统相关
+    'get_cpu_count',
+    
+    # 网络相关
+    'is_valid_ip', 'is_valid_ipv4', 'is_valid_ipv6', 'is_local_ip', 'get_local_ip'
+]

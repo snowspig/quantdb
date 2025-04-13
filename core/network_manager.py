@@ -5,7 +5,6 @@
 负责管理多WAN口连接和网络请求分发
 """
 import os
-import sys
 import time
 import logging
 import random
@@ -14,17 +13,18 @@ import requests
 import threading
 import json
 import urllib.parse
-from typing import Dict, List, Any, Optional, Union, Tuple
+from typing import Dict, List, Optional
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from requests.exceptions import RequestException, ConnectionError, Timeout
+from requests.exceptions import RequestException
 
-# 导入配置管理器
-from .config_manager import config_manager
+# 导入配置管理器 - 统一使用绝对导入
+# from .config_manager import ConfigManager # 不再使用相对导入
+from core.config_manager import ConfigManager # 使用绝对导入
 
-# 导入WAN管理模块
-from .wan_manager import port_allocator, load_balancer, wan_monitor
+# 使用函数导入WAN管理模块组件，以避免模块级变量在导入时自动初始化
+from .wan_manager import get_port_allocator, get_load_balancer
 
 
 class NetworkManager:
@@ -51,89 +51,85 @@ class NetworkManager:
     
     def __init__(self):
         """初始化网络管理器"""
-        # 避免重复初始化
-        if getattr(self, '_initialized', False):
+        self.logger = logging.getLogger('core.NetworkManager')
+        
+        # 确保单例模式
+        if hasattr(NetworkManager, '_initialized') and NetworkManager._initialized:
             return
             
-        # 使用锁确保线程安全的初始化
-        with self.__class__._init_lock:
-            # 双重检查，避免在获取锁期间状态改变
-            if getattr(self, '_initialized', False):
-                return
-                
-            # 设置日志
-            self.logger = logging.getLogger("core.NetworkManager")
+        # 标记为已初始化
+        NetworkManager._initialized = True
+        
+        # 加载配置 - 获取实例并使用
+        try:
+            _config_manager = ConfigManager() # 获取单例实例
+            self.config = _config_manager.get_all_config()
+        except Exception as e:
+            self.logger.error(f"无法加载配置: {str(e)}")
+            self.config = {}
             
-            # 确保不重复添加处理器并设置日志级别
-            if self.logger.handlers:
-                # 如果已经有处理器，移除它们
-                for handler in self.logger.handlers[:]:
-                    self.logger.removeHandler(handler)
+        # 初始化网络组件
+        try:
+            # 初始化会话存储
+            self._sessions = {}
             
-            # 添加处理器
-            console_handler = logging.StreamHandler()
-            console_handler.setFormatter(logging.Formatter(
-                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-            ))
-            # 设置较高的日志级别，减少输出
-            console_handler.setLevel(logging.WARNING)
-            self.logger.addHandler(console_handler)
-            
-            # 设置日志级别
-            log_level = os.environ.get("QUANTDB_LOG_LEVEL", "INFO").upper()
-            self.logger.setLevel(getattr(logging, log_level, logging.INFO))
-            
-            # 防止日志传递到父记录器，避免重复
-            self.logger.propagate = False
-                
-            # 读取网络配置
-            self.wan_config = config_manager.get_wan_config()
-            
-            # 正确读取WAN启用状态
-            self.wan_enabled = self.wan_config.get('enabled', False)
-            
-            # 初始化WAN接口列表
-            self.interfaces = config_manager.get_wan_interfaces()
-            self.active_interfaces = []
-            
-            # 接口索引到内部ID的映射
-            self.interface_id_map = {}
-            
-            # 会话管理
-            self.sessions = {}
-            self.session_lock = threading.Lock()
-            self.session_counter = 0
-            
-            # 默认请求配置
-            self.default_timeout = self.wan_config.get('timeout', 30)
-            self.default_retries = self.wan_config.get('retries', 3)
-            self.backoff_factor = self.wan_config.get('backoff_factor', 0.3)
-            
-            # 添加请求锁，防止重复请求
-            self.request_locks = {}
-            
-            # 添加处理中请求集合
+            # 请求追踪
             self._processing_requests = set()
+            self._request_counter = 0
+            self._request_lock = threading.Lock()
             
-            # 启动WAN监控
-            if self.wan_enabled:
-                wan_monitor.start_monitoring()
+            # 请求ID与WAN口映射
+            self._request_wan_mapping = {}
             
             # 初始化WAN接口
             self._init_wan_interfaces()
-            
-            # 标记为已初始化
-            self._initialized = True
-            
-            self.logger.info(f"网络管理器初始化完成，多WAN口启用状态: {self.wan_enabled}")
+            self.logger.info("网络管理器初始化完成")
+        except Exception as e:
+            self.logger.error(f"网络管理器初始化失败: {str(e)}")
+            # 确保初始化失败时也有默认值
+            self.interfaces = []
+            self.wan_enabled = False
         
+        # 启动WAN监控
+        try:
+            # 导入WAN监控器，如果未初始化则通过访问get_wan_monitor触发延迟初始化
+            from core.wan_manager import get_wan_monitor
+            self.wan_monitor = get_wan_monitor()
+            
+            # 确保WAN监控器已启动
+            if self.wan_monitor:
+                try:
+                    self.wan_monitor.start_monitoring()
+                    self.logger.info("WAN监控器已启动")
+                except Exception as e:
+                    self.logger.warning(f"启动WAN监控器失败: {str(e)}")
+            else:
+                self.logger.warning("WAN监控器不可用")
+        except Exception as e:
+            self.logger.warning(f"获取WAN监控器失败: {str(e)}")
+            self.wan_monitor = None
+    
     def __del__(self):
-        """析构函数，停止监控"""
-        if hasattr(self, 'wan_enabled') and self.wan_enabled:
-            wan_monitor.stop_monitoring()
-        
+        """析构函数，在对象销毁时执行清理"""
+        try:
+            # 停止WAN监控
+            if hasattr(self, 'wan_monitor') and self.wan_monitor:
+                self.wan_monitor.stop_monitoring()
+        except:
+            pass
+    
     def _init_wan_interfaces(self):
         """初始化WAN接口"""
+        # 确保网络配置存在
+        network_config = self.config.get('network', {})
+        wan_config = network_config.get('wan', {})
+        
+        # 初始化WAN启用状态
+        self.wan_enabled = wan_config.get('enabled', False)
+        
+        # 获取配置的接口列表
+        self.interfaces = wan_config.get('interfaces', [])
+        
         if not self.wan_enabled:
             self.logger.debug("多WAN口功能未启用")
             return
@@ -157,8 +153,13 @@ class NetworkManager:
                 self.active_interfaces.append(interface)
                 
         # 更新负载均衡器的可用WAN列表
-        available_wan_idxs = [interface.get('wan_idx') for interface in self.active_interfaces]
-        load_balancer.update_available_wans(available_wan_idxs)
+        try:
+            available_wan_idxs = [interface.get('wan_idx') for interface in self.active_interfaces]
+            lb = get_load_balancer()
+            if lb:
+                lb.update_available_wans(available_wan_idxs)
+        except Exception as e:
+            self.logger.warning(f"更新负载均衡器失败: {str(e)}")
                 
         if self.active_interfaces:
             self.logger.info(f"已激活 {len(self.active_interfaces)}/{len(self.interfaces)} 个WAN接口")
@@ -200,10 +201,20 @@ class NetworkManager:
                 host = parsed_url.hostname
                 port = parsed_url.port or 80
                 
-                # 分配端口
-                local_port = port_allocator.allocate_port(wan_idx)
-                if not local_port:
-                    self.logger.warning(f"无法为接口 {interface_name} (WAN {wan_idx}) 分配本地端口")
+                # 尝试获取端口分配器
+                try:
+                    port_allocator = get_port_allocator()
+                    if not port_allocator:
+                        self.logger.warning(f"无法获取端口分配器，接口 {interface_name} 将被跳过")
+                        return False
+                        
+                    # 分配端口
+                    local_port = port_allocator.allocate_port(wan_idx)
+                    if not local_port:
+                        self.logger.warning(f"无法为接口 {interface_name} (WAN {wan_idx}) 分配本地端口")
+                        return False
+                except Exception as e:
+                    self.logger.warning(f"端口分配失败: {str(e)}")
                     return False
                 
                 # 创建socket
@@ -263,40 +274,17 @@ class NetworkManager:
                 finally:
                     sock.close()
                     # 释放端口
-                    port_allocator.release_port(wan_idx, local_port)
+                    try:
+                        if port_allocator and local_port:
+                            port_allocator.release_port(wan_idx, local_port)
+                    except Exception as e:
+                        self.logger.warning(f"释放端口失败: {str(e)}")
                     
             except Exception as e:
                 self.logger.warning(f"通过Socket测试接口 {interface_name} (WAN {wan_idx}) 失败: {str(e)}")
                 
-                # 回退到HTTP请求测试
-                self.logger.debug(f"尝试使用HTTP请求测试接口 {interface_name}")
-                
-                # 使用HTTP请求测试接口（用于兼容旧代码）
-                response = self.request('get', test_url, interface=interface, timeout=5)
-                
-                if not response or response.status_code != 200:
-                    self.logger.warning(f"接口 {interface_name} ({interface_ip}) HTTP测试失败，状态码: {response.status_code if response else 'N/A'}")
-                    return False
-                    
-                # 解析返回的JSON数据获取外部IP
-                try:
-                    data = response.json()
-                    external_ip = data.get('your_ip')
-                    
-                    if not external_ip:
-                        self.logger.warning(f"接口 {interface_name} ({interface_ip}) 无法获取外部IP")
-                        return False
-                        
-                    # 将外部IP保存到接口配置中，用于后续验证
-                    interface['external_ip'] = external_ip
-                    interface['last_verified'] = time.time()
-                    
-                    self.logger.info(f"接口 {interface_name} ({interface_ip}) 测试通过，外部IP: {external_ip}")
-                    return True
-                    
-                except ValueError:
-                    self.logger.warning(f"接口 {interface_name} ({interface_ip}) 返回的数据不是有效的JSON")
-                    return False
+                # 回退到HTTP请求测试（暂时禁用，避免循环依赖）
+                return False
                 
         except Exception as e:
             self.logger.warning(f"接口 {interface.get('name', 'unknown')} ({interface.get('source_ip', 'unknown')}) 不可用: {str(e)}")
@@ -385,13 +373,28 @@ class NetworkManager:
             return {}
             
         # 使用负载均衡器选择WAN接口
-        wan_idx = load_balancer.select_wan()
-        
-        if wan_idx == -1:
-            return {}
+        try:
+            lb = get_load_balancer()
+            if not lb:
+                # 如果负载均衡器不可用，随机选择接口
+                self.logger.warning("负载均衡器不可用，随机选择WAN接口")
+                if self.active_interfaces:
+                    return random.choice(self.active_interfaces)
+                return {}
+                
+            wan_idx = lb.select_wan()
             
-        # 根据WAN索引获取接口配置
-        return self._get_interface_by_wan_idx(wan_idx)
+            if wan_idx == -1:
+                return {}
+                
+            # 根据WAN索引获取接口配置
+            return self._get_interface_by_wan_idx(wan_idx)
+        except Exception as e:
+            self.logger.warning(f"获取平衡接口失败: {str(e)}")
+            # 如果有可用接口，随机选择一个
+            if self.active_interfaces:
+                return random.choice(self.active_interfaces)
+            return {}
         
     def create_session(self, name: str = None, interface: Dict = None, wan_idx: int = None,
                       retries: int = None, timeout: int = None) -> str:
@@ -591,7 +594,7 @@ class NetworkManager:
                         self.logger.debug(f"使用已设置的端口: {local_port}")
                     else:
                         # 分配端口
-                        local_port = port_allocator.allocate_port(selected_wan_idx)
+                        local_port = get_port_allocator().allocate_port(selected_wan_idx)
                         if not local_port:
                             self.logger.warning(f"无法为WAN {selected_wan_idx} 分配端口，回退到代理方式")
                         else:
@@ -684,7 +687,7 @@ class NetworkManager:
             
             # 如果请求成功且使用了负载均衡，记录成功
             if selected_wan_idx is not None and response and response.status_code == 200:
-                load_balancer.record_success(selected_wan_idx, request_time)
+                get_load_balancer().record_success(selected_wan_idx, request_time)
                 
             # 清理环境变量
             if 'LOCAL_BIND_PORT' in os.environ:
@@ -695,14 +698,14 @@ class NetworkManager:
         except RequestException as e:
             # 记录失败
             if selected_wan_idx is not None:
-                load_balancer.record_error(selected_wan_idx)
+                get_load_balancer().record_error(selected_wan_idx)
                 
             self.logger.error(f"请求失败: {url}, 方法: {method}, 错误: {str(e)}")
             return None
         finally:
             # 释放分配的端口，如果使用了端口绑定且是我们分配的
             if local_port and selected_wan_idx is not None:
-                port_allocator.release_port(selected_wan_idx, local_port)
+                get_port_allocator().release_port(selected_wan_idx, local_port)
                 
             # 清除环境变量
             if 'LOCAL_BIND_PORT' in os.environ:
@@ -787,7 +790,7 @@ class NetworkManager:
                 
         # 更新负载均衡器的可用WAN列表
         available_wan_idxs = [interface.get('wan_idx') for interface in self.active_interfaces]
-        load_balancer.update_available_wans(available_wan_idxs)
+        get_load_balancer().update_available_wans(available_wan_idxs)
         
         # 验证多WAN配置，但不输出日志
         multi_wan_valid = False
@@ -854,7 +857,7 @@ class NetworkManager:
             
         # 添加负载均衡器状态
         if self.wan_enabled:
-            result['load_balancer'] = load_balancer.get_stats()
+            result['load_balancer'] = get_load_balancer().get_stats()
             
         return result
         
@@ -1020,7 +1023,7 @@ class NetworkManager:
             port = parsed_url.port or 80
             
             # 分配端口
-            local_port = port_allocator.allocate_port(wan_idx)
+            local_port = get_port_allocator().allocate_port(wan_idx)
             if not local_port:
                 raise Exception(f"无法为WAN {wan_idx} 分配端口")
             
@@ -1139,7 +1142,7 @@ class NetworkManager:
                         
                         # 记录成功
                         if wan_idx is not None:
-                            load_balancer.record_success(wan_idx, elapsed)
+                            get_load_balancer().record_success(wan_idx, elapsed)
                             
                         # 获取外部IP
                         external_ip = data.get('your_ip')
@@ -1178,12 +1181,12 @@ class NetworkManager:
                     pass  # 忽略关闭错误
                 sock.close()
                 # 释放端口
-                port_allocator.release_port(wan_idx, local_port)
+                get_port_allocator().release_port(wan_idx, local_port)
                 
         except Exception as e:
             # 记录失败
             if wan_idx is not None:
-                load_balancer.record_error(wan_idx)
+                get_load_balancer().record_error(wan_idx)
                 
             self.logger.error(f"WAN {wan_idx} 请求异常: {str(e)}")
             return {
@@ -1252,7 +1255,7 @@ class NetworkManager:
                 
                 try:
                     # 获取本地端口
-                    local_port = port_allocator.allocate_port(wan_idx)
+                    local_port = get_port_allocator().allocate_port(wan_idx)
                     if not local_port:
                         self.logger.error(f"无法为WAN {wan_idx} 分配端口")
                         return {
@@ -1348,7 +1351,7 @@ class NetworkManager:
                         }
                     finally:
                         # 释放端口
-                        port_allocator.release_port(wan_idx, local_port)
+                        get_port_allocator().release_port(wan_idx, local_port)
                         
                         # 确保环境变量已清理
                         if 'LOCAL_BIND_PORT' in os.environ:
@@ -1641,7 +1644,7 @@ class NetworkManager:
                         
                         try:
                             # 分配本地端口
-                            local_port = port_allocator.allocate_port(wan_idx)
+                            local_port = get_port_allocator().allocate_port(wan_idx)
                             if not local_port:
                                 self.logger.error(f"无法为WAN {wan_idx} 分配端口，请求失败")
                                 return {
@@ -1687,7 +1690,7 @@ class NetworkManager:
                                     del os.environ['LOCAL_BIND_PORT']
                                     
                                 # 释放端口
-                                port_allocator.release_port(wan_idx, local_port)
+                                get_port_allocator().release_port(wan_idx, local_port)
                         except Exception as e:
                             elapsed = time.time() - start_req
                             self.logger.error(f"WAN {wan_idx} 请求 {api_name} 异常: {str(e)}")
@@ -1833,5 +1836,32 @@ class NetworkManager:
                 self._processing_requests.discard(request_id)
 
 
-# 创建全局网络管理器实例
-network_manager = NetworkManager()
+# 创建全局网络管理器实例函数
+def get_network_manager():
+    """获取网络管理器单例实例，如果不存在则创建"""
+    # 第一次导入模块时懒加载网络管理器
+    global _network_manager_instance
+    if _network_manager_instance is None:
+        try:
+            _network_manager_instance = NetworkManager()
+        except Exception as e:
+            logging.error(f"创建网络管理器失败: {str(e)}")
+            # 返回一个空壳实例，避免空引用错误
+            _network_manager_instance = EmptyNetworkManager()
+    return _network_manager_instance
+
+# 空壳网络管理器类，用于在创建实际网络管理器失败时返回
+class EmptyNetworkManager:
+    """网络管理器空壳，用于在创建实际网络管理器失败时返回"""
+    def __getattr__(self, name):
+        # 返回一个空函数，避免调用非存在方法时出错
+        def empty_func(*args, **kwargs):
+            return None
+        return empty_func
+
+# 全局实例变量
+_network_manager_instance = None
+
+# 向后兼容，在其他模块中可以通过network_manager直接访问实例
+# 但在导入时不会创建实例，只有在首次访问时才创建
+network_manager = get_network_manager()

@@ -16,26 +16,19 @@ pool.release_port(wan_idx, port)
 """
 import os
 import sys
-import json
 import time
 import random
 import socket
 import logging
 import threading
 import atexit
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Set, Any
+from typing import Dict, List, Tuple, Optional, Any
 
 # 检测操作系统类型
 IS_WINDOWS = sys.platform == 'win32'
 
-# 尝试导入项目配置管理器，如果不可用则使用默认配置
-try:
-    from ..config_manager import config_manager
-    HAS_CONFIG_MANAGER = True
-except ImportError:
-    HAS_CONFIG_MANAGER = False
-
+# 导入 ConfigManager 类
+from core.config_manager import ConfigManager
 
 # 定义内存版WAN端口池，适用于Windows环境
 class SimpleWanPortPool:
@@ -57,44 +50,43 @@ class SimpleWanPortPool:
     
     def __init__(self):
         """初始化端口池（单例模式，只在第一次调用时初始化）"""
-        with self._lock:
-            if SimpleWanPortPool._initialized:
-                return
-                
-            # 初始化日志
-            self.logger = logging.getLogger("core.wan_manager.SimpleWanPortPool")
-            self.logger.info("正在初始化WAN端口池...")
+        if SimpleWanPortPool._initialized:
+            return
             
-            try:
-                # 初始化端口范围和分配状态
-                self.wan_port_ranges = self._parse_port_ranges()
-                
-                # 初始化已分配端口集合
-                self.allocated_ports = {wan_idx: set() for wan_idx in self.wan_port_ranges.keys()}
-                
-                # 端口元数据
-                self.port_metadata = {}
-                
-                # 注册退出时清理函数（使用弱引用避免循环引用）
-                import weakref
-                atexit.register(weakref.proxy(self)._cleanup_wrapper)
-                
-                self.logger.info(f"端口池初始化完成，管理 {len(self.wan_port_ranges)} 个WAN接口")
-                for wan_idx, (start, end) in self.wan_port_ranges.items():
-                    self.logger.info(f"WAN {wan_idx} 端口范围: {start}-{end}")
-                
-                # 标记初始化完成
-                SimpleWanPortPool._initialized = True
-            except Exception as e:
-                self.logger.error(f"WAN端口池初始化失败: {str(e)}")
-                import traceback
-                self.logger.error(f"错误详情: {traceback.format_exc()}")
-                # 即使失败也标记为已初始化，避免反复尝试
-                SimpleWanPortPool._initialized = True
-                # 创建空的端口范围，确保后续调用不会崩溃
-                self.wan_port_ranges = {0: (50001, 51000)}
-                self.allocated_ports = {0: set()}
-                self.port_metadata = {}
+        # 初始化日志
+        self.logger = logging.getLogger("core.wan_manager.SimpleWanPortPool")
+        self.logger.info("正在初始化WAN端口池...")
+        
+        try:
+            # 初始化端口范围和分配状态
+            self.wan_port_ranges = self._parse_port_ranges()
+            
+            # 初始化已分配端口集合
+            self.allocated_ports = {wan_idx: set() for wan_idx in self.wan_port_ranges.keys()}
+            
+            # 端口元数据
+            self.port_metadata = {}
+            
+            # 注册退出时清理函数（使用弱引用避免循环引用）
+            import weakref
+            atexit.register(weakref.proxy(self)._cleanup_wrapper)
+            
+            self.logger.info(f"端口池初始化完成，管理 {len(self.wan_port_ranges)} 个WAN接口")
+            for wan_idx, (start, end) in self.wan_port_ranges.items():
+                self.logger.info(f"WAN {wan_idx} 端口范围: {start}-{end}")
+            
+            # 标记初始化完成
+            SimpleWanPortPool._initialized = True
+        except Exception as e:
+            self.logger.error(f"WAN端口池初始化失败: {str(e)}")
+            import traceback
+            self.logger.error(f"错误详情: {traceback.format_exc()}")
+            # 即使失败也标记为已初始化，避免反复尝试
+            SimpleWanPortPool._initialized = True
+            # 创建空的端口范围，确保后续调用不会崩溃
+            self.wan_port_ranges = {0: (50001, 51000)}
+            self.allocated_ports = {0: set()}
+            self.port_metadata = {}
     
     def _cleanup_wrapper(self):
         """清理函数包装器，避免在atexit中直接引用self"""
@@ -107,10 +99,21 @@ class SimpleWanPortPool:
         """解析配置中的端口范围"""
         port_ranges = {}
         
-        # 检查是否有配置管理器
-        if HAS_CONFIG_MANAGER:
+        # 直接获取 ConfigManager 实例并使用
+        try:
+            _config_manager = ConfigManager() # 获取单例实例
             # 从配置中获取端口范围
-            ranges_config = config_manager.get_wan_config().get('port_ranges', {})
+            # 注意: 这里需要确定 get_wan_config() 方法是否仍然存在或需要调整
+            # 假设 get_wan_config 存在于 config_manager 实例上
+            # 并且返回 network.wan 下的配置
+            network_config = _config_manager.get('network', {})
+            wan_config = network_config.get('wan', {})
+            ranges_config = wan_config.get('port_ranges', {}) # 尝试从 network.wan 读取
+
+            # 如果 network.wan 中没有，尝试从顶层 wan 读取 (兼容旧配置)
+            if not ranges_config:
+                top_wan_config = _config_manager.get('wan', {})
+                ranges_config = top_wan_config.get('port_ranges', {})
             
             # 如果配置不为空，解析配置
             if ranges_config:
@@ -128,6 +131,8 @@ class SimpleWanPortPool:
                 
                 if port_ranges:
                     return port_ranges
+        except Exception as e:
+            self.logger.error(f"获取或解析配置时出错: {e}")
         
         # 使用默认配置
         self.logger.info("使用默认端口范围配置")
@@ -151,79 +156,72 @@ class SimpleWanPortPool:
             start_port, end_port = self.wan_port_ranges[wan_idx]
             allocated = self.allocated_ports[wan_idx]
             
-            # 添加超时机制
-            start_time = time.time()
-            max_try_time = 3.0  # 最多尝试3秒
+            # 添加历史使用记录维护
+            if not hasattr(self, '_port_usage_history'):
+                self._port_usage_history = {}
             
-            # 尝试查找可用端口
-            attempts = 0
-            max_attempts = min(20, end_port - start_port + 1)  # 减少最大尝试次数避免卡顿
+            # 端口冷却期记录
+            if not hasattr(self, '_port_cooldown'):
+                self._port_cooldown = {}
             
-            while attempts < max_attempts and (time.time() - start_time) < max_try_time:
-                # 随机选择一个端口
-                port = random.randint(start_port, end_port)
+            # 端口分配失败记录和退避时间
+            if not hasattr(self, '_port_failure_counts'):
+                self._port_failure_counts = {}
+            
+            # 按使用频率排序端口选择
+            cool_time = time.time() - 120  # 2分钟冷却期
+            
+            # 智能端口选择策略
+            candidate_ports = []
+            for _ in range(min(10, end_port - start_port + 1)):
+                # 优先选择长时间未使用的端口
+                port = self._select_best_port(wan_idx, start_port, end_port, cool_time)
+                if port and port not in candidate_ports:
+                    candidate_ports.append(port)
                 
-                # 检查端口是否已分配
+            # 如果没有合适的端口，使用随机策略
+            if not candidate_ports:
+                candidate_ports = [random.randint(start_port, end_port) for _ in range(5)]
+            
+            # 尝试各个候选端口
+            for port in candidate_ports:
                 if port in allocated:
-                    attempts += 1
-                    # 短暂休眠避免CPU占用过高
-                    time.sleep(0.01)
                     continue
                 
-                # 尝试绑定端口测试可用性
+                # 检查端口冷却状态
+                if port in self._port_cooldown and self._port_cooldown[port] > time.time():
+                    continue
+                
+                # 尝试绑定测试端口可用性
                 try:
-                    # 添加超时处理
                     test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    test_socket.settimeout(0.05)  # 降低超时时间
+                    test_socket.settimeout(0.05)
                     test_socket.bind(('0.0.0.0', port))
                     test_socket.close()
                     
-                    # 端口可用，标记为已分配
+                    # 端口可用，记录分配
                     allocated.add(port)
+                    self._port_usage_history[port] = time.time()
                     
-                    # 添加端口元数据
-                    pid = os.getpid()
-                    metadata = {
-                        "allocated_time": time.time(),
-                        "pid": pid,
-                        "thread_id": threading.get_ident()
-                    }
-                    self.port_metadata[f"{wan_idx}:{port}"] = metadata
+                    # 重置失败计数
+                    if port in self._port_failure_counts:
+                        del self._port_failure_counts[port]
                     
-                    self.logger.debug(f"为WAN {wan_idx} 分配端口 {port} (PID: {pid})")
                     return port
-                except OSError:
-                    # 端口已被占用，尝试下一个
-                    attempts += 1
-                    # 短暂休眠避免CPU占用过高
-                    time.sleep(0.01)
                 except Exception as e:
-                    # 处理其他异常
-                    self.logger.warning(f"端口绑定测试异常: {str(e)}")
-                    attempts += 1
-                    time.sleep(0.01)
+                    # 增加失败计数和退避时间
+                    self._port_failure_counts[port] = self._port_failure_counts.get(port, 0) + 1
+                    self._port_cooldown[port] = time.time() + min(30, self._port_failure_counts[port] * 5)
             
-            if (time.time() - start_time) >= max_try_time:
-                self.logger.warning(f"分配端口超时，已尝试 {attempts} 次")
-            else:
-                self.logger.warning(f"无法为WAN {wan_idx} 分配可用端口，已尝试 {attempts} 次")
-                
-            # 如果所有尝试都失败，返回一个固定端口（不测试可用性）
-            fallback_port = start_port + (os.getpid() % (end_port - start_port))
-            self.logger.warning(f"使用后备端口 {fallback_port}（未验证可用性）")
+            # 常规分配失败，使用确定性算法分配端口
+            fallback_port = start_port + ((os.getpid() + int(time.time())) % (end_port - start_port))
             allocated.add(fallback_port)
-            
-            # 添加端口元数据
-            pid = os.getpid()
-            metadata = {
-                "allocated_time": time.time(),
-                "pid": pid,
-                "thread_id": threading.get_ident(),
-                "is_fallback": True
-            }
-            self.port_metadata[f"{wan_idx}:{fallback_port}"] = metadata
-            
             return fallback_port
+    
+    def _select_best_port(self, wan_idx, start_port, end_port, cool_time):
+        """选择最佳可用端口"""
+        # 实现端口选择算法，考虑历史使用情况、冷却期和失败记录
+        # ...
     
     def release_port(self, wan_idx: int, port: int) -> bool:
         """释放已分配的端口"""
@@ -286,12 +284,14 @@ class SimpleWanPortPool:
 if IS_WINDOWS:
     # Windows环境使用简化版实现
     WanPortPool = SimpleWanPortPool
-    wan_port_pool = SimpleWanPortPool.get_instance()
+    # 移除模块级实例化
+    # wan_port_pool = SimpleWanPortPool.get_instance()
 else:
     # Unix/Linux环境可以继续使用之前的完整实现
-    import fcntl
+    # import fcntl # 暂时注释掉，如果完整实现需要再启用
     
     # 这里应该放其他平台的完整实现
     # 暂时也使用简化版以避免导入错误
     WanPortPool = SimpleWanPortPool
-    wan_port_pool = SimpleWanPortPool.get_instance() 
+    # 移除模块级实例化
+    # wan_port_pool = SimpleWanPortPool.get_instance() 

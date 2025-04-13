@@ -14,8 +14,7 @@ import time
 import pandas as pd
 import pymongo
 import random
-from datetime import datetime, timedelta
-from typing import Dict, List, Set, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 from loguru import logger
 
@@ -25,7 +24,8 @@ project_root = current_dir.parent
 sys.path.append(str(project_root))
 
 # 导入平台核心模块
-from core import config_manager, mongodb_handler
+from core.config_manager import ConfigManager
+from core.mongodb_handler import MongoDBHandler
 from core.wan_manager import port_allocator
 from core.tushare_client_wan import TushareClientWAN
 
@@ -50,7 +50,8 @@ class TushareFetcher:
         interface_name: str = None,
         db_name: str = None,
         collection_name: str = None,
-        verbose: bool = False
+        verbose: bool = False,
+        mongo_handler_instance: Optional[MongoDBHandler] = None
     ):
         """
         初始化数据获取器
@@ -62,6 +63,7 @@ class TushareFetcher:
             db_name: MongoDB数据库名称，如果为None则从配置文件中读取
             collection_name: MongoDB集合名称
             verbose: 是否输出详细日志
+            mongo_handler_instance: 显式传入的 MongoDBHandler 实例
         """
         self.config_path = config_path
         self.interface_dir = interface_dir
@@ -74,11 +76,12 @@ class TushareFetcher:
         logger.remove()
         logger.add(sys.stderr, level=log_level, format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}")
         
-        # 加载配置
-        self.config = config_manager.get_all_config()
+        # 加载配置 - 获取实例并使用
+        _config_manager = ConfigManager() # 获取单例实例
+        self.config = _config_manager.get_all_config()
         self.interface_config = self._load_interface_config()
         
-        # 获取token和api_url - 从配置文件读取
+        # 获取token和api_url - 从配置中读取
         tushare_config = self.config.get("tushare", {})
         self.token = tushare_config.get("token", "")
         self.api_url = tushare_config.get("api_url", "")
@@ -102,10 +105,23 @@ class TushareFetcher:
         # 初始化Tushare客户端
         self.client = TushareClientWAN(token=self.token, api_url=self.api_url)
         
-        # 确保MongoDB连接初始化
-        if not mongodb_handler.is_connected():
+        # 获取或验证传入的 MongoDB handler
+        if mongo_handler_instance:
+            self.mongodb_handler = mongo_handler_instance
+            logger.info("使用传入的 MongoDB Handler 实例")
+        else:
+            logger.warning("未传入 MongoDB Handler 实例，尝试获取全局实例或初始化")
+            # 尝试获取全局实例（作为后备，但不推荐）
+            from core.mongodb_handler import init_mongodb_handler, mongodb_handler
+            self.mongodb_handler = mongodb_handler or init_mongodb_handler()
+        
+        # 确保 MongoDB 连接初始化 (使用 self.mongodb_handler)
+        if not self.mongodb_handler:
+            logger.error("无法获取或初始化 MongoDB Handler!")
+            sys.exit(1)
+        elif not self.mongodb_handler.is_connected():
             logger.info("初始化MongoDB连接...")
-            if mongodb_handler.connect():
+            if self.mongodb_handler.connect():
                 logger.info("MongoDB连接成功")
             else:
                 logger.error("连接MongoDB失败")
@@ -113,7 +129,7 @@ class TushareFetcher:
         else:
             logger.info("MongoDB已连接")
         
-        # 验证MongoDB连接和写入权限
+        # 验证 MongoDB 连接和写入权限 (使用 self.mongodb_handler)
         self._verify_mongodb_connection()
         
         # 记录可用字段和索引字段
@@ -121,16 +137,27 @@ class TushareFetcher:
         self.index_fields = self.interface_config.get("index_fields", [])
         
         # 检查多WAN口支持
-        wan_config = config_manager.get_wan_config()
-        self.port_allocator = port_allocator
+        # 获取实例并使用
+        wan_config = _config_manager.get_wan_config()
+        # self.port_allocator = port_allocator # 不再直接使用导入的实例
+        try:
+            from core.wan_manager import get_port_allocator # 改为使用 getter
+            self.port_allocator = get_port_allocator()
+        except ImportError as e:
+            logger.error(f"无法导入端口分配器: {e}")
+            self.port_allocator = None
         
         if wan_config.get("enabled", False):
-            available_indices = self.port_allocator.get_available_wan_indices()
-            wan_count = len(available_indices)
-            if wan_count > 0:
-                logger.info(f"已启用多WAN接口支持，WAN接口数量: {wan_count}")
+            # 检查 port_allocator 是否成功获取
+            if self.port_allocator:
+                available_indices = self.port_allocator.get_available_wan_indices()
+                wan_count = len(available_indices)
+                if wan_count > 0:
+                    logger.info(f"已启用多WAN接口支持，WAN接口数量: {wan_count}")
+                else:
+                    logger.warning("已启用多WAN接口支持，但未找到可用WAN接口")
             else:
-                logger.warning("已启用多WAN接口支持，但未找到可用WAN接口")
+                logger.warning("已启用多WAN接口支持，但无法获取端口分配器")
         else:
             logger.warning("未启用多WAN接口支持，将使用系统默认网络接口")
 
@@ -156,15 +183,14 @@ class TushareFetcher:
     def _verify_mongodb_connection(self):
         """验证MongoDB连接和写入权限"""
         try:
-            # 尝试ping命令来验证连接和权限
-            if mongodb_handler.is_connected():
-                db = mongodb_handler.get_database()
-                # 使用ping命令验证连接
+            # 使用 self.mongodb_handler
+            if self.mongodb_handler.is_connected():
+                db = self.mongodb_handler.get_database()
                 db.command('ping')
                 logger.debug(f"MongoDB连接和写入权限验证成功")
             else:
                 logger.warning("MongoDB未连接，尝试连接...")
-                if not mongodb_handler.connect():
+                if not self.mongodb_handler.connect():
                     logger.error("MongoDB连接失败")
         except Exception as e:
             logger.error(f"MongoDB连接或写入权限验证失败: {str(e)}")
@@ -259,10 +285,10 @@ class TushareFetcher:
             # 将DataFrame转换为记录列表
             records = df.to_dict('records')
             
-            # 确保MongoDB连接
-            if not mongodb_handler.is_connected():
+            # 确保MongoDB连接 (使用 self.mongodb_handler)
+            if not self.mongodb_handler.is_connected():
                 logger.warning("MongoDB未连接，尝试重新连接...")
-                if not mongodb_handler.connect():
+                if not self.mongodb_handler.connect():
                     logger.error("重新连接MongoDB失败")
                     return False
             
@@ -275,12 +301,12 @@ class TushareFetcher:
                 unique_keys = ["_id"]
             
             # 批量保存数据的统计信息
-            stats = {"inserted": 0, "updated": 0, "skipped": 0, "failed": 0}
+            stats = {"inserted": 0, "updated": 0, "skipped": 0, "failed": 0, "duplicate": 0}
             
             try:
                 start_time = time.time()
                 
-                # 查询现有记录
+                # 查询现有记录 (使用 self.mongodb_handler)
                 existing_records = []
                 query_conditions = []
                 
@@ -298,9 +324,9 @@ class TushareFetcher:
                     if valid and query:
                         query_conditions.append(query)
                 
-                # 如果有查询条件，获取现有记录
+                # 如果有查询条件，获取现有记录 (使用 self.mongodb_handler)
                 if query_conditions:
-                    existing_records = mongodb_handler.find_documents(
+                    existing_records = self.mongodb_handler.find_documents(
                         self.collection_name, 
                         {"$or": query_conditions}
                     )
@@ -354,25 +380,64 @@ class TushareFetcher:
                 
                 logger.info(f"处理统计: 新记录:{len(new_records)}条, 需更新:{len(update_operations)}条, 无变化跳过:{stats['skipped']}条")
                 
-                # 批量插入新记录
+                # 批量插入新记录 (使用 self.mongodb_handler)
                 if new_records:
                     try:
-                        # 使用mongodb_handler的批量插入方法
-                        result_ids = mongodb_handler.insert_many_documents(self.collection_name, new_records, ordered=False)
+                        result_ids = self.mongodb_handler.insert_many_documents(self.collection_name, new_records, ordered=False)
                         stats["inserted"] = len(result_ids)
                         logger.info(f"已批量插入 {stats['inserted']} 条新记录")
                     except pymongo.errors.BulkWriteError as e:
                         # 处理部分插入错误
+                        write_errors = e.details.get('writeErrors', [])
+                        duplicate_errors = sum(1 for err in write_errors if err.get('code') == 11000)
+                        
+                        # 记录重复键数量
+                        stats["duplicate"] = duplicate_errors
                         stats["inserted"] = e.details.get('nInserted', 0)
-                        failed = len(new_records) - stats["inserted"]
-                        stats["failed"] += failed
-                        logger.warning(f"批量插入过程中发生 {failed} 条记录写入失败")
+                        
+                        # 真正的错误（非重复键错误）
+                        true_failed = len(write_errors) - duplicate_errors
+                        stats["failed"] += true_failed
+                        
+                        if duplicate_errors > 0:
+                            logger.info(f"批量插入过程中有 {duplicate_errors} 条记录因为重复键被跳过")
+                            
+                            # 记录一些重复键信息以便调试
+                            if self.verbose and duplicate_errors > 0:
+                                dup_samples = [err.get('errmsg', '') for err in write_errors[:3] if err.get('code') == 11000]
+                                logger.debug(f"重复键错误示例: {dup_samples}")
+                                
+                        if true_failed > 0:
+                            logger.warning(f"批量插入过程中发生 {true_failed} 条记录真正的写入失败")
+                    except Exception as e:
+                        # 检查普通异常中是否包含重复键错误信息
+                        error_str = str(e)
+                        if "E11000 duplicate key error" in error_str:
+                            # 这是一个重复键错误，从错误消息中提取信息
+                            logger.info(f"批量插入过程中发生重复键错误")
+                            # 尝试估计重复键数量（可能不准确）
+                            stats["duplicate"] += 1  # 至少有一个重复
+                            
+                            # 尝试从错误消息中提取一些有用的信息
+                            if self.verbose:
+                                logger.debug(f"重复键错误详情: {error_str[:200]}...")
+                            
+                            # 假设部分记录可能已插入成功
+                            if "nInserted" in error_str:
+                                try:
+                                    n_inserted = int(error_str.split("nInserted\":")[1].split(",")[0].strip())
+                                    stats["inserted"] = n_inserted
+                                except:
+                                    stats["inserted"] = 0
+                        else:
+                            # 其他类型的错误
+                            logger.error(f"批量插入过程中发生错误: {error_str}")
+                            stats["failed"] += len(new_records)
                 
-                # 批量更新记录
+                # 批量更新记录 (使用 self.mongodb_handler)
                 if update_operations:
                     try:
-                        # 使用mongodb_handler的批量写入方法
-                        result = mongodb_handler.bulk_write(self.collection_name, update_operations, ordered=False)
+                        result = self.mongodb_handler.bulk_write(self.collection_name, update_operations, ordered=False)
                         # matched_count表示匹配的记录数，modified_count表示实际修改的记录数
                         matched = result.matched_count
                         modified = result.modified_count
@@ -386,14 +451,49 @@ class TushareFetcher:
                         logger.info(f"已批量更新 {stats['updated']} 条记录")
                     except pymongo.errors.BulkWriteError as e:
                         # 处理部分更新错误
+                        write_errors = e.details.get('writeErrors', [])
+                        duplicate_errors = sum(1 for err in write_errors if err.get('code') == 11000)
+                        
+                        # 记录重复键数量
+                        stats["duplicate"] += duplicate_errors
                         stats["updated"] = e.details.get('nModified', 0)
-                        failed = len(update_operations) - stats["updated"]
-                        stats["failed"] += failed
-                        logger.warning(f"批量更新过程中发生 {failed} 条记录更新失败")
+                        
+                        # 真正的错误（非重复键错误）
+                        true_failed = len(write_errors) - duplicate_errors
+                        stats["failed"] += true_failed
+                        
+                        if duplicate_errors > 0:
+                            logger.info(f"批量更新过程中有 {duplicate_errors} 条记录因为重复键被跳过")
+                        if true_failed > 0:
+                            logger.warning(f"批量更新过程中发生 {true_failed} 条记录真正的更新失败")
+                    except Exception as e:
+                        # 检查普通异常中是否包含重复键错误信息
+                        error_str = str(e)
+                        if "E11000 duplicate key error" in error_str:
+                            # 这是一个重复键错误，从错误消息中提取信息
+                            logger.info(f"批量更新过程中发生重复键错误")
+                            # 尝试估计重复键数量（可能不准确）
+                            stats["duplicate"] += 1  # 至少有一个重复
+                            
+                            # 尝试从错误消息中提取一些有用的信息
+                            if self.verbose:
+                                logger.debug(f"重复键错误详情: {error_str[:200]}...")
+                            
+                            # 假设部分记录可能已更新成功
+                            if "nModified" in error_str:
+                                try:
+                                    n_modified = int(error_str.split("nModified\":")[1].split(",")[0].strip())
+                                    stats["updated"] = n_modified
+                                except:
+                                    stats["updated"] = 0
+                        else:
+                            # 其他类型的错误
+                            logger.error(f"批量更新过程中发生错误: {error_str}")
+                            stats["failed"] += len(update_operations)
                 
-                # 验证是否有数据被实际写入
+                # 验证是否有数据被实际写入 (使用 self.mongodb_handler)
                 try:
-                    count = mongodb_handler.count_documents(self.collection_name, {})
+                    count = self.mongodb_handler.count_documents(self.collection_name, {})
                     logger.debug(f"查询到 {count} 条已存储的记录")
                     
                     # 记录操作耗时
@@ -407,7 +507,7 @@ class TushareFetcher:
                         if valid_records:
                             sample_record = random.choice(valid_records)
                             query = {key: sample_record[key] for key in unique_keys}
-                            found = mongodb_handler.find_document(self.collection_name, query)
+                            found = self.mongodb_handler.find_document(self.collection_name, query)
                             if found:
                                 logger.debug(f"验证写入成功：找到记录 {query}")
                             else:
@@ -419,28 +519,47 @@ class TushareFetcher:
                 logger.success(f"数据处理完成: 新插入 {stats['inserted']} 条记录，"
                               f"更新 {stats['updated']} 条记录，"
                               f"跳过 {stats['skipped']} 条记录，"
+                              f"重复 {stats['duplicate']} 条记录，"
                               f"失败 {stats['failed']} 条记录")
                 
-                # 如果没有错误发生，就认为操作成功，即使没有实际更新记录
+                # 如果没有真正错误发生，就认为操作成功，即使有重复键错误
                 if stats["failed"] == 0:
                     return True
                 # 如果有数据被插入或更新，也返回成功
                 elif stats["inserted"] > 0 or stats["updated"] > 0:
                     return True
+                # 如果只有重复键错误，也视为成功
+                elif stats["duplicate"] > 0 and stats["failed"] == 0:
+                    logger.info("只有重复键错误，视为成功操作")
+                    return True
                 else:
                     return False
                 
             except Exception as e:
-                logger.error(f"保存数据过程中出错: {str(e)}")
+                # 检查异常消息是否包含重复键错误
+                error_str = str(e)
+                if "E11000 duplicate key error" in error_str:
+                    logger.info(f"数据处理过程中发生重复键错误: {error_str[:100]}...")
+                    logger.info("包含重复键错误，视为非致命错误")
+                    return True  # 将重复键错误视为成功操作
+                else:
+                    logger.error(f"保存数据过程中出错: {str(e)}")
+                    import traceback
+                    logger.debug(f"详细错误信息: {traceback.format_exc()}")
+                    return False
+                
+        except Exception as e:
+            # 检查最上层异常是否包含重复键错误
+            error_str = str(e)
+            if "E11000 duplicate key error" in error_str:
+                logger.info(f"MongoDB操作过程中发生重复键错误: {error_str[:100]}...")
+                logger.info("包含重复键错误，视为非致命错误")
+                return True  # 将重复键错误视为成功操作
+            else:
+                logger.error(f"保存到MongoDB失败: {str(e)}")
                 import traceback
                 logger.debug(f"详细错误信息: {traceback.format_exc()}")
                 return False
-                
-        except Exception as e:
-            logger.error(f"保存到MongoDB失败: {str(e)}")
-            import traceback
-            logger.debug(f"详细错误信息: {traceback.format_exc()}")
-            return False
             
     def run(self) -> bool:
         """
@@ -490,25 +609,25 @@ class TushareFetcher:
             bool: 是否成功确保集合和索引
         """
         try:
-            # 确保MongoDB连接
-            if not mongodb_handler.is_connected():
+            # 确保MongoDB连接 (使用 self.mongodb_handler)
+            if not self.mongodb_handler.is_connected():
                 logger.info("MongoDB未连接，尝试连接...")
-                if not mongodb_handler.connect():
+                if not self.mongodb_handler.connect():
                     logger.error("连接MongoDB失败")
                     return False
                     
             logger.info(f"检查MongoDB集合 {self.collection_name} 是否存在")
             
-            # 使用collection_exists和create_collection方法
-            if not mongodb_handler.collection_exists(self.collection_name):
+            # 使用 self.mongodb_handler 的方法
+            if not self.mongodb_handler.collection_exists(self.collection_name):
                 logger.info(f"集合 {self.collection_name} 不存在，正在创建...")
-                mongodb_handler.create_collection(self.collection_name)
+                self.mongodb_handler.create_collection(self.collection_name)
                 logger.info(f"集合 {self.collection_name} 已成功创建")
             else:
                 logger.info(f"集合 {self.collection_name} 已存在")
             
-            # 检查并创建索引
-            collection = mongodb_handler.get_collection(self.collection_name)
+            # 检查并创建索引 (使用 self.mongodb_handler)
+            collection = self.mongodb_handler.get_collection(self.collection_name)
             if collection is None:
                 logger.error(f"无法获取集合: {self.collection_name}")
                 return False

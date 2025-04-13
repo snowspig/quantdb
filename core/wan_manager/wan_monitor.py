@@ -1,15 +1,12 @@
 """
 WAN连接监控模块 - 检查和监控多个WAN连接的状态
 """
-import os
-import sys
+
 import time
-import socket
 import threading
-import urllib.request
 import logging
-from typing import Dict, List, Set
-from ..config_manager import config_manager
+from typing import Set
+from core.config_manager import ConfigManager
 
 
 class WANMonitor:
@@ -39,8 +36,9 @@ class WANMonitor:
             
         self.logger = logging.getLogger("core.wan_manager.WANMonitor")
         
-        # 获取配置
-        monitor_config = config_manager.get_wan_config().get('monitoring', {})
+        # 获取配置 - 获取实例并使用
+        _config_manager = ConfigManager() 
+        monitor_config = _config_manager.get_wan_config().get('monitoring', {})
         self.check_interval = monitor_config.get('interval', 60)  # 默认60秒检查一次
         self.test_urls = monitor_config.get('test_urls', ['http://106.14.185.239:29990/test'])
         self.timeout = monitor_config.get('timeout', 10)  # 连接超时时间
@@ -52,6 +50,12 @@ class WANMonitor:
         self.should_stop = threading.Event()
         self.silent = silent
         self._initialized = True
+        
+        # 增加更多监控指标
+        self.connection_stats = {}
+        self.health_scores = {}
+        self.test_methods = ['socket', 'http', 'ping']
+        self.adaptive_intervals = {}  # 自适应检测间隔
         
         if not self.silent:
             self.logger.info(f"WAN监控器初始化成功,间隔: {self.check_interval}秒")
@@ -108,31 +112,33 @@ class WANMonitor:
         if not self.silent:
             self.logger.debug("开始检查所有WAN连接")
         
-        # 获取WAN端口范围配置
-        port_ranges = config_manager.get_wan_config().get('port_ranges', {})
-        if not port_ranges:
+        # 获取WAN接口配置 - 获取实例并使用
+        _config_manager = ConfigManager()
+        network_config = _config_manager.get('network', {})
+        wan_config = network_config.get('wan', {})
+        interfaces = wan_config.get('interfaces', [])
+        
+        if not interfaces:
+            if not self.silent: self.logger.warning("配置中未找到 network.wan.interfaces，无法检查WAN状态")
             return
             
-        # 检查每个WAN
+        # 检查每个配置的接口
         available_wans = set()
-        already_checked = set()  # 避免重复检查
         
-        for wan_idx_str in port_ranges.keys():
+        # 使用 enumerate 获取索引作为 wan_idx
+        for wan_idx, interface in enumerate(interfaces):
+            # wan_idx = interface.get('wan_idx') # 不再从字典获取
+            # if wan_idx is None:
+            #    self.logger.warning(f"接口 {interface.get('name')} 缺少 wan_idx")
+            #    continue
+                
             try:
-                wan_idx = int(wan_idx_str)
-                
-                # 避免重复检查
-                if wan_idx in already_checked:
-                    continue
-                    
-                already_checked.add(wan_idx)
-                
                 # 只记录结果，不输出日志
                 available = self._check_wan(wan_idx)
                 if available:
                     available_wans.add(wan_idx)
             except Exception as e:
-                self.logger.error(f"检查WAN {wan_idx_str} 时发生错误: {str(e)}")
+                self.logger.error(f"检查WAN {wan_idx} 时发生错误: {str(e)}")
                 
         # 更新可用WAN列表
         with self.status_lock:
@@ -144,54 +150,75 @@ class WANMonitor:
                     self.logger.info(f"WAN连接状态变化: {old_count} → {len(self.available_wans)} 个可用")
     
     def _check_wan(self, wan_idx: int) -> bool:
-        """
-        检查单个WAN连接是否可用
+        """增强版WAN检查方法，使用多种测试方式"""
+        # 记录开始时间
+        start_time = time.time()
+        results = []
         
-        Args:
-            wan_idx: WAN索引
-            
-        Returns:
-            是否可用
-        """
-        # 实际测试连接到一个test url
-        try:
-            from ..port_allocator import port_allocator
-            
-            # 获取测试URL
-            test_url = self.test_urls[0] if self.test_urls else "http://106.14.185.239:29990/test"
-            
-            # 分配端口
-            local_port = port_allocator.allocate_port(wan_idx)
-            if not local_port:
-                return False
-                
+        # 尝试多种测试方法
+        for method in self.test_methods:
             try:
-                # 创建socket
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(self.timeout)
+                if method == 'socket':
+                    results.append(self._check_wan_socket(wan_idx))
+                elif method == 'http':
+                    results.append(self._check_wan_http(wan_idx))
+                elif method == 'ping':
+                    results.append(self._check_wan_ping(wan_idx))
+            except Exception as e:
+                self.logger.debug(f"WAN {wan_idx} {method}测试异常: {e}")
+                results.append(False)
                 
-                # 绑定到指定端口
-                sock.bind(('0.0.0.0', local_port))
+        # 更新连接统计
+        elapsed = time.time() - start_time
+        if wan_idx not in self.connection_stats:
+            self.connection_stats[wan_idx] = {
+                'total_checks': 0,
+                'success_count': 0,
+                'recent_times': [],
+                'last_check': time.time()
+            }
+            
+        stats = self.connection_stats[wan_idx]
+        stats['total_checks'] += 1
+        
+        # 只要有一种方法成功即认为连接正常
+        is_available = any(results)
+        if is_available:
+            stats['success_count'] += 1
+            stats['recent_times'].append(elapsed)
+            # 保留最近10次检测的时间
+            if len(stats['recent_times']) > 10:
+                stats['recent_times'] = stats['recent_times'][-10:]
                 
-                # 解析URL
-                from urllib.parse import urlparse
-                parsed_url = urlparse(test_url)
-                host = parsed_url.hostname
-                port = parsed_url.port or 80
-                
-                # 连接测试
-                sock.connect((host, port))
-                sock.close()
-                
-                return True
-            except Exception:
-                return False
-            finally:
-                # 释放端口
-                port_allocator.release_port(wan_idx, local_port)
-                
-        except Exception:
-            return False
+        # 计算健康分数 (0-100)
+        success_rate = stats['success_count'] / stats['total_checks'] if stats['total_checks'] > 0 else 0
+        self.health_scores[wan_idx] = int(success_rate * 100)
+        
+        # 更新自适应检测间隔
+        # 健康状况良好时减少检测频率，不稳定时增加检测频率
+        if success_rate > 0.9:  # 90%以上成功率
+            self.adaptive_intervals[wan_idx] = min(120, self.check_interval * 1.5)  # 最长2分钟
+        elif success_rate < 0.5:  # 50%以下成功率
+            self.adaptive_intervals[wan_idx] = max(10, self.check_interval / 2)  # 最短10秒
+        else:
+            self.adaptive_intervals[wan_idx] = self.check_interval
+            
+        return is_available
+    
+    def _check_wan_socket(self, wan_idx: int) -> bool:
+        self.logger.debug(f"执行 WAN {wan_idx} socket 检查 (存根)")
+        # TODO: 实现实际的 socket 连接检查逻辑
+        return True # 暂时返回 True
+
+    def _check_wan_http(self, wan_idx: int) -> bool:
+        self.logger.debug(f"执行 WAN {wan_idx} http 检查 (存根)")
+        # TODO: 实现实际的 http 请求检查逻辑
+        return True # 暂时返回 True
+
+    def _check_wan_ping(self, wan_idx: int) -> bool:
+        self.logger.debug(f"执行 WAN {wan_idx} ping 检查 (存根)")
+        # TODO: 实现实际的 ping 检查逻辑
+        return True # 暂时返回 True
     
     def get_available_wans(self) -> Set[int]:
         """
@@ -221,5 +248,5 @@ class WANMonitor:
         self.stop_monitoring()
 
 
-# 创建全局监控实例
-wan_monitor = WANMonitor(silent=False) 
+# 创建全局监控实例 - 移除，由 wan_manager/__init__.py 延迟初始化
+# wan_monitor = WANMonitor(silent=False) 

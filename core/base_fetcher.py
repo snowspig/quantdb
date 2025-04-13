@@ -5,9 +5,7 @@
 为所有数据获取器提供统一的基类和基础功能
 """
 import os
-import sys
 import time
-import json
 import logging
 import threading
 import traceback
@@ -15,12 +13,11 @@ import pandas as pd
 import concurrent.futures
 from datetime import datetime, timedelta
 from abc import ABC, abstractmethod
-from typing import Dict, List, Any, Optional, Union, Tuple, Callable
+from typing import Dict, List, Any
 
 # 导入核心组件
 from .config_manager import config_manager
 from .mongodb_handler import mongodb_handler
-from .network_manager import network_manager
 
 class BaseFetcher(ABC):
     """

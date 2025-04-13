@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Tuple, Callable
 from collections import defaultdict
 import logging
 from enum import Enum
-from ..config_manager import config_manager
+from core.config_manager import ConfigManager
 
 
 class BalanceStrategy(Enum):
@@ -34,8 +34,9 @@ class LoadBalancer:
         self.logger = logging.getLogger("core.wan_manager.LoadBalancer")
         self.silent = silent
         
-        # 从配置中获取负载均衡设置
-        load_balancing = config_manager.get_wan_config().get('load_balancing', {})
+        # 从配置中获取负载均衡设置 - 获取实例并使用
+        _config_manager = ConfigManager()
+        load_balancing = _config_manager.get_wan_config().get('load_balancing', {})
         self.method = load_balancing.get('method', 'round_robin')
         
         # 初始化状态和统计信息
@@ -257,6 +258,55 @@ class LoadBalancer:
                 'stats': self.wan_stats
             }
 
+    def initialize(self):
+        """初始化负载均衡器状态"""
+        # 添加更多状态跟踪
+        self.response_times = {wan_idx: [] for wan_idx in self.available_wans}
+        self.failure_counts = {wan_idx: 0 for wan_idx in self.available_wans}
+        self.circuit_broken = {wan_idx: False for wan_idx in self.available_wans}
+        self.last_check_time = {wan_idx: 0 for wan_idx in self.available_wans}
+        self.method = 'adaptive'  # 使用自适应策略
+        
+    def _adaptive_selection(self) -> int:
+        """自适应负载均衡策略"""
+        # 计算每个WAN的得分 (响应时间越短，成功率越高，得分越高)
+        scores = {}
+        current_time = time.time()
+        
+        for wan_idx in self.available_wans:
+            # 检查是否处于熔断状态
+            if self.circuit_broken[wan_idx]:
+                # 定期尝试恢复熔断的连接
+                if current_time - self.last_check_time[wan_idx] > 60:  # 1分钟恢复检查
+                    self.circuit_broken[wan_idx] = False
+                else:
+                    scores[wan_idx] = 0
+                    continue
+                
+            # 计算最近的响应时间平均值
+            avg_time = 1.0  # 默认值
+            if self.response_times[wan_idx]:
+                # 只使用最近的5个响应时间
+                recent_times = self.response_times[wan_idx][-5:]
+                if recent_times:
+                    avg_time = sum(recent_times) / len(recent_times)
+                
+            # 计算成功率
+            total = self.wan_stats[wan_idx]['success_count'] + self.wan_stats[wan_idx]['error_count']
+            success_rate = 0.5  # 默认值
+            if total > 0:
+                success_rate = self.wan_stats[wan_idx]['success_count'] / total
+            
+            # 综合评分，响应时间反比，成功率正比
+            scores[wan_idx] = (success_rate * 0.7) + (1.0 / (avg_time + 0.1)) * 0.3
+        
+        # 选择得分最高的WAN
+        if not scores:
+            return self._round_robin()  # 回退到轮询
+        
+        best_wan = max(scores.items(), key=lambda x: x[1])[0]
+        return best_wan
 
-# 创建全局负载均衡器实例
-load_balancer = LoadBalancer(silent=False) 
+
+# 创建全局负载均衡器实例 - 移除，由 wan_manager/__init__.py 延迟初始化
+# load_balancer = LoadBalancer(silent=False) 

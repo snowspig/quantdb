@@ -84,4 +84,55 @@ port = pool.allocate_port(wan_idx=0)
 
 # 释放端口
 pool.release_port(wan_idx=0, port=port)
-``` 
+```
+
+# Windows网络优化工具
+
+## 简介
+
+该工具用于检测和优化Windows系统的TCP/IP设置，特别是对TIME_WAIT状态的持续时间进行优化，以减少端口复用时间，从而降低在高并发情况下的端口冲突问题。
+
+## 主要功能
+
+1. **检测当前TCP参数配置** - 检查并显示当前系统的TCP相关配置参数
+2. **提供优化建议** - 根据当前配置，提供针对性的优化建议
+3. **自动应用优化** - 在获得管理员权限的情况下，可以自动应用建议的优化配置
+4. **系统级优化** - 优化注册表中的TCP参数，如TIME_WAIT延迟、最大用户端口数等
+
+## 使用方法
+
+### 直接运行
+
+```
+python -m core.wan_manager.win_socket_optimizer
+```
+
+### 在代码中使用
+
+```python
+from core.wan_manager.win_socket_optimizer import generate_optimization_suggestions, print_optimization_guide
+
+# 获取优化建议
+suggestions = generate_optimization_suggestions()
+
+# 打印优化指南
+print_optimization_guide()
+```
+
+## 系统要求
+
+- Windows操作系统
+- 需要管理员权限才能应用优化设置
+
+## 注意事项
+
+1. 应用优化设置后，建议重启计算机以使更改完全生效
+2. 某些设置修改可能会对其他网络应用产生影响，请谨慎操作
+3. 如有网络问题，可以使用Windows自带的`netsh int ip reset`命令重置TCP/IP配置
+
+## 优化项目说明
+
+1. **TcpTimedWaitDelay**: 减少TIME_WAIT状态时间，默认值240秒，建议调整为30秒
+2. **MaxUserPort**: 增加可用的用户端口范围，建议设置为65534（最大值）
+3. **TCP自动调谐**: 启用TCP自动调谐功能，提高网络性能
+4. **TcpFinWait2Delay**: 优化TCP连接释放速度 

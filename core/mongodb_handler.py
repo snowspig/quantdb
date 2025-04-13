@@ -7,10 +7,8 @@ MongoDB处理器模块
 import pymongo
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError, OperationFailure
 import yaml
-import os
 import time
 import logging
-from typing import Dict, Any, Optional
 from urllib.parse import quote_plus
 
 
@@ -280,15 +278,33 @@ class MongoDBHandler:
             pymongo.results.InsertManyResult: 插入结果
             
         Raises:
-            Exception: 如果插入失败
+            pymongo.errors.BulkWriteError: 如果批量写入过程中有错误
+            Exception: 如果有其他插入失败
         """
         try:
             collection = self.get_collection(collection_name)
             result = collection.insert_many(documents, ordered=ordered)
             return result.inserted_ids
+        except pymongo.errors.BulkWriteError as e:
+            # 保留原始的BulkWriteError异常，添加日志
+            self.logger.warning(f"批量插入文档过程中发生错误: {str(e)}")
+            
+            # 判断是否包含重复键错误
+            if "E11000 duplicate key error" in str(e):
+                write_errors = e.details.get('writeErrors', [])
+                duplicate_errors = sum(1 for err in write_errors if err.get('code') == 11000)
+                self.logger.info(f"包含{duplicate_errors}个重复键错误，非致命错误")
+                
+                # 记录一些错误样例
+                if duplicate_errors > 0:
+                    sample_errors = [err.get('errmsg', '') for err in write_errors[:3] if err.get('code') == 11000]
+                    self.logger.debug(f"重复键错误示例: {sample_errors}")
+            
+            # 直接抛出原始异常，不重新包装
+            raise
         except Exception as e:
             self.logger.error(f"批量插入文档失败: {str(e)}")
-            raise Exception(f"批量插入文档失败: {str(e)}")
+            raise
 
     def find_document(self, collection_name, query):
         """查找单个文档
@@ -542,15 +558,33 @@ class MongoDBHandler:
             pymongo.results.BulkWriteResult: 批量写入结果
             
         Raises:
+            pymongo.errors.BulkWriteError: 如果批量写入过程中有错误
             Exception: 如果批量写入失败
         """
         try:
             collection = self.get_collection(collection_name)
             result = collection.bulk_write(operations, ordered=ordered)
             return result
+        except pymongo.errors.BulkWriteError as e:
+            # 保留原始的BulkWriteError异常，添加日志
+            self.logger.warning(f"批量写入操作过程中发生错误: {str(e)}")
+            
+            # 判断是否包含重复键错误
+            if "E11000 duplicate key error" in str(e):
+                write_errors = e.details.get('writeErrors', [])
+                duplicate_errors = sum(1 for err in write_errors if err.get('code') == 11000)
+                self.logger.info(f"包含{duplicate_errors}个重复键错误，非致命错误")
+                
+                # 记录一些错误样例
+                if duplicate_errors > 0:
+                    sample_errors = [err.get('errmsg', '') for err in write_errors[:3] if err.get('code') == 11000]
+                    self.logger.debug(f"重复键错误示例: {sample_errors}")
+            
+            # 直接抛出原始异常，不重新包装
+            raise
         except Exception as e:
             self.logger.error(f"批量写入操作失败: {str(e)}")
-            raise Exception(f"批量写入操作失败: {str(e)}")
+            raise
             
     def create_collection(self, collection_name, **options):
         """创建集合
@@ -672,5 +706,5 @@ def init_mongodb_handler(config_path="config/config.yaml"):
     return mongodb_handler
 
 
-# 自动初始化全局实例
-init_mongodb_handler()
+# 自动初始化全局实例 - 移除或注释掉，避免在导入时自动连接
+# init_mongodb_handler()
