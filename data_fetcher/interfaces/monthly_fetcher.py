@@ -439,6 +439,9 @@ class monthlyFetcher(TushareFetcher):
             params['start_date'] = start_date
         if end_date:
             params['end_date'] = end_date
+            
+        # 添加limit参数，确保能获取足够的数据（最多10000条）
+        params['limit'] = 10000
         
         # 参数检查：现在至少需要 trade_date 或 start_date+end_date
         if not (trade_date or (start_date and end_date) or ts_code):
@@ -467,6 +470,14 @@ class monthlyFetcher(TushareFetcher):
                 params=params,
                 wan_idx=wan_idx # 传递 wan_idx
             )
+            
+            # 记录实际返回的数据量
+            if result is not None and not result.empty:
+                logger.info(f"API返回数据：{len(result)}条记录")
+                # 检查是否达到了限制
+                if len(result) >= 9900:  # 接近10000条的上限
+                    logger.warning(f"返回记录数接近limit上限(10000)，可能有数据被截断")
+            
             return result
         except Exception as e:
             # 添加更详细的日志，包括 wan_idx
@@ -979,6 +990,12 @@ class monthlyFetcher(TushareFetcher):
                             if not success:
                                 logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
                                 all_success = False
+                    
+                    # 在full模式下，添加随机等待时间避免请求过快
+                    if self.full_mode:
+                        wait_time = random.uniform(2, 5)
+                        logger.info(f"完整模式下添加随机等待: {wait_time:.2f}秒")
+                        time.sleep(wait_time)
                 except Exception as e:
                     logger.error(f"处理股票 {ts_code} 时发生异常: {str(e)}")
                     all_success = False
@@ -1024,7 +1041,6 @@ class monthlyFetcher(TushareFetcher):
                 wan_success = True
                 success_count = 0
                 
-                # 直接在每次fetch_stock_data调用时传递wan_idx参数，不使用lambda替换
                 # 逐个处理该WAN口的所有股票
                 for ts_code in stocks:
                     # 检查是否收到停止信号
@@ -1034,7 +1050,7 @@ class monthlyFetcher(TushareFetcher):
                         
                     try:
                         # 打印正在处理的股票代码
-                        logger.info(f"WAN口 {wan_idx} 正在处理股票: {ts_code}")  # 添加这一行，显示正在处理的股票代码
+                        logger.info(f"WAN口 {wan_idx} 正在处理股票: {ts_code}")
                         
                         # 获取单个股票数据，直接传递wan_idx参数
                         df = self.fetch_data(ts_code=ts_code, wan_idx=wan_idx)
@@ -1056,6 +1072,13 @@ class monthlyFetcher(TushareFetcher):
                         else:
                             logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
                             wan_success = False
+                            
+                        # 在full模式下，添加随机等待时间避免请求过快
+                        if self.full_mode:
+                            wait_time = random.uniform(2, 5)
+                            logger.info(f"WAN口 {wan_idx} 完整模式下添加随机等待: {wait_time:.2f}秒")
+                            time.sleep(wait_time)
+                        
                     except Exception as e:
                         logger.error(f"WAN口 {wan_idx} 处理股票 {ts_code} 时发生异常: {str(e)}")
                         wan_success = False
@@ -1382,8 +1405,16 @@ class monthlyFetcher(TushareFetcher):
                         if retries >= max_retries:
                             # 在最后一次尝试，记录错误详情
                             logger.error(f"批量写入失败: {bwe.details}")
+                            # 检查是否有重复键错误
+                            if 'writeErrors' in bwe.details:
+                                for error in bwe.details.get('writeErrors', []):
+                                    if error.get('code') == 11000:  # 重复键错误
+                                        logger.debug(f"重复键错误: {error.get('errmsg', '')}")
                             return False
-                        time.sleep(1)  # 重试前等待
+                        # full模式下增加重试等待时间
+                        wait_time = random.uniform(2, 5) if self.full_mode else 1
+                        logger.info(f"等待 {wait_time:.2f} 秒后重试...")
+                        time.sleep(wait_time)  # 重试前等待
                         
                     except Exception as e:
                         retries += 1
@@ -1391,7 +1422,10 @@ class monthlyFetcher(TushareFetcher):
                         if retries >= max_retries:
                             logger.error(f"批次 {i//chunk_size + 1} 处理失败，已达到最大重试次数")
                             return False
-                        time.sleep(1)  # 重试前等待
+                        # full模式下增加重试等待时间
+                        wait_time = random.uniform(2, 5) if self.full_mode else 1
+                        logger.info(f"等待 {wait_time:.2f} 秒后重试...")
+                        time.sleep(wait_time)  # 重试前等待
             
             # 记录最终结果
             logger.success(

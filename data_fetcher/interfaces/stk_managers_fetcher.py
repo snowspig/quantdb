@@ -1,19 +1,19 @@
 #!/usr/bin/env python
 """
-previous_name Fetcher V2 - 获取中国A股证券曾用名并保存到MongoDB
+stk_managers Basic Fetcher V2 - 获取日线基本数据并保存到MongoDB
 
-该脚本用于从湘财Tushare获取中国A股证券曾用名，并保存到MongoDB数据库中
+该脚本用于从湘财Tushare获取日线基本数据，并保存到MongoDB数据库中
 该版本继承TushareFetcher基类，实现了与stock_basic_fetcher相同的架构和功能
 
 参考接口文档：http://tushare.xcsc.com:7173/document/2?doc_id=26
 
 使用方法：
-    python previous_name_fetcher.py                   # 使用湘财真实API数据，简洁日志模式，获取近期数据
-    python previous_name_fetcher.py --verbose         # 使用湘财真实API数据，详细日志模式
-    python previous_name_fetcher.py --start-date 20200101 --end-date 20231231  # 指定日期范围
-    python previous_name_fetcher.py --exchange SZSE   # 获取深交所的日线数据
-    python previous_name_fetcher.py --serial          # 使用串行模式处理数据（默认为并行模式）
-    python previous_name_fetcher.py --full            # 使用完整模式，按股票代码列表获取所有股票的基本数据
+    python stk_managers_fetcher.py                   # 使用湘财真实API数据，简洁日志模式，获取近期数据
+    python stk_managers_fetcher.py --verbose         # 使用湘财真实API数据，详细日志模式
+    python stk_managers_fetcher.py --start-date 20200101 --end-date 20231231  # 指定日期范围
+    python stk_managers_fetcher.py --exchange SZSE   # 获取深交所的日线数据
+    python stk_managers_fetcher.py --serial          # 使用串行模式处理数据（默认为并行模式）
+    python stk_managers_fetcher.py --full            # 使用完整模式，按股票代码列表获取所有股票的基本数据
 """
 import sys
 import time
@@ -123,11 +123,11 @@ def get_validation_status(shared_config: Dict[str, Any]) -> Dict[str, bool]:
     validation_summary = shared_config.get("validation_summary", {})
     return validation_summary
 
-class previous_nameFetcher(TushareFetcher):
+class stk_managersFetcher(TushareFetcher):
     """
-    中国A股证券曾用名获取器V2
+    日线基本数据获取器V2
     
-    该类用于从Tushare获取中国A股证券曾用名并保存到MongoDB数据库
+    该类用于从Tushare获取日线基本数据并保存到MongoDB数据库
     使用TushareFetcher基类提供的通用功能
     支持串行和并行两种处理模式
     支持按日期和按股票代码两种抓取模式
@@ -137,9 +137,9 @@ class previous_nameFetcher(TushareFetcher):
         self,
         config_path: str = "config/config.yaml",
         interface_dir: str = "config/interfaces",
-        interface_name: str = "previous_name.json",
+        interface_name: str = "stk_managers.json",
         db_name: str = None,
-        collection_name: str = "previous_name",
+        collection_name: str = "stk_managers",
         start_date: str = None,
         end_date: str = None,
         exchange: str = "SSE",  # 默认上交所
@@ -152,7 +152,7 @@ class previous_nameFetcher(TushareFetcher):
         mongo_handler_instance: Optional[MongoDBHandler] = None # 新增参数
     ):
         """
-        初始化中国A股证券曾用名获取器
+        初始化日线基本数据获取器
         
         Args:
             config_path: 配置文件路径
@@ -290,7 +290,7 @@ class previous_nameFetcher(TushareFetcher):
         if self.full_mode:
             logger.info("抓取模式: 完整模式(按股票代码)，将抓取所有历史数据而不限制日期范围")
         else:
-            logger.info(f"抓取模式: 日期模式(按交易日)，日期范围: {self.start_date} - {self.end_date}")
+            logger.info(f"抓取模式: 日期模式(按公告日期)，日期范围: {self.start_date} - {self.end_date}")
         
         # 添加类型停止标志
         self.stop_processing = False
@@ -380,13 +380,12 @@ class previous_nameFetcher(TushareFetcher):
     
     def fetch_data(self, **kwargs) -> Optional[pd.DataFrame]:
         """
-        从Tushare获取日线数据
+        从Tushare获取公司管理层数据
         
         Args:
             **kwargs: 查询参数，包括：
                 ts_code: 股票代码
-                trade_date: 交易日期（内部会映射为begin_date使用）
-                begin_date: 起始日期
+                ann_date: 公告日期
                 start_date: 开始日期
                 end_date: 结束日期
                 wan_idx: 指定WAN口索引，可选
@@ -396,8 +395,7 @@ class previous_nameFetcher(TushareFetcher):
             返回DataFrame或者None（如果出错）
         """
         ts_code = kwargs.get('ts_code')
-        trade_date = kwargs.get('trade_date')
-        begin_date = kwargs.get('begin_date')
+        ann_date = kwargs.get('ann_date')
         start_date = kwargs.get('start_date')
         end_date = kwargs.get('end_date')
         
@@ -411,26 +409,16 @@ class previous_nameFetcher(TushareFetcher):
         params = {}
         if ts_code:
             params['ts_code'] = ts_code
-        
-        # 重要：如果提供了trade_date但没有提供begin_date，则将trade_date的值用作begin_date
-        if trade_date and not begin_date:
-            params['begin_date'] = trade_date
-            logger.debug(f"将trade_date参数值 {trade_date} 映射为begin_date参数")
-        elif begin_date:
-            params['begin_date'] = begin_date
-            
-        # 保留原有的trade_date，如果API需要的话
-        if trade_date:
-            params['trade_date'] = trade_date
-            
+        if ann_date:
+            params['ann_date'] = ann_date
         if start_date:
             params['start_date'] = start_date
         if end_date:
             params['end_date'] = end_date
         
-        # 参数检查：现在至少需要 begin_date 或 trade_date 或 start_date+end_date
-        if not (begin_date or trade_date or (start_date and end_date) or ts_code):
-            logger.error("必须提供 ts_code、trade_date/begin_date 或 start_date+end_date")
+        # 参数检查：现在至少需要 ann_date 或 start_date+end_date 或 ts_code
+        if not (ann_date or (start_date and end_date) or ts_code):
+            logger.error("必须提供 ts_code、ann_date 或 start_date+end_date")
             return None
         
         # 设置WAN接口参数
@@ -451,7 +439,7 @@ class previous_nameFetcher(TushareFetcher):
             
             # 调用 self.client.get_data，并传递 wan_idx
             result = self.client.get_data(
-                api_name='previous_name', 
+                api_name='stk_managers', 
                 params=params,
                 wan_idx=wan_idx # 传递 wan_idx
             )
@@ -466,12 +454,12 @@ class previous_nameFetcher(TushareFetcher):
     
     def process_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        处理获取的中国A股证券曾用名
+        处理获取的日线基本数据
         只保留股票代码前两位为00、30、60、68的数据
         但在full模式下直接返回原始数据，不进行过滤
         
         Args:
-            df: 原始中国A股证券曾用名
+            df: 原始日线基本数据
             
         Returns:
             处理后的数据
@@ -584,26 +572,82 @@ class previous_nameFetcher(TushareFetcher):
         logger.info(f"生成日期范围内的所有日期，共 {len(all_dates)} 个日期")
         return all_dates
     
-    def fetch_previous_name_data(self, trade_date: str) -> Optional[pd.DataFrame]:
+    def fetch_stk_managers_data(self, ann_date: str) -> Optional[pd.DataFrame]:
         """
-        获取指定交易日的除权除息数据（内部将trade_date映射为begin_date使用）
+        获取指定公告日期的管理层数据
         
         Args:
-            trade_date: 交易日期，格式为YYYYMMDD（内部将作为begin_date使用）
+            ann_date: 公告日期，格式为YYYYMMDD
             
         Returns:
-            指定日期的除权除息数据，如果失败则返回None
+            指定公告日期的管理层数据，如果失败则返回None
         """
-        logger.info(f"正在获取交易日 {trade_date} 的除权除息数据...")
-        # 将trade_date作为begin_date参数传递
-        return self.fetch_data(trade_date=trade_date)
+        logger.info(f"正在获取公告日期 {ann_date} 的管理层数据 (所有交易所)...")
+        # 调用 fetch_data 时传递 ann_date 参数
+        return self.fetch_data(ann_date=ann_date)
     
-    def _process_date_with_wan(self, trade_date: str, wan_idx: int) -> bool:
+    def _process_date_with_wan_no_lock(self, ann_date: str, wan_idx: int) -> bool:
         """
-        使用指定的WAN口处理单个交易日数据
+        使用指定的WAN口处理单个公告日期数据，不获取锁（由调用者控制锁）
         
         Args:
-            trade_date: 交易日期
+            ann_date: 公告日期
+            wan_idx: 要使用的WAN口索引
+            
+        Returns:
+            是否成功
+        """
+        logger.info(f"WAN口 {wan_idx} 处理公告日期 {ann_date}")
+        
+        success = False
+        df = None
+        
+        try:
+            # 获取单日数据 - 直接传递 wan_idx 给 fetch_data
+            df = self.fetch_data(ann_date=ann_date, wan_idx=wan_idx)
+            if df is None or df.empty:
+                logger.warning(f"公告日期 {ann_date} 的数据为空或获取失败")
+                return False
+            
+            # 处理数据
+            processed_df = self.process_data(df)
+            if processed_df is None or processed_df.empty:
+                logger.warning(f"公告日期 {ann_date} 的处理后数据为空")
+                return False
+            
+            # 保存单日数据到MongoDB
+            if not self.mongodb_handler.is_connected():
+                logger.warning("MongoDB未连接，尝试连接...")
+                if not self.mongodb_handler.connect():
+                    logger.error("连接MongoDB失败")
+                    # 添加到结果队列，供后续处理
+                    self.result_queue.put((ann_date, processed_df))
+                    return False
+                    
+            # 保存到MongoDB
+            success = self.save_to_mongodb(processed_df)
+            if success:
+                logger.success(f"公告日期 {ann_date} 的数据已保存到MongoDB")
+            else:
+                logger.error(f"保存公告日期 {ann_date} 的数据到MongoDB失败")
+                # 添加到结果队列，供后续处理
+                self.result_queue.put((ann_date, processed_df))
+        except Exception as e:
+            logger.error(f"处理公告日期 {ann_date} 时发生异常: {str(e)}")
+            # 如果有数据但处理失败，添加到结果队列
+            if df is not None and not df.empty:
+                processed_df = self.process_data(df)
+                if processed_df is not None and not processed_df.empty:
+                    self.result_queue.put((ann_date, processed_df))
+        
+        return success
+    
+    def _process_date_with_wan(self, ann_date: str, wan_idx: int) -> bool:
+        """
+        使用指定的WAN口处理单个公告日期数据
+        
+        Args:
+            ann_date: 公告日期
             wan_idx: 要使用的WAN口索引
             
         Returns:
@@ -614,7 +658,7 @@ class previous_nameFetcher(TushareFetcher):
             logger.warning(f"WAN口索引 {wan_idx} 无效或不可用，尝试使用默认处理")
             # 尝试使用默认处理方式
             try:
-                df = self.fetch_previous_name_data(trade_date)
+                df = self.fetch_stk_managers_data(ann_date)
                 if df is None or df.empty:
                     return False
                 
@@ -624,89 +668,33 @@ class previous_nameFetcher(TushareFetcher):
                 
                 success = self.save_to_mongodb(processed_df)
                 if not success:
-                    self.result_queue.put((trade_date, processed_df))
+                    self.result_queue.put((ann_date, processed_df))
                 
                 return success
             except Exception as e:
-                logger.error(f"默认处理交易日 {trade_date} 的除权除息数据时发生异常: {str(e)}")
+                logger.error(f"默认处理公告日期 {ann_date} 时发生异常: {str(e)}")
                 return False
         
-        logger.info(f"线程使用WAN口 {wan_idx} 处理交易日 {trade_date} 的除权除息数据")
+        logger.info(f"线程使用WAN口 {wan_idx} 处理公告日期 {ann_date}")
         
         # 获取WAN口锁
         if not self.wan_locks[wan_idx].acquire(timeout=5):
-            logger.warning(f"无法获取WAN口 {wan_idx} 的锁，跳过处理交易日 {trade_date}")
+            logger.warning(f"无法获取WAN口 {wan_idx} 的锁，跳过处理公告日期 {ann_date}")
             return False
         
         try:
-            return self._process_date_with_wan_no_lock(trade_date, wan_idx)
+            return self._process_date_with_wan_no_lock(ann_date, wan_idx)
         finally:
             # 释放WAN口锁
             self.wan_locks[wan_idx].release()
             logger.debug(f"释放WAN口 {wan_idx} 的锁")
     
-    def _process_date_with_wan_no_lock(self, trade_date: str, wan_idx: int) -> bool:
+    def _process_date_parallel(self, ann_dates: List[str]) -> bool:
         """
-        使用指定的WAN口处理单个交易日数据，不获取锁（由调用者控制锁）
+        并行处理多个公告日期数据
         
         Args:
-            trade_date: 交易日期
-            wan_idx: 要使用的WAN口索引
-            
-        Returns:
-            是否成功
-        """
-        logger.info(f"WAN口 {wan_idx} 处理交易日 {trade_date} 的除权除息数据")
-        
-        success = False
-        df = None
-        
-        try:
-            # 获取单日数据 - 直接传递 wan_idx 给 fetch_data
-            df = self.fetch_data(trade_date=trade_date, wan_idx=wan_idx)
-            if df is None or df.empty:
-                logger.warning(f"交易日 {trade_date} 的除权除息数据为空或获取失败")
-                return False
-            
-            # 处理数据
-            processed_df = self.process_data(df)
-            if processed_df is None or processed_df.empty:
-                logger.warning(f"交易日 {trade_date} 的处理后除权除息数据为空")
-                return False
-            
-            # 保存单日数据到MongoDB
-            if not self.mongodb_handler.is_connected():
-                logger.warning("MongoDB未连接，尝试连接...")
-                if not self.mongodb_handler.connect():
-                    logger.error("连接MongoDB失败")
-                    # 添加到结果队列，供后续处理
-                    self.result_queue.put((trade_date, processed_df))
-                    return False
-                    
-            # 保存到MongoDB
-            success = self.save_to_mongodb(processed_df)
-            if success:
-                logger.success(f"交易日 {trade_date} 的除权除息数据已保存到MongoDB")
-            else:
-                logger.error(f"保存交易日 {trade_date} 的除权除息数据到MongoDB失败")
-                # 添加到结果队列，供后续处理
-                self.result_queue.put((trade_date, processed_df))
-        except Exception as e:
-            logger.error(f"处理交易日 {trade_date} 的除权除息数据时发生异常: {str(e)}")
-            # 如果有数据但处理失败，添加到结果队列
-            if df is not None and not df.empty:
-                processed_df = self.process_data(df)
-                if processed_df is not None and not processed_df.empty:
-                    self.result_queue.put((trade_date, processed_df))
-        
-        return success
-    
-    def _process_date_parallel(self, trade_dates: List[str]) -> bool:
-        """
-        并行处理多个交易日的除权除息数据
-        
-        Args:
-            trade_dates: 交易日列表
+            ann_dates: 公告日期列表
             
         Returns:
             是否全部成功
@@ -715,44 +703,44 @@ class previous_nameFetcher(TushareFetcher):
             logger.warning("未找到可用的WAN口，降级为串行处理模式")
             # 降级为串行处理
             all_success = True
-            for trade_date in trade_dates:
+            for ann_date in ann_dates:
                 # 检查是否收到停止信号
                 if STOP_PROCESSING:
                     logger.warning("收到停止信号，中断处理")
                     return False
                 
                 try:
-                    df = self.fetch_previous_name_data(trade_date)
+                    df = self.fetch_stk_managers_data(ann_date)
                     if df is not None and not df.empty:
                         processed_df = self.process_data(df)
                         if processed_df is not None and not processed_df.empty:
                             success = self.save_to_mongodb(processed_df)
                             if not success:
-                                logger.error(f"保存交易日 {trade_date} 的除权除息数据到MongoDB失败")
-                                self.result_queue.put((trade_date, processed_df))
+                                logger.error(f"保存公告日期 {ann_date} 的数据到MongoDB失败")
+                                self.result_queue.put((ann_date, processed_df))
                                 all_success = False
                 except Exception as e:
-                    logger.error(f"处理交易日 {trade_date} 的除权除息数据时发生异常: {str(e)}")
+                    logger.error(f"处理公告日期 {ann_date} 时发生异常: {str(e)}")
                     all_success = False
             return all_success
         
         threads_count = self.available_wan_count
-        logger.info(f"并行处理 {len(trade_dates)} 个交易日的除权除息数据，线程数: {threads_count}，可用WAN口: {self.available_wan_indices}")
+        logger.info(f"并行处理 {len(ann_dates)} 个公告日期的数据，线程数: {threads_count}，可用WAN口: {self.available_wan_indices}")
         
         # 确保WAN索引列表有效
         if not self.available_wan_indices:
             logger.error("可用WAN口列表为空，无法进行并行处理")
             return False
         
-        # 均匀分配交易日到可用WAN口
+        # 均匀分配公告日期到可用WAN口
         date_groups = {wan_idx: [] for wan_idx in self.available_wan_indices}
-        for i, date in enumerate(trade_dates):
+        for i, date in enumerate(ann_dates):
             wan_idx = self.available_wan_indices[i % len(self.available_wan_indices)]
             date_groups[wan_idx].append(date)
         
         # 记录分配情况
         for wan_idx, dates in date_groups.items():
-            logger.info(f"WAN口 {wan_idx} 分配到 {len(dates)} 个交易日")
+            logger.info(f"WAN口 {wan_idx} 分配到 {len(dates)} 个公告日期")
         
         all_success = True
         processed_dates_count = 0  # 添加计数器跟踪处理的日期数
@@ -761,7 +749,7 @@ class previous_nameFetcher(TushareFetcher):
         def process_wan_dates(wan_idx, dates):
             """处理单个WAN口对应的所有日期"""
             if not dates:  # 没有日期需要处理
-                logger.info(f"WAN口 {wan_idx} 没有分配到交易日，跳过")
+                logger.info(f"WAN口 {wan_idx} 没有分配到公告日期，跳过")
                 return True, 0
                 
             # 获取WAN口锁，确保同一时间只有一个线程使用此WAN口
@@ -772,12 +760,12 @@ class previous_nameFetcher(TushareFetcher):
             logger.info(f"线程成功获取WAN口 {wan_idx} 的锁")
             
             try:
-                logger.info(f"线程开始处理WAN口 {wan_idx} 的 {len(dates)} 个交易日的除权除息数据")
+                logger.info(f"线程开始处理WAN口 {wan_idx} 的 {len(dates)} 个公告日期")
                 
                 wan_success = True
                 success_count = 0
                 
-                # 逐个处理该WAN口的所有交易日
+                # 逐个处理该WAN口的所有公告日期
                 for date in dates:
                     # 检查是否收到停止信号
                     if STOP_PROCESSING:
@@ -789,19 +777,19 @@ class previous_nameFetcher(TushareFetcher):
                         if success:
                             success_count += 1
                         else:
-                            logger.warning(f"WAN口 {wan_idx} 处理交易日 {date} 的除权除息数据失败")
+                            logger.warning(f"WAN口 {wan_idx} 处理公告日期 {date} 失败")
                             wan_success = False
                     except Exception as e:
-                        logger.error(f"WAN口 {wan_idx} 处理交易日 {date} 的除权除息数据时发生异常: {str(e)}")
+                        logger.error(f"WAN口 {wan_idx} 处理公告日期 {date} 时发生异常: {str(e)}")
                         wan_success = False
                 
                 # 如果至少成功处理了一个日期，视为部分成功
                 if success_count > 0:
-                    logger.info(f"WAN口 {wan_idx} 成功处理了 {success_count}/{len(dates)} 个交易日的除权除息数据")
+                    logger.info(f"WAN口 {wan_idx} 成功处理了 {success_count}/{len(dates)} 个公告日期")
                     # 即使有些失败，只要有成功的，我们就不认为整体失败
                     wan_success = True
                 
-                logger.info(f"线程完成WAN口 {wan_idx} 的所有交易日除权除息数据处理")
+                logger.info(f"线程完成WAN口 {wan_idx} 的所有公告日期处理")
                 return wan_success, success_count
             finally:
                 # 释放WAN口锁
@@ -821,7 +809,7 @@ class previous_nameFetcher(TushareFetcher):
             for wan_idx in self.available_wan_indices:
                 dates = date_groups.get(wan_idx, [])
                 # 即使没有日期，也提交任务以保持线程和WAN口一一对应
-                logger.info(f"提交WAN口 {wan_idx} 处理 {len(dates)} 个交易日的除权除息数据任务")
+                logger.info(f"提交WAN口 {wan_idx} 处理 {len(dates)} 个公告日期的任务")
                 future = executor_pool.submit(process_wan_dates, wan_idx, dates)
                 future_to_wan[future] = wan_idx
             
@@ -855,12 +843,12 @@ class previous_nameFetcher(TushareFetcher):
                 executor_pool = None
         
         # 只有当没有成功处理任何日期时，才返回失败
-        if processed_dates_count == 0 and len(trade_dates) > 0:
-            logger.error(f"所有 {len(trade_dates)} 个交易日的除权除息数据都处理失败")
+        if processed_dates_count == 0 and len(ann_dates) > 0:
+            logger.error(f"所有 {len(ann_dates)} 个公告日期都处理失败")
             return False
         
         # 如果至少处理了一些日期，就返回成功
-        logger.success(f"成功处理了 {processed_dates_count}/{len(trade_dates)} 个交易日的除权除息数据")
+        logger.success(f"成功处理了 {processed_dates_count}/{len(ann_dates)} 个公告日期")
         return True
     
     def fetch_stock_data(self, ts_code: str) -> Optional[pd.DataFrame]:
@@ -957,11 +945,11 @@ class previous_nameFetcher(TushareFetcher):
                                 logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
                                 all_success = False
                     
-                    # full模式下添加5秒延时
+                    # 在full模式下，添加随机等待时间避免请求过快
                     if self.full_mode:
-                        logger.info(f"full模式: 等待5秒后继续下一个请求...")
-                        time.sleep(5)
-                        
+                        wait_time = random.uniform(2, 5)
+                        logger.debug(f"完整模式下添加随机等待: {wait_time:.2f}秒")
+                        time.sleep(wait_time)
                 except Exception as e:
                     logger.error(f"处理股票 {ts_code} 时发生异常: {str(e)}")
                     all_success = False
@@ -1017,7 +1005,7 @@ class previous_nameFetcher(TushareFetcher):
                         
                     try:
                         # 打印正在处理的股票代码
-                        logger.info(f"WAN口 {wan_idx} 正在处理股票: {ts_code}")  # 添加这一行，显示正在处理的股票代码
+                        logger.info(f"WAN口 {wan_idx} 正在处理股票: {ts_code}")
                         
                         # 获取单个股票数据，直接传递wan_idx参数
                         df = self.fetch_data(ts_code=ts_code, wan_idx=wan_idx)
@@ -1039,11 +1027,12 @@ class previous_nameFetcher(TushareFetcher):
                         else:
                             logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
                             wan_success = False
-                            
-                        # full模式下添加5秒延时
+                        
+                        # 在full模式下，添加随机等待时间避免请求过快
                         if self.full_mode:
-                            logger.info(f"full模式: 等待5秒后继续下一个请求...")
-                            time.sleep(5)
+                            wait_time = random.uniform(2, 5)
+                            logger.debug(f"WAN口 {wan_idx} 完整模式下添加随机等待: {wait_time:.2f}秒")
+                            time.sleep(wait_time)
                             
                     except Exception as e:
                         logger.error(f"WAN口 {wan_idx} 处理股票 {ts_code} 时发生异常: {str(e)}")
@@ -1135,7 +1124,7 @@ class previous_nameFetcher(TushareFetcher):
             # 根据模式走不同的处理流程
             if self.full_mode:
                 # 完整模式：按股票代码获取
-                logger.info("使用完整模式，按股票代码获取所有历史数据")
+                logger.info("使用完整模式，按股票代码获取所有管理层数据")
                 
                 # 第二步：获取所有股票代码
                 logger.info("第二步：从stock_basic集合获取股票代码列表")
@@ -1181,12 +1170,6 @@ class previous_nameFetcher(TushareFetcher):
                             else:
                                 logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
                                 all_success = False
-                                
-                            # full模式下添加5秒延时
-                            if self.full_mode:
-                                logger.info(f"full模式: 等待5秒后继续下一个请求...")
-                                time.sleep(5)
-                                
                         except Exception as e:
                             logger.error(f"处理股票 {ts_code} 的数据时发生异常: {str(e)}")
                             all_success = False
@@ -1194,63 +1177,63 @@ class previous_nameFetcher(TushareFetcher):
                     return all_success
                 else:
                     # 并行模式
-                    logger.info(f"使用并行模式处理 {len(stock_codes)} 个股票的数据，将在每个请求后添加5秒延时")
+                    logger.info(f"使用并行模式处理 {len(stock_codes)} 个股票的数据")
                     return self._process_stock_parallel(stock_codes)
             else:
-                # 日期模式：按交易日获取
-                logger.info("使用日期模式，按交易日获取数据")
+                # 日期模式：按公告日期获取
+                logger.info("使用日期模式，按公告日期获取数据")
                 
-                # 第二步：获取日期范围内的所有交易日
-                logger.info(f"第二步：获取日期范围 {self.start_date} - {self.end_date} 内的交易日...")
-                trade_dates = self.get_trade_dates(self.start_date, self.end_date)
+                # 第二步：获取日期范围内的所有交易日作为可能的公告日期
+                logger.info(f"第二步：获取日期范围 {self.start_date} - {self.end_date} 内的可能公告日期...")
+                ann_dates = self.get_trade_dates(self.start_date, self.end_date)
                 
-                if not trade_dates:
-                    logger.warning("未找到交易日，没有数据需要处理")
+                if not ann_dates:
+                    logger.warning("未找到可能的公告日期，没有数据需要处理")
                     return True  # 没有数据也视为成功
                 
                 # 第三步：获取数据（串行或并行）
                 if self.serial_mode:
                     # 串行模式
-                    logger.info(f"第三步：串行处理 {len(trade_dates)} 个交易日的数据")
+                    logger.info(f"第三步：串行处理 {len(ann_dates)} 个公告日期的数据")
                     all_success = True
                     
-                    for begin_date in trade_dates:
+                    for ann_date in ann_dates:
                         # 检查是否收到停止信号
                         if STOP_PROCESSING:
                             logger.warning("收到停止信号，中断处理")
                             return False
                             
-                        logger.info(f"正在处理起始日: {begin_date}")
+                        logger.info(f"正在处理公告日期: {ann_date}")
                         
                         try:
                             # 获取单日数据
-                            df = self.fetch_previous_name_data(begin_date)
+                            df = self.fetch_stk_managers_data(ann_date)
                             if df is None or df.empty:
-                                logger.warning(f"起始日 {begin_date} 的数据为空或获取失败")
+                                logger.warning(f"公告日期 {ann_date} 的数据为空或获取失败")
                                 continue
                             
                             # 处理数据
                             processed_df = self.process_data(df)
                             if processed_df is None or processed_df.empty:
-                                logger.warning(f"起始日 {begin_date} 的处理后数据为空")
+                                logger.warning(f"公告日期 {ann_date} 的处理后数据为空")
                                 continue
                             
                             # 保存单日数据到MongoDB
                             success = self.save_to_mongodb(processed_df)
                             if success:
-                                logger.success(f"起始日 {begin_date} 的数据已保存到MongoDB")
+                                logger.success(f"公告日期 {ann_date} 的数据已保存到MongoDB")
                             else:
-                                logger.error(f"保存起始日 {begin_date} 的数据到MongoDB失败")
+                                logger.error(f"保存公告日期 {ann_date} 的数据到MongoDB失败")
                                 all_success = False
                         except Exception as e:
-                            logger.error(f"处理起始日 {begin_date} 的数据时发生异常: {str(e)}")
+                            logger.error(f"处理公告日期 {ann_date} 的数据时发生异常: {str(e)}")
                             all_success = False
                     
                     return all_success
                 else:
                     # 并行模式
-                    logger.info(f"第三步：并行处理 {len(trade_dates)} 个交易日的除权除息数据")
-                    return self._process_date_parallel(trade_dates)
+                    logger.info(f"第三步：并行处理 {len(ann_dates)} 个公告日期的数据")
+                    return self._process_date_parallel(ann_dates)
             
             logger.info("数据获取和保存流程完成")
             return True
@@ -1340,15 +1323,24 @@ class previous_nameFetcher(TushareFetcher):
                             
                             if key in existing_ids:
                                 # 记录存在，需要更新
+                                # 移除文档中的_id字段，避免尝试修改不可变字段
+                                update_doc = doc.copy()
+                                if '_id' in update_doc:
+                                    del update_doc['_id']
+                                
                                 updates.append(
                                     pymongo.UpdateOne(
                                         {"_id": existing_ids[key]},
-                                        {"$set": doc}
+                                        {"$set": update_doc}
                                     )
                                 )
                             else:
                                 # 记录不存在，需要插入
-                                inserts.append(doc)
+                                # 确保新文档中不包含_id字段
+                                insert_doc = doc.copy()
+                                if '_id' in insert_doc:
+                                    del insert_doc['_id']
+                                inserts.append(insert_doc)
                         
                         # 4. 执行插入操作
                         if inserts:
@@ -1376,8 +1368,16 @@ class previous_nameFetcher(TushareFetcher):
                         if retries >= max_retries:
                             # 在最后一次尝试，记录错误详情
                             logger.error(f"批量写入失败: {bwe.details}")
+                            # 检查是否有重复键错误
+                            if 'writeErrors' in bwe.details:
+                                for error in bwe.details.get('writeErrors', []):
+                                    if error.get('code') == 11000:  # 重复键错误
+                                        logger.debug(f"重复键错误: {error.get('errmsg', '')}")
                             return False
-                        time.sleep(1)  # 重试前等待
+                        # full模式下增加重试等待时间
+                        wait_time = random.uniform(2, 5) if self.full_mode else 1
+                        logger.info(f"等待 {wait_time:.2f} 秒后重试...")
+                        time.sleep(wait_time)  # 重试前等待
                         
                     except Exception as e:
                         retries += 1
@@ -1385,7 +1385,10 @@ class previous_nameFetcher(TushareFetcher):
                         if retries >= max_retries:
                             logger.error(f"批次 {i//chunk_size + 1} 处理失败，已达到最大重试次数")
                             return False
-                        time.sleep(1)  # 重试前等待
+                        # full模式下增加重试等待时间
+                        wait_time = random.uniform(2, 5) if self.full_mode else 1
+                        logger.info(f"等待 {wait_time:.2f} 秒后重试...")
+                        time.sleep(wait_time)  # 重试前等待
             
             # 记录最终结果
             logger.success(
@@ -1430,14 +1433,14 @@ def main():
         # sys.exit(1)
     # ---- 初始化结束 ----
     
-    parser = argparse.ArgumentParser(description='获取中国A股证券曾用名并保存到MongoDB')
+    parser = argparse.ArgumentParser(description='获取日线基本数据并保存到MongoDB')
     parser.add_argument('--config', default='config/config.yaml', help='配置文件路径')
     parser.add_argument('--interface-dir', default='config/interfaces', help='接口配置文件目录')
     parser.add_argument('--exchange', default='SSE', help='交易所代码：SSE-上交所, SZSE-深交所')
     parser.add_argument('--start-date', help='开始日期，格式：YYYYMMDD')
     parser.add_argument('--end-date', help='结束日期，格式：YYYYMMDD')
     parser.add_argument('--db-name', help='MongoDB数据库名称')
-    parser.add_argument('--collection-name', default='previous_name', help='MongoDB集合名称')
+    parser.add_argument('--collection-name', default='stk_managers', help='MongoDB集合名称')
     parser.add_argument('--verbose', action='store_true', help='输出详细日志')
     parser.add_argument('--shared-config', type=str, default=None, help='共享配置文件路径')
     parser.add_argument('--skip-validation', action='store_true', help='跳过配置验证')
@@ -1469,7 +1472,7 @@ def main():
                 logger.info(f"从共享配置获取配置文件路径：{args.config}")
         
         # 创建获取器并运行 - 传入 mongo_instance
-        fetcher = previous_nameFetcher(
+        fetcher = stk_managersFetcher(
             config_path=args.config,
             interface_dir=args.interface_dir,
             exchange=args.exchange,
@@ -1490,10 +1493,10 @@ def main():
             success = fetcher.run()
             
             if success:
-                logger.success("中国A股证券曾用名获取和保存成功")
+                logger.success("日线基本数据获取和保存成功")
                 return 0
             else:
-                logger.error("中国A股证券曾用名获取或保存失败")
+                logger.error("日线基本数据获取或保存失败")
                 return 1
         except KeyboardInterrupt:
             logger.warning("接收到Ctrl+C，正在强制退出...")

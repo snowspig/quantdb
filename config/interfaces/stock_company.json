@@ -7,7 +7,7 @@
     "update_frequency": "daily",
     "update_priority": 1,
     "index_fields": [
-        "ts_code"
+        "ts_code", "found_date"
     ],
     "available_fields": [
         "ts_code", "province", "city", "chairman", "president", 

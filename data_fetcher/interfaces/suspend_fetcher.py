@@ -1,2319 +1,1545 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
-停牌数据获取器 - 获取A股停复牌信息并保存到MongoDB
+suspend Basic Fetcher V2 - 获取日线基本数据并保存到MongoDB
 
-该脚本用于从湘财Tushare获取A股停复牌信息，并保存到MongoDB数据库中
-支持多WAN接口并行抓取、多种模式获取数据，并具备失败重试机制
+该脚本用于从湘财Tushare获取日线基本数据，并保存到MongoDB数据库中
+该版本继承TushareFetcher基类，实现了与stock_basic_fetcher相同的架构和功能
 
-参考接口文档：http://tushare.xcsc.com:7173/document/2?doc_id=31
+参考接口文档：http://tushare.xcsc.com:7173/document/2?doc_id=26
 
 使用方法：
-    python suspend_fetcher.py                 # 使用recent模式获取最近一周的停牌数据
-    python suspend_fetcher.py --full          # 获取从1990年至今的所有停牌数据
-    python suspend_fetcher.py --verbose       # 输出详细日志
-    python suspend_fetcher.py --mock          # 使用模拟数据（API不可用时）
-    python suspend_fetcher.py --ts-code 600000.SH  # 获取指定股票的停牌数据
-    python suspend_fetcher.py --batch-size 1      # 设置每批处理20只股票
+    python suspend_fetcher.py                   # 使用湘财真实API数据，简洁日志模式，获取近期数据
+    python suspend_fetcher.py --verbose         # 使用湘财真实API数据，详细日志模式
+    python suspend_fetcher.py --start-date 20200101 --end-date 20231231  # 指定日期范围
+    python suspend_fetcher.py --exchange SZSE   # 获取深交所的日线数据
+    python suspend_fetcher.py --serial          # 使用串行模式处理数据（默认为并行模式）
+    python suspend_fetcher.py --full            # 使用完整模式，按股票代码列表获取所有股票的基本数据
 """
-import os
 import sys
-import json
-import yaml
 import time
+import json
+import os
 import pandas as pd
+import threading
+import queue
+import concurrent.futures
+import signal
+import atexit
 from datetime import datetime, timedelta
-from typing import Dict, List, Set, Optional, Any, Tuple, Union
+from typing import List, Optional, Dict, Any
 from pathlib import Path
 from loguru import logger
 import random
-import pymongo
-import requests.adapters
 import socket
-import requests
-import threading
-import queue
+import pymongo
 
 # 添加项目根目录到Python路径
 current_dir = Path(__file__).resolve().parent
-sys.path.append(str(current_dir))
+project_root = current_dir.parent.parent
+sys.path.append(str(project_root))
 
-# 导入项目模块
-from data_fetcher.tushare_client import TushareClient
-from storage.mongodb_client import MongoDBClient
-from wan_manager.port_allocator import PortAllocator
+# 导入平台核心模块
+from core.tushare_fetcher import TushareFetcher
+from core.mongodb_handler import MongoDBHandler, init_mongodb_handler
 
-def tcp_port_is_free(port):
-    """检查TCP端口是否可用"""
-    import socket
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+# 全局变量用于线程和进程控制
+STOP_PROCESSING = False
+executor_pool = None  # 全局线程池对象
+
+# 信号处理函数
+def signal_handler(sig, frame):
+    global STOP_PROCESSING, executor_pool
+    logger.warning("接收到中断信号(Ctrl+C)，正在强制退出...")
+    STOP_PROCESSING = True
+    
+    # 强制关闭线程池
+    if executor_pool:
+        logger.info("正在关闭线程池...")
+        executor_pool.shutdown(wait=False)
+    
+    # 强制退出程序
+    logger.warning("程序被强制终止")
+    os._exit(130)  # 使用os._exit强制退出
+
+# 退出处理函数
+def exit_handler():
+    global STOP_PROCESSING
+    if STOP_PROCESSING:
+        logger.warning("程序正在通过退出处理器清理资源...")
+    else:
+        logger.info("程序正常退出")
+
+# 共享配置加载函数
+def load_shared_config(shared_config_path=None) -> Dict[str, Any]:
+    """
+    加载共享配置
+    
+    如果指定了共享配置路径，直接从文件加载
+    否则尝试从环境变量获取路径
+    
+    Args:
+        shared_config_path: 共享配置文件路径
+        
+    Returns:
+        Dict[str, Any]: 共享配置字典
+    """
+    # 首先检查参数
+    if shared_config_path:
+        config_path = shared_config_path
+    # 其次检查环境变量
+    elif "QUANTDB_SHARED_CONFIG" in os.environ:
+        config_path = os.environ.get("QUANTDB_SHARED_CONFIG")
+    else:
+        # 如果没有共享配置，返回空字典
+        logger.debug("没有找到共享配置路径")
+        return {}
+    
     try:
-        s.bind(('0.0.0.0', port))
-        s.listen(1)
-        s.close()
-        return True
-    except OSError:
-        if s:
-            s.close()
-        return False
+        # 检查文件是否存在
+        if not os.path.exists(config_path):
+            logger.warning(f"共享配置文件不存在：{config_path}")
+            return {}
+        
+        # 加载配置
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        
+        logger.info(f"成功从共享配置中加载设置：{config_path}")
+        return config
+    except Exception as e:
+        logger.error(f"加载共享配置失败：{str(e)}")
+        return {}
 
-class TushareClientWAN:
+def get_validation_status(shared_config: Dict[str, Any]) -> Dict[str, bool]:
     """
-    专用于WAN绑定的Tushare客户端
+    从共享配置中获取验证状态
+    
+    Args:
+        shared_config: 共享配置字典
+        
+    Returns:
+        Dict[str, bool]: 验证状态字典
+    """
+    validation_summary = shared_config.get("validation_summary", {})
+    return validation_summary
+
+class suspendFetcher(TushareFetcher):
+    """
+    日线基本数据获取器V2
+    
+    该类用于从Tushare获取日线基本数据并保存到MongoDB数据库
+    使用TushareFetcher基类提供的通用功能
+    支持串行和并行两种处理模式
+    支持按日期和按股票代码两种抓取模式
     """
     
-    def __init__(self, token: str, timeout: int = 60, api_url: str = None):
-        """初始化WAN绑定的Tushare客户端"""
-        self.token = token
-        self.timeout = timeout
-        
-        # 使用传入的API URL或默认为湘财Tushare API地址
-        self.url = api_url or "http://api.waditu.com"
-        
-        self.headers = {
-            "Content-Type": "application/json",
-        }
-        self.proxies = None
-        self.local_addr = None
-        self.wan_idx = None
-        self.local_port = None
-        
-        # 验证token
-        mask_token = token[:4] + '*' * (len(token) - 8) + token[-4:] if len(token) > 8 else '***'
-        logger.debug(f"TushareClientWAN初始化: {mask_token} (长度: {len(token)}), API URL: {self.url}")
-    
-    def set_local_address(self, host: str, port: int, wan_idx: int = None):
-        """设置本地地址绑定"""
-        # 检查端口是否可用
-        if not tcp_port_is_free(port):
-            logger.warning(f"端口 {port} 不可用，可能仍在TIME_WAIT状态")
-            # 尝试选择临近端口
-            for offset in range(1, 11):
-                alt_port = port + offset
-                if tcp_port_is_free(alt_port):
-                    logger.info(f"选择替代端口 {alt_port} 替代不可用的端口 {port}")
-                    port = alt_port
-                    break
-            else:
-                logger.error(f"无法找到可用的替代端口")
-                raise OSError(f"所有尝试的端口都不可用")
-        
-        self.local_addr = (host, port)
-        self.wan_idx = wan_idx
-        self.local_port = port
-        logger.debug(f"已设置本地地址绑定: {host}:{port}, WAN索引: {wan_idx}")
-    
-    def reset_local_address(self):
-        """重置本地地址绑定"""
-        self.local_addr = None
-        self.wan_idx = None
-        self.local_port = None
-        logger.debug("已重置本地地址绑定")
-    
-    def set_timeout(self, timeout: int):
-        """设置请求超时"""
-        self.timeout = timeout
-        logger.debug(f"已设置请求超时: {timeout}秒")
-    
-    def get_data(self, api_name: str, params: dict, fields: list = None):
-        """
-        获取API数据
-        
-        Args:
-            api_name: API名称
-            params: 请求参数
-            fields: 返回字段列表
-            
-        Returns:
-            DataFrame格式的数据
-        """
-        # 创建请求数据 - 与原始TushareClient请求格式保持一致
-        req_params = {
-            "api_name": api_name,
-            "token": self.token,
-            "params": params or {},
-            "fields": fields or ""
-        }
-        
-        logger.debug(f"请求URL: {self.url}, API: {api_name}, Token长度: {len(self.token)}")
-        
-        # 使用requests发送请求，增强错误处理
-        start_time = time.time()
-        
-        try:
-            # 使用类似wan_test_client的方式直接创建socket并绑定
-            if self.local_addr and self.wan_idx is not None:
-                logger.debug(f"使用WAN {self.wan_idx} 端口 {self.local_port} 发送请求")
-                
-                # 从URL解析主机和端口
-                import urllib.parse
-                parsed_url = urllib.parse.urlparse(self.url)
-                host = parsed_url.hostname
-                port = parsed_url.port or 80
-                is_https = parsed_url.scheme == 'https'
-                
-                if is_https:
-                    # 对于HTTPS，我们需要使用SSL
-                    import ssl
-                    context = ssl.create_default_context()
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.bind(self.local_addr)
-                    s.settimeout(self.timeout)
-                    wrapped_socket = context.wrap_socket(s, server_hostname=host)
-                    wrapped_socket.connect((host, port))
-                    
-                    # 构建HTTP请求
-                    request = f"POST {parsed_url.path} HTTP/1.1\r\n"
-                    request += f"Host: {host}\r\n"
-                    request += "Content-Type: application/json\r\n"
-                    
-                    # 添加其他请求头
-                    for header, value in self.headers.items():
-                        if header.lower() != "content-type" and header.lower() != "host":
-                            request += f"{header}: {value}\r\n"
-                    
-                    # 添加内容长度
-                    json_data = json.dumps(req_params)
-                    request += f"Content-Length: {len(json_data)}\r\n"
-                    request += "Connection: close\r\n\r\n"
-                    request += json_data
-                    
-                    # 发送请求
-                    wrapped_socket.sendall(request.encode())
-                    
-                    # 接收响应
-                    response = b""
-                    while True:
-                        try:
-                            data = wrapped_socket.recv(4096)
-                            if not data:
-                                break
-                            response += data
-                        except socket.timeout:
-                            break
-                    
-                    wrapped_socket.close()
-                    
-                    # 解析HTTP响应
-                    response_text = response.decode('utf-8', errors='ignore')
-                    
-                    # 提取JSON主体
-                    body_start = response_text.find('\r\n\r\n')
-                    if body_start != -1:
-                        body = response_text[body_start + 4:]
-                        
-                        # 解析JSON
-                        try:
-                            result = json.loads(body)
-                            # 检查响应状态
-                            if result.get('code') != 0:
-                                logger.error(f"API返回错误: {result.get('code')} - {result.get('msg')}")
-                                return None
-                                
-                            # 转换为DataFrame
-                            data = result.get('data')
-                            if not data or not data.get('items'):
-                                logger.debug("API返回空数据")
-                                return pd.DataFrame()
-                                
-                            items = data.get('items')
-                            columns = data.get('fields')
-                            
-                            # 创建DataFrame
-                            df = pd.DataFrame(items, columns=columns)
-                            return df
-                        except json.JSONDecodeError:
-                            logger.error("解析JSON响应失败")
-                            return None
-                    else:
-                        logger.error("无法找到HTTP响应主体")
-                        return None
-                
-                else:
-                    # 对于HTTP请求，必须使用SourceAddressAdapter来绑定源地址
-                    s = requests.Session()
-                    # 使用自定义适配器绑定源地址
-                    s.mount('http://', SourceAddressAdapter(self.local_addr))
-                    s.mount('https://', SourceAddressAdapter(self.local_addr))
-                    
-                    response = s.post(
-                        self.url,
-                        json=req_params,
-                        headers=self.headers,
-                        timeout=self.timeout,
-                        proxies=self.proxies
-                    )
-                    
-                    # 检查响应状态
-                    if response.status_code != 200:
-                        logger.error(f"API请求错误: {response.status_code} - {response.text}")
-                        return None
-                        
-                    # 解析响应
-                    result = response.json()
-                    if result.get('code') != 0:
-                        logger.error(f"API返回错误: {result.get('code')} - {result.get('msg')}")
-                        return None
-                        
-                    # 转换为DataFrame
-                    data = result.get('data')
-                    if not data or not data.get('items'):
-                        logger.debug("API返回空数据")
-                        return pd.DataFrame()
-                        
-                    items = data.get('items')
-                    columns = data.get('fields')
-                    
-                    # 创建DataFrame
-                    df = pd.DataFrame(items, columns=columns)
-                    return df
-            
-            else:
-                # 如果没有设置本地地址绑定，使用普通请求
-                s = requests.Session()
-                
-                # 使用SourceAddressAdapter
-                if self.local_addr:
-                    s.mount('http://', SourceAddressAdapter(self.local_addr))
-                    s.mount('https://', SourceAddressAdapter(self.local_addr))
-                
-                response = s.post(
-                    self.url,
-                    json=req_params,
-                    headers=self.headers,
-                    timeout=self.timeout,
-                    proxies=self.proxies
-                )
-                
-                # 检查响应状态
-                if response.status_code != 200:
-                    logger.error(f"API请求错误: {response.status_code} - {response.text}")
-                    return None
-                    
-                # 解析响应
-                result = response.json()
-                if result.get('code') != 0:
-                    logger.error(f"API返回错误: {result.get('code')} - {result.get('msg')}")
-                    return None
-                    
-                # 转换为DataFrame
-                data = result.get('data')
-                if not data or not data.get('items'):
-                    logger.debug("API返回空数据")
-                    return pd.DataFrame()
-                    
-                items = data.get('items')
-                columns = data.get('fields')
-                
-                # 创建DataFrame
-                df = pd.DataFrame(items, columns=columns)
-                return df
-                
-        except Exception as e:
-            elapsed = time.time() - start_time
-            logger.error(f"获取API数据失败: {str(e)}")
-            import traceback
-            logger.debug(f"详细错误信息: {traceback.format_exc()}")
-            logger.debug(f"请求耗时: {elapsed:.2f}s 后失败")
-            raise  # 重新抛出异常，让调用者处理
-
-
-class SourceAddressAdapter(requests.adapters.HTTPAdapter):
-    """用于设置源地址的HTTP适配器"""
-    
-    def __init__(self, source_address, **kwargs):
-        self.source_address = source_address
-        super(SourceAddressAdapter, self).__init__(**kwargs)
-    
-    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
-        pool_kwargs['source_address'] = self.source_address
-        super(SourceAddressAdapter, self).init_poolmanager(
-            connections, maxsize, block, **pool_kwargs)
-
-
-class SuspendFetcher:
-    """
-    停牌数据获取器
-    
-    该类用于从Tushare获取A股停复牌信息并保存到MongoDB数据库，支持多种获取模式：
-    1. recent模式：获取最近一周的停牌数据，其中 suspend_date = trade_date
-    2. full模式：获取从1990年1月1日至今的所有停牌数据，按股票代码列表抓取
-    """
-
     def __init__(
         self,
         config_path: str = "config/config.yaml",
         interface_dir: str = "config/interfaces",
         interface_name: str = "suspend.json",
-        target_market_codes: Set[str] = {"00", "30", "60", "68"},
         db_name: str = None,
         collection_name: str = "suspend",
+        start_date: str = None,
+        end_date: str = None,
+        exchange: str = "SSE",  # 默认上交所
         verbose: bool = False,
-        max_workers: int = 3,  # 并行工作线程数
-        retry_count: int = 5,   # 数据获取重试次数
-        retry_delay: int = 5,   # 重试延迟时间(秒)
-        batch_size: int = 1,    # 每批次处理的股票数量
-        port_release_timeout: int = 120  # 端口释放超时时间(秒)
+        shared_config: Dict[str, Any] = None,
+        skip_validation: bool = False,
+        serial_mode: bool = False,  # 是否使用串行模式
+        max_workers: int = 3,  # 并行模式下的最大工作线程数
+        full_mode: bool = False,  # 是否使用完整模式（按股票代码抓取）
+        mongo_handler_instance: Optional[MongoDBHandler] = None # 新增参数
     ):
         """
-        初始化停牌数据获取器
+        初始化日线基本数据获取器
         
         Args:
             config_path: 配置文件路径
             interface_dir: 接口配置文件目录
             interface_name: 接口名称
-            target_market_codes: 目标市场代码集合，只保存这些板块的股票数据
             db_name: MongoDB数据库名称，如果为None则从配置文件中读取
             collection_name: MongoDB集合名称
+            start_date: 开始日期（格式：YYYYMMDD，默认为当前日期前一年）
+            end_date: 结束日期（格式：YYYYMMDD，默认为当前日期）
+            exchange: 交易所代码（SSE：上交所，SZSE：深交所，默认SSE）
             verbose: 是否输出详细日志
-            max_workers: 并行工作线程数
-            retry_count: 数据获取重试次数
-            retry_delay: 重试延迟时间(秒)
-            batch_size: 每批处理的股票数量
-            port_release_timeout: 端口释放超时时间(秒)
+            shared_config: 共享配置字典
+            skip_validation: 是否跳过验证
+            serial_mode: 是否使用串行模式
+            max_workers: 并行模式下的最大工作线程数
+            full_mode: 是否使用完整模式（按股票代码抓取）
+            mongo_handler_instance: 显式传入的 MongoDBHandler 实例
         """
-        self.config_path = config_path
-        self.interface_dir = interface_dir
-        self.interface_name = interface_name
-        self.target_market_codes = target_market_codes
-        self.collection_name = collection_name
-        self.verbose = verbose
-        self.max_workers = max_workers
-        self.retry_count = retry_count
-        self.retry_delay = retry_delay
-        self.batch_size = batch_size
-        self.port_release_timeout = port_release_timeout
+        # 使用共享配置中的设置（如果有）
+        if shared_config:
+            # 可以从共享配置中获取配置文件路径
+            config_path = shared_config.get("config_file", config_path)
+            # 获取验证状态
+            validation_status = get_validation_status(shared_config)
+            skip_validation = skip_validation or validation_status.get("all_valid", False)
+            
+            logger.info(f"使用共享配置：配置文件={config_path}, 跳过验证={skip_validation}")
         
-        # 端口使用记录，用于跟踪端口的最近使用时间
-        self.used_ports = {}
-        self.port_lock = threading.Lock()
+        # 保存skip_validation状态，但不传递给父类
+        self.skip_validation = skip_validation
         
-        # 错误计数和动态重试调整
-        self.error_count = 0
-        self.error_threshold = 5  # 连续错误阈值
-        self.backoff_factor = 1.0  # 初始退避系数
-        self.backoff_lock = threading.Lock()
-        self.last_error_time = time.time()
-
-        # 设置日志级别
-        log_level = "DEBUG" if verbose else "INFO"
-        logger.remove()
-        logger.add(sys.stderr, level=log_level, format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}")
+        # 检查TushareFetcher是否支持skip_validation参数
+        import inspect
+        parent_params = inspect.signature(TushareFetcher.__init__).parameters
+        parent_args = {}
         
-        # 加载配置
-        self.config = self._load_config()
-        self.interface_config = self._load_interface_config()
+        # 基本参数
+        parent_args['config_path'] = config_path
+        parent_args['interface_dir'] = interface_dir
+        parent_args['interface_name'] = interface_name
+        parent_args['db_name'] = db_name
+        parent_args['collection_name'] = collection_name
+        parent_args['verbose'] = verbose
         
-        # 获取token和api_url - 从配置文件读取
-        tushare_config = self.config.get("tushare", {})
-        self.token = tushare_config.get("token", "")
-        self.api_url = tushare_config.get("api_url", "")
+        # 如果父类支持skip_validation，则添加
+        if 'skip_validation' in parent_params:
+            parent_args['skip_validation'] = skip_validation
+            if verbose:
+                logger.debug("TushareFetcher支持skip_validation参数")
+        else:
+            logger.debug("TushareFetcher不支持skip_validation参数，将在子类中处理")
         
-        # 从配置中读取db_name
-        mongodb_config = self.config.get("mongodb", {})
-        config_db_name = mongodb_config.get("db_name", "tushare_data")
-        # 如果未传入db_name或传入为None，则使用配置文件中的值
-        self.db_name = db_name if db_name is not None else config_db_name
-        logger.debug(f"使用数据库名称: {self.db_name}")
+        # 添加传递的 MongoDB Handler 实例
+        parent_args['mongo_handler_instance'] = mongo_handler_instance
         
-        if not self.token:
-            logger.error("未配置Tushare API Key")
-            sys.exit(1)
+        # 调用父类初始化方法
+        super().__init__(**parent_args)
         
-        # 以安全方式记录token
-        mask_token = self.token[:4] + '*' * (len(self.token) - 8) + self.token[-4:] if len(self.token) > 8 else '***'
-        logger.debug(f"获取到的API token长度: {len(self.token)}")
-        logger.debug(f"获取到的API URL: {self.api_url}")
+        # 将传入的实例也保存在子类中，供 get_trade_dates 使用
+        self.mongodb_handler = mongo_handler_instance
         
-        # 初始化原始Tushare客户端（用于非WAN场景）
-        self.client = self._init_client()
+        self.exchange = exchange
         
-        # 初始化MongoDB客户端
-        self.mongo_client = self._init_mongo_client()
-        
-        # 初始化多WAN口管理器
-        self.port_allocator = self._init_port_allocator() 
-
-    def _load_config(self) -> Dict[str, Any]:
-        """加载配置文件"""
-        try:
-            with open(self.config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
-                logger.debug(f"成功加载配置文件: {self.config_path}")
-                return config
-        except Exception as e:
-            logger.error(f"加载配置文件失败: {str(e)}")
-            return {}
-
-    def _load_interface_config(self) -> Dict[str, Any]:
-        """加载接口配置文件"""
-        try:
-            interface_path = os.path.join(self.interface_dir, self.interface_name)
-            if not os.path.exists(interface_path):
-                logger.warning(f"接口配置文件不存在: {interface_path}，将使用默认配置")
-                # 使用默认配置
-                return {
-                    "description": "A股停复牌信息",
-                    "api_name": "suspend",
-                    "fields": [],
-                    "params": {},
-                    "available_fields": [
-                        "ts_code", "suspend_date", "suspend_type", "resume_date", 
-                        "change_reason", "suspend_time", "change_reason_type"
-                    ],
-                    "index_fields": ["ts_code", "suspend_date"]
-                }
+        # 设置默认日期范围（如果未提供）
+        if not start_date or not end_date:
+            today = datetime.now()
+            if not end_date:
+                self.end_date = today.strftime("%Y%m%d")
+            else:
+                self.end_date = end_date
                 
-            with open(interface_path, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                logger.debug(f"成功加载接口配置: {interface_path}")
-                return config
-        except Exception as e:
-            logger.error(f"加载接口配置失败: {str(e)}")
-            # 使用默认配置
-            return {
-                "description": "A股停复牌信息",
-                "api_name": "suspend",
-                "fields": [],
-                "params": {},
-                "available_fields": [
-                    "ts_code", "suspend_date", "suspend_type", "resume_date", 
-                    "change_reason", "suspend_time", "change_reason_type"
-                ],
-                "index_fields": ["ts_code", "suspend_date"]
-            }
-
-    def _init_client(self) -> TushareClient:
-        """初始化Tushare客户端"""
+            if not start_date:
+                # 默认获取最近一周的数据
+                one_week_ago = today - timedelta(days=7)
+                self.start_date = one_week_ago.strftime("%Y%m%d")
+            else:
+                self.start_date = start_date
+        else:
+            self.start_date = start_date
+            self.end_date = end_date
+        
+        self.serial_mode = serial_mode
+        self.full_mode = full_mode
+        
+        # 获取可用的WAN口数量
         try:
-            # 从配置中获取token和api_url
-            tushare_config = self.config.get("tushare", {})
-            token = tushare_config.get("token", "")
-            api_url = tushare_config.get("api_url", "")
+            # 获取端口分配器
+            from core.wan_manager import get_port_allocator
+            self.port_allocator = get_port_allocator()
             
-            # 验证token
-            if not token:
-                logger.error("未配置Tushare API Key")
-                sys.exit(1)
+            # 从port_allocator获取WAN口信息
+            self.available_wan_indices = self.port_allocator.get_available_wan_indices()
+            self.available_wan_count = len(self.available_wan_indices)
             
-            # 这里我们记录一下token的前几位和长度，便于调试
-            # 注意：实际生产环境中应谨慎记录敏感信息
-            mask_token = token[:4] + '*' * (len(token) - 8) + token[-4:] if len(token) > 8 else '***'
-            logger.debug(f"使用token初始化客户端: {mask_token} (长度: {len(token)}), API URL: {api_url}")
-                
-            # 创建并返回客户端实例，传入api_url
-            return TushareClient(token=token, api_url=api_url)
-        except Exception as e:
-            logger.error(f"初始化Tushare客户端失败: {str(e)}")
-            sys.exit(1)
-
-    def _init_mongo_client(self) -> MongoDBClient:
-        """初始化MongoDB客户端"""
-        try:
-            mongodb_config = self.config.get("mongodb", {})
-            
-            # 获取MongoDB连接信息
-            uri = mongodb_config.get("uri", "")
-            host = mongodb_config.get("host", "localhost")
-            port = mongodb_config.get("port", 27017)
-            username = mongodb_config.get("username", "")
-            password = mongodb_config.get("password", "")
-            auth_source = mongodb_config.get("auth_source", "admin")
-            auth_mechanism = mongodb_config.get("auth_mechanism", "SCRAM-SHA-1")
-            
-            # 获取MongoDB连接选项
-            options = mongodb_config.get("options", {})
-            connection_pool_size = options.get("max_pool_size", 100)
-            timeout_ms = options.get("connect_timeout_ms", 30000)
-            
-            # 记录MongoDB连接信息
-            logger.debug(f"MongoDB连接信息: {host}:{port}, 认证源: {auth_source}, 认证机制: {auth_mechanism}")
-            logger.debug(f"MongoDB连接选项: 连接池大小: {connection_pool_size}, 超时: {timeout_ms}ms")
-            logger.debug(f"MongoDB数据库名称: {self.db_name}")
-            
-            # 创建MongoDB客户端 - 使用从配置或参数中获取的数据库名称
-            mongo_client = MongoDBClient(
-                uri=uri,
-                host=host,
-                port=port,
-                username=username,
-                password=password,
-                db_name=self.db_name,  # 使用从配置或初始化参数中获取的db_name
-                auth_source=auth_source,
-                auth_mechanism=auth_mechanism,
-                connection_pool_size=connection_pool_size,
-                timeout_ms=timeout_ms
-            )
-            
-            # 连接到数据库
-            if not mongo_client.connect():
-                logger.error("连接MongoDB失败")
-                sys.exit(1)
-                
-            return mongo_client
-        except Exception as e:
-            logger.error(f"初始化MongoDB客户端失败: {str(e)}")
-            sys.exit(1)
-
-    def _init_port_allocator(self) -> Optional[PortAllocator]:
-        """初始化多WAN口管理器"""
-        try:
-            # 检查是否启用WAN接口
+            logger.info(f"获取到WAN口索引: {self.available_wan_indices}")
+        except ImportError as e:
+            logger.error(f"导入端口分配器失败: {str(e)}")
+            self.available_wan_indices = []
+            self.available_wan_count = 0
+        
+        # 如果没有可用WAN口，检查wan配置
+        if self.available_wan_count == 0:
+            # 从配置中直接获取WAN列表
             wan_config = self.config.get("wan", {})
-            wan_enabled = wan_config.get("enabled", False)
+            wan_list = wan_config.get("wan_list", [])
+            logger.info(f"配置中的WAN列表: {wan_list}")
             
-            if not wan_enabled:
-                logger.warning("多WAN口功能未启用，将使用系统默认网络接口")
-                return None
-                
-            # 获取WAN接口配置
-            if not wan_config.get("port_ranges"):
-                logger.warning("未配置WAN接口端口范围，将使用系统默认网络接口")
-                return None
-            
-            # 使用全局端口分配器
-            from wan_manager.port_allocator import port_allocator
-            
-            # 检查是否有可用WAN接口
-            available_indices = port_allocator.get_available_wan_indices()
-            if not available_indices:
-                logger.warning("没有可用的WAN接口，将使用系统默认网络接口")
-                return None
-                
-            logger.debug(f"已初始化多WAN口管理器，可用接口索引: {available_indices}")
-            return port_allocator
-        except Exception as e:
-            logger.error(f"初始化多WAN口管理器失败: {str(e)}")
-            return None
-            
-    def _get_wan_socket(self, wan_idx: int = None) -> Optional[Tuple[int, int]]:
-        """
-        获取WAN接口和端口
-        
-        Args:
-            wan_idx: 指定WAN接口索引，如果为None则自动选择
-            
-        Returns:
-            (wan_idx, port) 元组，或者None表示失败
-        """
-        if not self.port_allocator:
-            return None
-            
-        try:
-            # 获取可用的WAN接口索引
-            available_indices = self.port_allocator.get_available_wan_indices()
-            if not available_indices:
-                logger.warning("没有可用的WAN接口")
-                return None
-            
-            # 如果指定了WAN索引，检查是否可用
-            if wan_idx is not None:
-                if wan_idx not in available_indices:
-                    logger.warning(f"指定的WAN {wan_idx} 不可用，尝试其他WAN")
-                    # 选择另一个可用的WAN
-                    wan_idx = random.choice(available_indices)
+            logger.warning("未找到可用的WAN口，将使用串行模式")
+            self.serial_mode = True
+            self.max_workers = 1
+        else:
+            # 确保并行线程数不超过可用WAN口数量
+            if max_workers > self.available_wan_count:
+                logger.warning(f"指定的线程数({max_workers})超过了可用WAN口数量({self.available_wan_count})，将自动调整")
+                self.max_workers = self.available_wan_count
             else:
-                # 随机选择一个WAN接口
-                wan_idx = random.choice(available_indices)
+                self.max_workers = max_workers
+        
+        # 存储WAN口使用情况
+        self.wan_locks = {}
+        for wan_idx in self.available_wan_indices:
+            self.wan_locks[wan_idx] = threading.Lock()
             
-            # 在分配端口前短暂休眠，减少端口冲突
-            time.sleep(0.1 + random.random() * 0.3)  # 0.1-0.4秒随机延迟
+        # 如果没有WAN锁，至少创建一个默认锁以避免错误
+        if not self.wan_locks:
+            # 添加默认WAN锁用于串行模式
+            self.wan_locks[0] = threading.Lock()
+        
+        # 用于存储并行处理结果的队列
+        self.result_queue = queue.Queue()
+        
+        # 日志输出
+        logger.info(f"交易所: {self.exchange}, 日期范围: {self.start_date} - {self.end_date}")
+        logger.info(f"处理模式: {'串行' if self.serial_mode else '并行'}, 可用WAN口数量: {self.available_wan_count}, 并行线程数: {self.max_workers}")
+        if self.full_mode:
+            logger.info("抓取模式: 完整模式(按股票代码)，将抓取所有历史数据而不限制日期范围")
+        else:
+            logger.info(f"抓取模式: 日期模式(按交易日)，日期范围: {self.start_date} - {self.end_date}")
+        
+        # 添加类型停止标志
+        self.stop_processing = False
+    
+    def _get_wan_socket(self, wan_idx=None, retry_count=0):
+        """
+        获取一个WAN网络socket用于连接Tushare API
+        
+        Args:
+            wan_idx: 指定WAN口索引，如果为None则随机选择
+            retry_count: 重试次数
             
-            # 分配端口（包含随机性）
-            max_attempts = 3
-            for attempt in range(max_attempts):
-                try:
-                    # 获取一个端口
-                    port = self.port_allocator.allocate_port(wan_idx)
-                    if port:
-                        # 检查端口是否最近使用过，如果是，则检查时间间隔
-                        now = time.time()
-                        with self.port_lock:
-                            port_key = f"{wan_idx}:{port}"
-                            if port_key in self.used_ports:
-                                last_used = self.used_ports[port_key]
-                                elapsed = now - last_used
-                                if elapsed < self.port_release_timeout:
-                                    logger.warning(f"端口 {port_key} 最近已使用，间隔 {elapsed:.1f}秒 小于超时 {self.port_release_timeout}秒，释放并重新选择")
-                                    self.port_allocator.release_port(wan_idx, port)
-                                    # 尝试选择另一个WAN或等待
-                                    time.sleep(0.5 + random.random())
-                                    continue
-                                    
-                            # 记录端口使用时间
-                            self.used_ports[port_key] = now
-                            
-                        # 检查端口是否真的可用
-                        if not tcp_port_is_free(port):
-                            logger.warning(f"端口 {port} 系统指示不可用，释放并重试")
-                            self.port_allocator.release_port(wan_idx, port)
-                            # 尝试选择另一个WAN或等待
-                            time.sleep(0.5 + random.random())
-                            continue
-                            
-                        logger.debug(f"使用WAN接口 {wan_idx}，本地端口 {port}")
-                        return (wan_idx, port)
-                    else:
-                        # 如果此WAN没有可用端口，尝试其他WAN接口
-                        logger.warning(f"WAN {wan_idx} 没有可用端口，尝试其他WAN")
-                        other_indices = [idx for idx in available_indices if idx != wan_idx]
-                        if other_indices:
-                            # 使用其他WAN索引
-                            wan_idx = random.choice(other_indices)
-                        else:
-                            # 所有WAN接口都没有可用端口
-                            logger.warning("所有WAN接口都没有可用端口")
-                            # 短暂等待后重试当前WAN
-                            time.sleep(0.5 + random.random())
-                except Exception as e:
-                    logger.warning(f"分配端口时出错: {str(e)}，尝试第 {attempt+1}/{max_attempts} 次")
-                    time.sleep(0.5 + random.random())
-            
-            logger.warning(f"无法为WAN {wan_idx} 分配端口，所有尝试均失败")
+        Returns:
+            元组 (socket对象, 端口号, WAN口索引)
+        """
+        # 如果超过最大重试次数，抛出异常
+        max_retry = getattr(self, 'max_retry', 3)
+        if retry_count > max_retry:
+            logger.error(f"无法获取WAN端口，已重试{retry_count}次")
             return None
-            
-        except Exception as e:
-            logger.error(f"获取WAN接口失败: {str(e)}")
-            return None
-
-    def get_target_ts_codes_from_stock_basic(self) -> Set[str]:
-        """
-        从stock_basic集合中获取目标板块的股票代码
         
-        Returns:
-            目标板块股票代码集合
-        """
-        try:
-            # 确保MongoDB连接
-            if not self.mongo_client.is_connected():
-                logger.warning("MongoDB未连接，尝试重新连接...")
-                if not self.mongo_client.connect():
-                    logger.error("重新连接MongoDB失败")
-                    return set()
+        # 端口分配器（如果未初始化，则尝试初始化）
+        if not hasattr(self, 'port_allocator') or self.port_allocator is None:
+            try:
+                # 使用新的getter函数获取端口分配器
+                from core.wan_manager import get_port_allocator
+                self.port_allocator = get_port_allocator()
                 
-            # 查询stock_basic集合中符合条件的股票代码
-            logger.info(f"从stock_basic集合查询目标板块 {self.target_market_codes} 的股票代码")
-            
-            # 构建查询条件：symbol前两位在target_market_codes中
-            query_conditions = []
-            for market_code in self.target_market_codes:
-                # 使用正则表达式匹配symbol前两位
-                query_conditions.append({"symbol": {"$regex": f"^{market_code}"}})
-                
-            # 使用$or操作符组合多个条件
-            query = {"$or": query_conditions} if query_conditions else {}
-            
-            # 只查询ts_code字段
-            result = self.mongo_client.find("stock_basic", query, projection={"ts_code": 1, "_id": 0})
-            
-            # 提取ts_code集合
-            ts_codes = set()
-            for doc in result:
-                if "ts_code" in doc:
-                    ts_codes.add(doc["ts_code"])
-            
-            logger.success(f"从stock_basic集合获取到 {len(ts_codes)} 个目标股票代码")
-            
-            # 输出详细日志
-            if self.verbose:
-                sample_codes = list(ts_codes)[:5] if ts_codes else []
-                logger.debug(f"样例股票代码: {sample_codes}")
-                
-            return ts_codes
-            
-        except Exception as e:
-            logger.error(f"查询stock_basic集合失败: {str(e)}")
-            import traceback
-            logger.debug(f"详细错误信息: {traceback.format_exc()}")
-            return set()
-            
-    def _ensure_indexes(self, collection) -> bool:
-        """
-        确保必要的索引存在
+                # 获取可用WAN口
+                self.available_wan_indices = self.port_allocator.get_available_wan_indices()
+                self.available_wan_count = len(self.available_wan_indices)
+                logger.debug(f"获取到的WAN口索引: {self.available_wan_indices}")
+            except Exception as e:
+                logger.error(f"获取端口分配器失败: {str(e)}")
+                logger.warning("获取WAN端口失败")
+                return None
         
-        Args:
-            collection: MongoDB集合对象
-            
-        Returns:
-            是否成功创建或确认索引
-        """
-        try:
-            # 获取现有索引
-            existing_indexes = collection.index_information()
-            logger.debug(f"现有索引信息: {existing_indexes}")
-            
-            # 获取索引字段配置
-            index_fields = self.interface_config.get("index_fields", ["ts_code", "suspend_date"])
-            
-            # 检查复合唯一索引 (ts_code, suspend_date)
-            index_name = "_".join([f"{field}_1" for field in index_fields])
-            index_created = False
-            
-            # 检查索引是否存在并且结构正确
-            if index_name in existing_indexes:
-                # 验证索引的键和属性
-                existing_index = existing_indexes[index_name]
-                expected_keys = [(field, 1) for field in index_fields]
-                
-                # 确保是有序的正确键和唯一约束
-                keys_match = all(key in expected_keys for key in existing_index['key']) and len(existing_index['key']) == len(expected_keys)
-                is_unique = existing_index.get('unique', False)
-                
-                if keys_match and is_unique:
-                    logger.debug(f"复合唯一索引 ({', '.join(index_fields)}) 已存在且结构正确，跳过创建")
-                else:
-                    # 索引存在但结构不正确，删除并重建
-                    logger.info(f"复合唯一索引 ({', '.join(index_fields)}) 存在但结构不正确，删除并重建索引")
-                    try:
-                        collection.drop_index(index_name)
-                        logger.debug(f"成功删除现有索引: {index_name}")
-                    except Exception as e:
-                        logger.error(f"删除索引时出错: {str(e)}")
-                    
-                    # 创建正确的索引
-                    collection.create_index(
-                        [(field, 1) for field in index_fields], 
-                        unique=True, 
-                        background=True
-                    )
-                    logger.success(f"已重建复合唯一索引 ({', '.join(index_fields)})")
-                    index_created = True
+        # 如果未指定WAN口，随机选择一个可用的WAN口
+        if wan_idx is None:
+            if not self.available_wan_indices:
+                logger.warning("无可用WAN口，尝试使用默认WAN口")
+                wan_idx = 0  # 使用默认WAN口
             else:
-                # 索引不存在，创建它
-                logger.info(f"正在为集合 {collection.name} 创建复合唯一索引 ({', '.join(index_fields)})...")
-                collection.create_index(
-                    [(field, 1) for field in index_fields], 
-                    unique=True, 
-                    background=True
-                )
-                logger.success(f"已成功创建复合唯一索引 ({', '.join(index_fields)})")
-                index_created = True
-            
-            # 检查单字段索引
-            for field in index_fields:
-                index_field_name = f"{field}_1"
-                if index_field_name not in existing_indexes:
-                    logger.info(f"正在为字段 {field} 创建索引...")
-                    collection.create_index(field)
-                    logger.success(f"已为字段 {field} 创建索引")
-                    index_created = True
-                else:
-                    logger.debug(f"字段 {field} 的索引已存在，跳过创建")
-            
-            # 确保在创建索引后等待一小段时间，让MongoDB完成索引构建
-            if index_created:
-                logger.info("索引已创建或修改，等待MongoDB完成索引构建...")
-                time.sleep(1.0)  # 等待1秒，让MongoDB完成索引构建
-            
-            return True
-                    
-        except Exception as e:
-            logger.error(f"创建索引时出错: {str(e)}")
-            import traceback
-            logger.debug(f"详细错误信息: {traceback.format_exc()}")
-            return False 
-
-    def fetch_suspend_by_date(self, trade_date: str) -> pd.DataFrame:
-        """
-        按日期获取停牌信息
+                # 引入随机延迟，避免多进程同时申请同一个WAN口
+                if retry_count == 0:
+                    time.sleep(random.uniform(0, 0.5))
+                wan_idx = random.choice(self.available_wan_indices)
         
-        Args:
-            trade_date: 交易日期，格式为YYYYMMDD
-            
-        Returns:
-            DataFrame形式的停牌数据
-        """
         try:
-            params = {"suspend_date": trade_date}
+            # 申请端口
+            port = self.port_allocator.allocate_port(wan_idx)
+            if not port:
+                # 分配失败，记录日志
+                logger.warning(f"WAN端口分配失败: wan_idx={wan_idx}，将重试")
                 
-            logger.debug(f"获取日期 {trade_date} 的停牌数据")
+                # 引入随机延迟，减少端口竞争
+                time.sleep(random.uniform(0.5, 1.0))
+                
+                # 递归重试，尝试其他WAN口
+                return self._get_wan_socket(None, retry_count + 1)
+                
+            logger.debug(f"成功分配WAN端口: wan_idx={wan_idx}, port={port}")
             
-            df = self.client.get_data(
-                api_name="suspend",
-                params=params,
-                fields=self.interface_config.get("available_fields", [])
-            )
+            # 创建socket对象
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             
-            if df.empty:
-                logger.warning(f"日期 {trade_date} 未获取到停牌数据")
-                return pd.DataFrame()
+            # 绑定到分配的端口
+            sock.bind(('0.0.0.0', port))
             
-            logger.info(f"成功获取日期 {trade_date} 的停牌数据，共 {len(df)} 条记录")
-            return df
+            return sock, port, wan_idx
         except Exception as e:
-            logger.error(f"获取日期 {trade_date} 的停牌数据失败: {str(e)}")
-            return pd.DataFrame()
+            # 分配失败，记录日志
+            logger.warning(f"WAN端口分配失败: wan_idx={wan_idx}, 错误={str(e)}, 将重试")
+            
+            # 确保释放已分配的端口
+            try:
+                if 'port' in locals() and port:
+                    self.port_allocator.release_port(wan_idx, port)
+            except:
+                pass
+            
+            # 引入随机延迟，减少端口竞争
+            time.sleep(random.uniform(0.5, 1.0))
+            
+            # 递归重试，尝试其他WAN口
+            return self._get_wan_socket(None, retry_count + 1)
     
-    def fetch_suspend_by_code(self, ts_code: str) -> pd.DataFrame:
+    def fetch_data(self, **kwargs) -> Optional[pd.DataFrame]:
         """
-        按股票代码获取停牌信息
+        从Tushare获取停复牌数据
         
         Args:
-            ts_code: 股票代码
-            
-        Returns:
-            DataFrame形式的停牌数据
-        """
-        try:
-            params = {"ts_code": ts_code}
-                
-            logger.debug(f"获取股票 {ts_code} 的停牌数据")
-            
-            df = self.client.get_data(
-                api_name="suspend",
-                params=params,
-                fields=self.interface_config.get("available_fields", [])
-            )
-            
-            if df.empty:
-                logger.warning(f"股票 {ts_code} 未获取到停牌数据")
-                return pd.DataFrame()
-                
-            logger.info(f"成功获取股票 {ts_code} 的停牌数据，共 {len(df)} 条记录")
-            return df
-        except Exception as e:
-            logger.error(f"获取股票 {ts_code} 的停牌数据失败: {str(e)}")
-            return pd.DataFrame()
-    
-    def filter_by_target_ts_codes(self, df: pd.DataFrame, target_ts_codes: Set[str]) -> pd.DataFrame:
-        """
-        根据目标股票代码过滤数据
-        
-        Args:
-            df: 待过滤的DataFrame
-            target_ts_codes: 目标股票代码集合
+            **kwargs: 查询参数，包括：
+                ts_code: 股票代码
+                suspend_date: 停牌日期
+                resume_date: 复牌日期
+                wan_idx: 指定WAN口索引，可选
+                use_wan: 是否使用WAN口，默认True
         
         Returns:
-            过滤后的DataFrame
+            返回DataFrame或者None（如果出错）
         """
-        if df.empty:
-            return df
-            
-        # 过滤不在目标股票代码中的记录
-        logger.debug(f"过滤前记录数: {len(df)}")
-        filtered_df = df[df['ts_code'].isin(target_ts_codes)]
-        logger.debug(f"过滤后记录数: {len(filtered_df)}")
+        ts_code = kwargs.get('ts_code')
+        suspend_date = kwargs.get('suspend_date')
+        resume_date = kwargs.get('resume_date')
+        start_date = kwargs.get('start_date')
+        end_date = kwargs.get('end_date')
         
-        return filtered_df
-    
-    def save_to_mongodb(self, df: pd.DataFrame) -> bool:
-        """
-        将数据保存到MongoDB
+        # 是否使用WAN口
+        use_wan = kwargs.get('use_wan', True)
         
-        Args:
-            df: 待保存的DataFrame
-            
-        Returns:
-            是否成功保存
-        """
-        if df is None or df.empty:
-            logger.warning("没有数据可保存到MongoDB")
-            return False
-            
-        try:
-            start_time = time.time()
-            
-            # 确保MongoDB连接
-            if not self.mongo_client.is_connected():
-                logger.warning("MongoDB未连接，尝试重新连接...")
-                if not self.mongo_client.connect():
-                    logger.error("重新连接MongoDB失败")
-                    return False
-            
-            # 获取MongoDB数据库和集合
-            db = self.mongo_client.client[self.db_name]  # 使用client属性直接访问数据库
-            collection = db[self.collection_name]
-            
-            # 首先创建索引 - 提前创建索引以提高插入和查询效率
-            if not self._ensure_indexes(collection):
-                logger.warning("索引创建或确认失败，将尝试继续保存数据")
-            
-            # 将DataFrame转换为字典列表
-            records = df.to_dict('records')
-            
-            # 批量处理，避免一次性处理太多记录
-            batch_size = 1000  # 设置合适的批量大小
-            total_batches = (len(records) + batch_size - 1) // batch_size
-            
-            total_inserted = 0
-            total_updated = 0
-            total_skipped = 0
-            
-            # 准备批量操作
-            for i in range(0, len(records), batch_size):
-                batch = records[i:i+batch_size]
-                
-                # 增加超时时间，避免大批量操作超时
-                try:
-                    # 使用更适合的唯一键 - 根据业务逻辑
-                    unique_keys = self.interface_config.get("index_fields", ["ts_code", "suspend_date"])
-                    batch_result = self._batch_upsert(collection, batch, unique_keys)
-                    
-                    # 更新统计信息
-                    total_inserted += batch_result.get("inserted", 0)
-                    total_updated += batch_result.get("updated", 0)
-                    if "skipped" in batch_result:
-                        total_skipped += batch_result["skipped"]
-                    
-                    # 进度显示
-                    if self.verbose and total_batches > 1:
-                        progress = (i + len(batch)) / len(records) * 100
-                        progress = min(progress, 100)
-                        logger.debug(f"MongoDB保存进度: {i+len(batch)}/{len(records)} ({progress:.1f}%)")
-                except Exception as e:
-                    logger.error(f"批量处理数据时出错: {str(e)}")
-                    import traceback
-                    logger.debug(f"详细错误信息: {traceback.format_exc()}")
-            
-            elapsed = time.time() - start_time
-            total_processed = total_inserted + total_updated + total_skipped
-            
-            # 保存操作统计信息，供调用方使用
-            self.last_operation_stats = {
-                "inserted": total_inserted,
-                "updated": total_updated,
-                "skipped": total_skipped,
-                "total": total_processed
-            }
-            
-            # 输出详细的统计信息
-            logger.success(f"数据处理完成: 新插入 {total_inserted} 条记录，更新 {total_updated} 条记录，跳过 {total_skipped} 条记录，共处理 {total_processed}/{len(records)} 条记录，耗时 {elapsed:.2f}s")
-            
-            # 确认是否成功处理了数据
-            if total_processed > 0:
-                return True
-            else:
-                if len(records) > 0:
-                    logger.warning(f"提交了 {len(records)} 条记录，但MongoDB未报告任何插入、更新或跳过的记录")
-                return False
-                
-        except Exception as e:
-            logger.error(f"保存数据到MongoDB失败: {str(e)}")
-            import traceback
-            logger.debug(f"详细错误信息: {traceback.format_exc()}")
-            return False
-    
-    def _batch_upsert(self, collection, records: List[Dict], unique_keys: List[str]) -> Dict[str, int]:
-        """
-        批量更新或插入记录
+        # 提取WAN口索引（如果指定了）
+        wan_idx = kwargs.get('wan_idx')
         
-        Args:
-            collection: MongoDB集合对象
-            records: 要保存的记录列表
-            unique_keys: 唯一键列表
-            
-        Returns:
-            包含插入、更新和跳过记录数的字典
-        """
-        if not records:
-            return {"inserted": 0, "updated": 0, "skipped": 0}
-            
-        # 为了提高效率，我们不再逐个检查记录是否存在，而是批量处理
-        # 而是用两步策略：先查询哪些记录已存在，然后将记录分为插入和更新两组
-        inserted = 0
-        updated = 0
-        skipped = 0
-        
-        # 构建所有记录的唯一键查询
-        existing_records = set()
-        queries = []
-        valid_records = []
-        
-        # 第一步：提取所有有效记录并构建查询条件
-        for record in records:
-            # 构建查询条件
-            query = {}
-            key_str = ""
-            is_valid = True
-            
-            for key in unique_keys:
-                if key in record and record[key] is not None:
-                    query[key] = record[key]
-                    key_str += str(record[key]) + "_"
-                else:
-                    # 缺少唯一键字段，标记为无效
-                    is_valid = False
-                    break
-                    
-            if not is_valid or len(query) != len(unique_keys):
-                # 跳过无效记录
-                skipped += 1
-                continue
-                
-            # 检查是否已处理过相同的记录
-            if key_str in existing_records:
-                skipped += 1
-                continue
-                
-            # 记录唯一键，准备查询
-            existing_records.add(key_str)
-            queries.append(query)
-            valid_records.append((record, query))
-            
-        # 第二步：查询哪些记录已经存在
-        if not valid_records:
-            logger.warning("没有有效记录可以处理")
-            return {"inserted": 0, "updated": 0, "skipped": skipped}
-            
-        # 使用$or查询批量检查记录是否存在
-        existing_keys = set()
-        try:
-            if queries:
-                query = {"$or": queries}
-                existing_docs = collection.find(query, {"_id": 0, **{k: 1 for k in unique_keys}})
-                
-                # 记录已存在的记录的唯一键
-                for doc in existing_docs:
-                    key_values = tuple(doc.get(key) for key in unique_keys)
-                    existing_keys.add(key_values)
-        except Exception as e:
-            logger.error(f"批量查询记录存在性失败: {str(e)}")
-            # 如果查询失败，假设所有记录都需要更新
-            existing_keys = set()  # 清空集合，后续会执行upsert
-            
-        # 根据查询结果准备插入和更新操作
-        insert_ops = []
-        update_ops = []
-        
-        for record, query in valid_records:
-            # 构建唯一键元组
-            key_values = tuple(record.get(key) for key in unique_keys)
-            
-            if key_values in existing_keys:
-                # 记录已存在，执行更新
-                update_ops.append(
-                    pymongo.UpdateOne(
-                        query,
-                        {"$set": record}
-                    )
-                )
-                updated += 1
-            else:
-                # 记录不存在，执行插入
-                insert_ops.append(pymongo.InsertOne(record))
-                inserted += 1
-                
-        # 分别执行插入和更新操作
-        try:
-            # 设置合理的WriteConcern参数
-            from pymongo import WriteConcern
-            temp_collection = collection.with_options(
-                write_concern=WriteConcern(w=1, j=False)
-            )
-            
-            # 执行插入操作
-            if insert_ops:
-                try:
-                    insert_result = temp_collection.bulk_write(insert_ops, ordered=False)
-                    real_inserted = insert_result.inserted_count
-                    if real_inserted != len(insert_ops):
-                        logger.warning(f"实际插入数量与预期不一致: 预期={len(insert_ops)}, 实际={real_inserted}")
-                        inserted = real_inserted
-                except pymongo.errors.BulkWriteError as bwe:
-                    # 处理部分失败的插入
-                    if hasattr(bwe, 'details'):
-                        details = bwe.details
-                        if 'nInserted' in details:
-                            inserted = details['nInserted']
-                        skipped += len(insert_ops) - inserted
-                        
-                        # 检查是否有重复键错误
-                        if 'writeErrors' in details:
-                            for error in details['writeErrors']:
-                                if error.get('code') == 11000:  # 重复键错误
-                                    if self.verbose:
-                                        logger.debug(f"插入操作重复键错误: {error.get('errmsg', '')}")
-                                        
-                    logger.warning(f"插入操作部分失败: {len(bwe.details.get('writeErrors', []))} 错误")
-            
-            # 执行更新操作
-            if update_ops:
-                try:
-                    update_result = temp_collection.bulk_write(update_ops, ordered=False)
-                    real_updated = update_result.modified_count
-                    if real_updated != len(update_ops):
-                        logger.debug(f"部分记录未被修改，可能数据未变化: 预期={len(update_ops)}, 实际修改={real_updated}")
-                except pymongo.errors.BulkWriteError as bwe:
-                    # 处理部分失败的更新
-                    if hasattr(bwe, 'details'):
-                        details = bwe.details
-                        if 'nModified' in details:
-                            updated = details['nModified']
-                        skipped += len(update_ops) - updated
-                    logger.warning(f"更新操作部分失败: {len(bwe.details.get('writeErrors', []))} 错误")
-                    
-        except Exception as e:
-            logger.error(f"执行批量操作失败: {str(e)}")
-            import traceback
-            logger.debug(f"详细错误信息: {traceback.format_exc()}")
-            
-        return {"inserted": inserted, "updated": updated, "skipped": skipped} 
-
-    def fetch_suspend_with_wan(self, ts_code: str = None, suspend_date: str = None, resume_date: str = None, wan_info: Tuple[int, int] = None) -> pd.DataFrame:
-        """
-        使用WAN接口获取停牌数据
-        
-        Args:
-            ts_code: 可选，股票代码
-            suspend_date: 可选，停牌日期
-            resume_date: 可选，复牌日期
-            wan_info: WAN接口和端口信息，格式为(wan_idx, port)
-            
-        Returns:
-            DataFrame形式的停牌数据
-        """
+        # 设置API参数
         params = {}
         if ts_code:
-            params["ts_code"] = ts_code
+            params['ts_code'] = ts_code
         if suspend_date:
-            params["suspend_date"] = suspend_date
+            params['suspend_date'] = suspend_date
         if resume_date:
-            params["resume_date"] = resume_date
-            
-        # 准备日志消息
-        log_msg = "获取停牌数据"
-        if ts_code:
-            log_msg += f" 股票代码: {ts_code}"
-        if suspend_date:
-            log_msg += f" 停牌日期: {suspend_date}"
-        if resume_date:
-            log_msg += f" 复牌日期: {resume_date}"
-            
-        logger.debug(log_msg)
+            params['resume_date'] = resume_date
         
-        # 准备API参数
-        api_name = "suspend"
-        fields = self.interface_config.get("available_fields", [])
+        # 参数检查：需要提供 ts_code 或 suspend_date 或 resume_date 中的至少一个
+        if not (ts_code or suspend_date or resume_date):
+            logger.error("必须提供 ts_code、suspend_date 或 resume_date 中的至少一个")
+            return None
         
-        # 使用传入的WAN接口
-        use_wan = wan_info is not None
-        max_retries = 5
-        retry_count = 0
+        # 检查是否同时提供了 suspend_date 和 resume_date
+        if suspend_date and resume_date:
+            logger.warning("suspend_date 和 resume_date 不能同时提供，将只使用 suspend_date")
+            del params['resume_date']  # 删除 resume_date
         
-        while retry_count <= max_retries:
-            try:
-                # 调用Tushare API
-                if use_wan:
-                    wan_idx, port = wan_info
-                    logger.debug(f"使用WAN接口 {wan_idx} 和本地端口 {port} 请求数据")
-                    
-                    # 创建WAN专用客户端
-                    client = TushareClientWAN(token=self.token, timeout=120, api_url=self.api_url)
-                    client.set_local_address('0.0.0.0', port, wan_idx)
-                else:
-                    # 使用普通客户端
-                    client = self.client
-                    client.set_timeout(120)
-                
-                # 获取数据
-                start_time = time.time()
-                df = client.get_data(api_name=api_name, params=params, fields=fields)
-                elapsed = time.time() - start_time
-                
-                # 释放WAN端口（如果使用了）
-                if use_wan:
-                    # 增加随机延迟再释放端口
-                    release_delay = 1 + random.random() * 2  # 1-3秒的随机延迟
-                    time.sleep(release_delay)
-                    logger.debug(f"延迟 {release_delay:.2f}秒后释放WAN {wan_idx} 的端口 {port}")
-                    self.port_allocator.release_port(wan_idx, port)
-                
-                if df is None:
-                    # 记录错误并调整退避策略
-                    self._record_error()
-                    
-                    logger.warning(f"{log_msg} 失败，返回None")
-                    retry_count += 1
-                    
-                    # 获取动态调整的等待时间
-                    wait_time = self._get_retry_wait_time(retry_count)
-                    logger.info(f"第 {retry_count}/{max_retries} 次重试，等待 {wait_time:.1f} 秒")
-                    time.sleep(wait_time)
-                    continue
-                
-                if df.empty:
-                    logger.info(f"{log_msg} 未获取到数据")
-                    return pd.DataFrame()
-                
-                # 记录成功
-                self._record_success()
-                logger.info(f"成功获取 {len(df)} 条停牌记录，耗时 {elapsed:.2f}s")
-                return df
-                
-            except Exception as e:
-                # 记录错误
-                self._record_error()
-                
-                retry_count += 1
-                error_msg = str(e)
-                
-                # 释放WAN端口（如果使用了）
-                if use_wan:
-                    wan_idx, port = wan_info
-                    # 增加随机延迟再释放端口
-                    release_delay = 1 + random.random() * 2  # 1-3秒的随机延迟
-                    time.sleep(release_delay)
-                    logger.debug(f"延迟 {release_delay:.2f}秒后释放WAN {wan_idx} 的端口 {port}")
-                    self.port_allocator.release_port(wan_idx, port)
-                
-                # 判断是否为速率限制错误
-                error_type = "rate_limit" if "40203" in error_msg else None
-                wait_time = self._get_retry_wait_time(retry_count, error_type)
-                
-                if "40203" in error_msg:
-                    logger.warning(f"触发API速率限制，将等待 {wait_time:.1f} 秒后重试 ({retry_count}/{max_retries})")
-                else:
-                    logger.warning(f"获取数据失败: {error_msg}，将在 {wait_time:.1f} 秒后重试 ({retry_count}/{max_retries})")
-                
-                if retry_count > max_retries:
-                    logger.error(f"达到最大重试次数，放弃获取数据")
-                    return pd.DataFrame()
-                    
-                time.sleep(wait_time)
+        # 设置WAN接口参数
+        wan_info = None
+        sock = None
         
-        logger.error("获取数据失败，已达最大重试次数")
-        return pd.DataFrame()
-
-    def fetch_suspend_batch(self, ts_codes: List[str], suspend_date: str = None, resume_date: str = None) -> pd.DataFrame:
-        """
-        批量获取多个股票的停牌数据（串行方式）
-        
-        Args:
-            ts_codes: 股票代码列表
-            suspend_date: 可选，停牌日期
-            resume_date: 可选，复牌日期
-            
-        Returns:
-            所有股票的停牌数据合并后的DataFrame
-        """
-        if not ts_codes:
-            logger.warning("没有股票代码可以查询")
-            return pd.DataFrame()
-        
-        # 进度统计变量
-        total_stocks = len(ts_codes)
-        processed_stocks = 0
-        success_stocks = 0
-        total_records = 0
-        all_data = []
-        
-        start_time = time.time()
-        
-        # 逐个股票代码获取数据
-        for ts_code in ts_codes:
-            # 获取停牌数据
-            df = self.fetch_suspend_with_wan(
-                ts_code=ts_code,
-                suspend_date=suspend_date,
-                resume_date=resume_date,
-                wan_info=self._get_wan_socket()
-            )
-            
-            # 更新统计信息
-            processed_stocks += 1
-            if not df.empty:
-                success_stocks += 1
-                total_records += len(df)
-                all_data.append(df)
-                logger.info(f"股票 {ts_code} 获取到 {len(df)} 条停牌记录")
-                
-                # 每批次数据立即保存
-                self.save_to_mongodb(df)
-            else:
-                logger.info(f"股票 {ts_code} 未获取到停牌数据")
-            
-            # 更新进度
-            progress = processed_stocks / total_stocks * 100
-            elapsed = time.time() - start_time
-            avg_time = elapsed / processed_stocks
-            remaining = avg_time * (total_stocks - processed_stocks)
-            
-            logger.info(f"进度: {processed_stocks}/{total_stocks} ({progress:.1f}%), "
-                       f"耗时: {elapsed:.1f}s, 剩余: {remaining:.1f}s")
-            
-            # 短暂休眠，避免API调用过于频繁
-            time.sleep(1)
-        
-        # 合并所有数据
-        if all_data:
-            result_df = pd.concat(all_data, ignore_index=True)
-            logger.success(f"共获取 {success_stocks}/{total_stocks} 个股票的停牌数据，总计 {total_records} 条记录")
-            return result_df
-        else:
-            logger.warning(f"未获取到任何停牌数据")
-            return pd.DataFrame()
-
-    def fetch_suspend_parallel(self, ts_codes: List[str], suspend_date: str = None, resume_date: str = None, batch_size: int = 10) -> pd.DataFrame:
-        """
-        使用多WAN口并行获取多个股票的停牌数据
-        
-        Args:
-            ts_codes: 股票代码列表
-            suspend_date: 可选，停牌日期
-            resume_date: 可选，复牌日期
-            batch_size: 每批处理的股票数量
-            
-        Returns:
-            所有股票的停牌数据合并后的DataFrame（空DataFrame，因为数据已保存到MongoDB）
-        """
-        if not ts_codes:
-            logger.warning("没有股票代码可以查询")
-            return pd.DataFrame()
-            
-        # 获取可用的WAN接口
-        available_wans = []
-        if self.port_allocator:
-            available_wans = self.port_allocator.get_available_wan_indices()
-            logger.info(f"可用的WAN接口数量: {len(available_wans)}, WAN索引: {available_wans}")
-            
-        if not available_wans:
-            logger.warning("没有可用的WAN接口，将使用系统默认网络接口")
-            # 如果没有可用WAN，回退到普通批处理
-            return self.fetch_suspend_batch(ts_codes, suspend_date, resume_date)
-        
-        import threading
-        import queue
-        
-        # 将股票代码按批次分组
-        total_stocks = len(ts_codes)
-        batches = []
-        for i in range(0, total_stocks, batch_size):
-            batch = ts_codes[i:i+batch_size]
-            batches.append(batch)
-        
-        total_batches = len(batches)
-        logger.info(f"将 {total_stocks} 个股票分为 {total_batches} 批处理，每批 {batch_size} 个")
-        
-        # 创建工作队列和结果队列
-        task_queue = queue.Queue()
-        result_queue = queue.Queue()
-        
-        # 创建失败任务重试队列
-        retry_queue = queue.Queue()
-        
-        # 加入所有任务
-        for i, batch in enumerate(batches):
-            task_queue.put((i, batch))
-        
-        # 线程锁
-        lock = threading.Lock()
-        
-        # 追踪已处理的批次和WAN口使用情况
-        processed_batches = set()
-        wan_usage_stats = {wan_idx: 0 for wan_idx in available_wans}
-        batch_wan_mapping = {}  # 记录每个批次使用的WAN
-        
-        # 最大重试次数
-        MAX_RETRY = 5
-        
-        # 工作线程函数
-        def worker():
-            while True:
-                # 优先处理重试队列中的任务
-                retry_task = None
-                try:
-                    if not retry_queue.empty():
-                        retry_task = retry_queue.get(block=False)
-                        batch_id, stock_batch, retry_count = retry_task
-                        
-                        with lock:
-                            logger.info(f"开始处理重试任务: 批次 {batch_id+1}/{total_batches} (重试 {retry_count}/{MAX_RETRY})")
-                        
-                        # 为重试任务选择一个不同的WAN
-                        if batch_id in batch_wan_mapping:
-                            used_wan = batch_wan_mapping[batch_id]
-                            # 尝试选择一个不同的WAN
-                            other_wans = [w for w in available_wans if w != used_wan]
-                            if other_wans:
-                                wan_idx = random.choice(other_wans)
-                            else:
-                                wan_idx = random.choice(available_wans)
-                        else:
-                            wan_idx = random.choice(available_wans)
-                    elif not task_queue.empty():
-                        batch_id, stock_batch = task_queue.get(block=False)
-                        retry_count = 0
-                        
-                        # 选择WAN接口 - 负载最小的优先
-                        wan_usage_counts = [(idx, count) for idx, count in wan_usage_stats.items()]
-                        wan_usage_counts.sort(key=lambda x: x[1])  # 按使用次数排序
-                        wan_idx = wan_usage_counts[0][0]  # 使用次数最少的WAN
-                    else:
-                        # 所有任务都已处理
-                        return
-                except queue.Empty:
-                    # 所有任务都已处理
-                    return
-                
-                # 更新WAN使用统计
-                with lock:
-                    wan_usage_stats[wan_idx] = wan_usage_stats.get(wan_idx, 0) + 1
-                    batch_wan_mapping[batch_id] = wan_idx
-                
-                # 获取WAN接口
+        try:
+            # 如果需要使用WAN接口，获取一个WAN socket
+            if use_wan:
                 wan_info = self._get_wan_socket(wan_idx)
                 if not wan_info:
-                    with lock:
-                        logger.warning(f"无法为WAN {wan_idx} 获取端口，将尝试其他WAN接口")
-                    
-                    # 如果还有重试次数，放入重试队列
-                    if retry_count < MAX_RETRY:
-                        retry_queue.put((batch_id, stock_batch, retry_count + 1))
-                    else:
-                        with lock:
-                            logger.error(f"批次 {batch_id+1} 重试达到最大次数 {MAX_RETRY}，放弃处理")
-                        result_queue.put((batch_id, len(stock_batch), 0, wan_idx))
-                    
-                    continue
-                
-                wan_idx, port = wan_info
-                
-                # 处理批次
-                try:
-                    with lock:
-                        logger.info(f"开始处理批次 {batch_id+1}/{total_batches} 使用WAN {wan_idx} 端口 {port}" + 
-                                   (f" (重试 {retry_count}/{MAX_RETRY})" if retry_count > 0 else ""))
-                    
-                    batch_records = 0
-                    batch_data = []
-                    
-                    # 逐个股票处理
-                    for ts_code in stock_batch:
-                        # 获取停牌数据 - 根据是否提供日期参数决定调用方式
-                        df = self.fetch_suspend_with_wan(
-                            ts_code=ts_code,
-                            suspend_date=suspend_date,
-                            resume_date=resume_date,
-                            wan_info=wan_info
-                        )
-                        
-                        if not df.empty:
-                            batch_records += len(df)
-                            batch_data.append(df)
-                            with lock:
-                                logger.info(f"WAN {wan_idx} 批次 {batch_id+1}: 股票 {ts_code} 获取到 {len(df)} 条停牌记录")
-                            
-                            # 单个股票数据立即保存
-                            self.save_to_mongodb(df)
-                        else:
-                            with lock:
-                                logger.debug(f"WAN {wan_idx} 批次 {batch_id+1}: 股票 {ts_code} 未获取到停牌数据")
-                        
-                        # 短暂休眠避免API调用过于频繁
-                        time.sleep(1)
-                    
-                    # 合并批次数据并报告结果
-                    batch_df = pd.concat(batch_data, ignore_index=True) if batch_data else pd.DataFrame()
-                    with lock:
-                        logger.info(f"WAN {wan_idx} 批次 {batch_id+1}/{total_batches} 处理完成，获取到 {batch_records} 条记录")
-                    
-                    # 放入结果队列
-                    result_queue.put((batch_id, len(stock_batch), batch_records, wan_idx))
-                    
-                    # 添加到已处理批次集合
-                    with lock:
-                        processed_batches.add(batch_id)
-                    
-                except Exception as e:
-                    with lock:
-                        logger.error(f"WAN {wan_idx} 处理批次 {batch_id+1} 时出错: {str(e)}")
-                        import traceback
-                        logger.debug(f"详细错误信息: {traceback.format_exc()}")
-                    
-                    # 如果还有重试次数，放入重试队列
-                    if retry_count < MAX_RETRY:
-                        with lock:
-                            logger.warning(f"批次 {batch_id+1} 处理失败，将在重试队列中等待 (重试 {retry_count+1}/{MAX_RETRY})")
-                        retry_queue.put((batch_id, stock_batch, retry_count + 1))
-                    else:
-                        with lock:
-                            logger.error(f"批次 {batch_id+1} 重试达到最大次数 {MAX_RETRY}，放弃处理")
-                        result_queue.put((batch_id, len(stock_batch), 0, wan_idx))
-                    
-                finally:
-                    # 释放WAN端口
-                    if wan_info:
-                        # 增加延迟确保端口完全释放
-                        # Windows系统TIME_WAIT状态通常为2分钟，提供足够的端口释放时间
-                        release_delay = 1 + random.random() * 2  # 1-3秒的随机延迟
-                        time.sleep(release_delay)
-                        logger.debug(f"延迟 {release_delay:.2f}秒后释放WAN {wan_idx} 的端口 {port}")
-                        self.port_allocator.release_port(wan_idx, port)
-        
-        # 启动工作线程
-        threads = []
-        max_concurrent = min(len(available_wans), self.max_workers)
-        logger.info(f"启动 {max_concurrent} 个工作线程进行并行处理，共 {total_batches} 个批次")
-        
-        for _ in range(max_concurrent):
-            thread = threading.Thread(target=worker)
-            thread.daemon = True
-            thread.start()
-            threads.append(thread)
-        
-        # 主线程等待所有任务完成
-        start_time = time.time()
-        completed_batches = 0
-        total_success_stocks = 0
-        total_records = 0
-        
-        # 处理结果
-        while completed_batches < total_batches:
-            try:
-                batch_id, batch_size, batch_records, wan_idx = result_queue.get(timeout=60)
-                
-                completed_batches += 1
-                if batch_records > 0:
-                    total_success_stocks += 1
-                    total_records += batch_records
-                
-                # 更新进度
-                progress = completed_batches / total_batches * 100
-                elapsed = time.time() - start_time
-                avg_time = elapsed / completed_batches if completed_batches > 0 else 0
-                remaining = avg_time * (total_batches - completed_batches)
-                
-                # 活跃的WAN
-                active_wans = set()
-                for bid, wid in batch_wan_mapping.items():
-                    if bid not in processed_batches:
-                        active_wans.add(wid)
-                active_wans_str = ", ".join([f"WAN-{w}" for w in active_wans]) if active_wans else "无"
-                
-                logger.info(f"总进度: {completed_batches}/{total_batches} ({progress:.1f}%) [WAN-{wan_idx}完成, 活跃:{active_wans_str}], "
-                           f"耗时: {elapsed:.1f}s, 剩余: {remaining:.1f}s")
-                
-                # 每完成25%的批次或所有批次完成时，显示WAN使用统计
-                if completed_batches % max(1, total_batches // 4) == 0 or completed_batches == total_batches:
-                    stats_msg = ", ".join([f"WAN-{idx}: {count}次" for idx, count in wan_usage_stats.items()])
-                    logger.info(f"WAN使用统计: {stats_msg}")
-                
-            except queue.Empty:
-                # 检查是否有活动线程
-                active_threads = sum(1 for t in threads if t.is_alive())
-                if active_threads == 0:
-                    logger.warning("等待超时且所有线程已结束，检查是否有未完成的任务")
-                    
-                    remaining_tasks = task_queue.qsize() + retry_queue.qsize()
-                    if remaining_tasks == 0:
-                        logger.warning("没有剩余任务，可能有部分结果未被正确处理")
-                        break
-                    else:
-                        logger.warning(f"还有 {remaining_tasks} 个任务未完成，重新启动工作线程")
-                        # 重新启动一些工作线程
-                        for _ in range(min(remaining_tasks, max_concurrent)):
-                            thread = threading.Thread(target=worker)
-                            thread.daemon = True
-                            thread.start()
-                            threads.append(thread)
-                        
-                logger.info(f"等待结果中，活动线程: {active_threads}, 已完成: {completed_batches}/{total_batches}")
-                # 避免CPU占用过高
-                time.sleep(1)
-        
-        # 等待所有线程结束
-        for thread in threads:
-            thread.join(timeout=5)
+                    logger.warning("无法获取WAN接口，将不使用WAN")
+                    use_wan = False
             
-        # 输出最终统计信息
-        elapsed_total = time.time() - start_time
-        stats_msg = ", ".join([f"WAN-{idx}: {count}次" for idx, count in wan_usage_stats.items()])
-        
-        logger.success(f"并行处理完成，共获取 {total_success_stocks}/{total_batches} 批次的停牌数据，"
-                      f"总计 {total_records} 条记录，耗时 {elapsed_total:.1f}s")
-        logger.info(f"最终WAN使用统计: {stats_msg}")
-        
-        # 返回空DataFrame，因为数据已保存到MongoDB
-        return pd.DataFrame()
-
-    def get_trade_calendar(self, start_date: str, end_date: str) -> List[str]:
+            if use_wan:
+                sock, port, wan_idx = wan_info
+                logger.debug(f"使用WAN接口 {wan_idx} 和本地端口 {port} 请求数据")
+            
+            # 调用 self.client.get_data，并传递 wan_idx
+            result = self.client.get_data(
+                api_name='suspend', 
+                params=params,
+                wan_idx=wan_idx # 传递 wan_idx
+            )
+            return result
+        except Exception as e:
+            # 添加更详细的日志，包括 wan_idx
+            logger.error(f"调用 self.client.get_data 失败 (WAN: {wan_idx}): {str(e)}")
+            return None
+        finally:
+            # 注意：get_data 内部的 finally 块会处理端口释放和状态重置
+            pass
+    
+    def process_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        从MongoDB中获取指定日期范围内的交易日历
+        处理获取的日线基本数据
+        只保留股票代码前两位为00、30、60、68的数据
+        但在full模式下直接返回原始数据，不进行过滤
+        
+        Args:
+            df: 原始日线基本数据
+            
+        Returns:
+            处理后的数据
+        """
+        if df is None or df.empty:
+            return df
+            
+        # 在full模式下直接返回原始数据，不进行过滤
+        if self.full_mode:
+            logger.debug("完整模式(full)下不进行股票代码过滤，返回原始数据")
+            return df
+        
+        # 检查是否存在ts_code字段
+        if 'ts_code' not in df.columns:
+            logger.warning("数据中不包含ts_code字段，无法按板块过滤")
+            return df
+        
+        # 提取ts_code前两位数字
+        try:
+            # 假设ts_code格式为: 000001.SZ，我们需要提取000001的前两位
+            df['code_prefix'] = df['ts_code'].apply(lambda x: x.split('.')[0][:2])
+            
+            # 过滤保留00、30、60、68开头的股票
+            target_prefixes = ['00', '30', '60', '68']
+            filtered_df = df[df['code_prefix'].isin(target_prefixes)].copy()
+            
+            # 删除临时列
+            if 'code_prefix' in filtered_df.columns:
+                filtered_df = filtered_df.drop('code_prefix', axis=1)
+            
+            original_count = len(df)
+            filtered_count = len(filtered_df)
+            
+            logger.info(f"股票数据过滤: 原始 {original_count} 条，过滤后 {filtered_count} 条 (保留00、30、60、68板块)")
+            
+            # 记录过滤后的板块分布
+            if filtered_count > 0 and self.verbose:
+                prefix_counts = df[df['code_prefix'].isin(target_prefixes)]['code_prefix'].value_counts().to_dict()
+                logger.debug(f"各板块数据量: {prefix_counts}")
+            
+            return filtered_df
+        except Exception as e:
+            logger.warning(f"过滤股票板块时发生异常: {str(e)}，返回原始数据")
+            return df
+    
+    def get_trade_dates(self, start_date: str = None, end_date: str = None) -> List[str]:
+        """
+        获取指定日期范围内的交易日列表
+        
+        先从trade_cal集合中查询实际交易日，如果失败则生成日期范围内的所有日期
         
         Args:
             start_date: 开始日期，格式为YYYYMMDD
             end_date: 结束日期，格式为YYYYMMDD
             
         Returns:
-            交易日期列表，格式为YYYYMMDD
+            交易日期列表
+        """
+        # 使用传入的参数或默认参数
+        start_date = start_date or self.start_date
+        end_date = end_date or self.end_date
+        
+        # 首先尝试从MongoDB的trade_cal集合中获取交易日数据
+        try:
+            # 确保MongoDB连接 (使用 self.mongodb_handler)
+            if not self.mongodb_handler:
+                logger.error("MongoDB Handler 未初始化")
+                raise Exception("MongoDB Handler 未初始化")
+            elif not self.mongodb_handler.is_connected():
+                logger.warning("MongoDB未连接，尝试连接...")
+                if not self.mongodb_handler.connect():
+                    logger.error("连接MongoDB失败")
+                    raise Exception("连接MongoDB失败")
+            
+            # 构建查询条件 - 移除 exchange 限制
+            query = {
+                "trade_date": {"$gte": start_date, "$lte": end_date}
+                # "exchange": self.exchange # 移除交易所过滤
+            }
+            
+            # 查询trade_cal集合
+            result = self.mongodb_handler.find_documents("trade_cal", query)
+            
+            # 提取日期列表并去重、排序
+            trade_dates_with_duplicates = [doc.get("trade_date") for doc in result if "trade_date" in doc]
+            # 去重并排序
+            trade_dates = sorted(list(set(trade_dates_with_duplicates)))
+            
+            if trade_dates:
+                logger.info(f"从trade_cal集合获取到 {len(trade_dates)} 个不重复的交易日 (所有交易所)")
+                return trade_dates
+            else:
+                logger.warning("trade_cal集合中未找到符合条件的交易日数据")
+        except Exception as e:
+            logger.error(f"查询trade_cal交易日数据失败: {str(e)}")
+        
+        # 如果从trade_cal获取失败，则生成日期范围内的所有日期作为备选
+        logger.warning("无法从trade_cal获取交易日，将生成日期范围内的所有日期作为备选")
+        logger.info(f"生成日期范围 {start_date} 到 {end_date} 内的所有日期作为交易日")
+        
+        start_date_obj = datetime.strptime(start_date, '%Y%m%d')
+        end_date_obj = datetime.strptime(end_date, '%Y%m%d')
+        
+        all_dates = []
+        current_date = start_date_obj
+        while current_date <= end_date_obj:
+            all_dates.append(current_date.strftime('%Y%m%d'))
+            current_date += timedelta(days=1)
+        
+        logger.info(f"生成日期范围内的所有日期，共 {len(all_dates)} 个日期")
+        return all_dates
+    
+    def fetch_suspend_data(self, trade_date: str) -> Optional[pd.DataFrame]:
+        """
+        获取指定交易日的停复牌数据
+        
+        Args:
+            trade_date: 交易日，格式为YYYYMMDD
+            
+        Returns:
+            指定交易日的数据，如果失败则返回None
+        """
+        logger.info(f"正在获取交易日 {trade_date} 的停复牌数据...")
+        
+        # 分别查询停牌日期和复牌日期数据
+        suspend_df = self.fetch_data(suspend_date=trade_date)
+        resume_df = self.fetch_data(resume_date=trade_date)
+        
+        # 合并数据
+        if suspend_df is not None and not suspend_df.empty and resume_df is not None and not resume_df.empty:
+            # 两者都有数据时合并
+            df = pd.concat([suspend_df, resume_df], ignore_index=True)
+            logger.info(f"交易日 {trade_date} 合并停牌和复牌数据: 停牌 {len(suspend_df)} 条, 复牌 {len(resume_df)} 条")
+            return df
+        elif suspend_df is not None and not suspend_df.empty:
+            # 只有停牌数据
+            logger.info(f"交易日 {trade_date} 只有停牌数据: {len(suspend_df)} 条")
+            return suspend_df
+        elif resume_df is not None and not resume_df.empty:
+            # 只有复牌数据
+            logger.info(f"交易日 {trade_date} 只有复牌数据: {len(resume_df)} 条")
+            return resume_df
+        else:
+            # 都没有数据
+            logger.warning(f"交易日 {trade_date} 没有停牌或复牌数据")
+            return None
+
+    def fetch_stock_data(self, ts_code: str) -> Optional[pd.DataFrame]:
+        """获取指定股票代码的停复牌数据"""
+        logger.info(f"正在获取股票 {ts_code} 的停复牌数据...")
+        
+        # 在full模式下只用ts_code查询
+        params = {'ts_code': ts_code}
+        
+        # 非full模式下需要添加日期条件
+        if not self.full_mode and self.start_date and self.end_date:
+            logger.info(f"查询该股票在 {self.start_date} - {self.end_date} 期间的停复牌数据")
+            
+            # 分别查询停牌和复牌数据
+            suspend_df = self.fetch_data(ts_code=ts_code, suspend_date=self.start_date)
+            resume_df = self.fetch_data(ts_code=ts_code, resume_date=self.start_date)
+            
+            # 合并数据
+            if suspend_df is not None and not suspend_df.empty and resume_df is not None and not resume_df.empty:
+                df = pd.concat([suspend_df, resume_df], ignore_index=True)
+                return df
+            elif suspend_df is not None and not suspend_df.empty:
+                return suspend_df
+            elif resume_df is not None and not resume_df.empty:
+                return resume_df
+            else:
+                return None
+        
+        # 直接查询，full模式下
+        return self.fetch_data(**params)
+    
+    def get_stock_codes(self) -> List[str]:
+        """
+        从MongoDB的stock_basic集合中获取股票代码列表
+        筛选上市日期早于当前日期的股票
+        
+        Returns:
+            股票代码列表
         """
         try:
             # 确保MongoDB连接
-            if not self.mongo_client.is_connected():
-                logger.warning("MongoDB未连接，尝试重新连接...")
-                if not self.mongo_client.connect():
-                    logger.error("重新连接MongoDB失败")
+            if not self.mongodb_handler.is_connected():
+                logger.warning("MongoDB未连接，尝试连接...")
+                if not self.mongodb_handler.connect():
+                    logger.error("连接MongoDB失败")
                     return []
-                    
-            # 连接MongoDB
-            db = self.mongo_client.client[self.db_name]
             
-            # 一般交易日历保存在trade_cal集合中
-            collection = db["trade_cal"]
+            # 获取当前日期作为筛选条件
+            current_date = datetime.now().strftime("%Y%m%d")
             
-            # 查询指定日期范围内的交易日
+            # 构建查询条件 - 筛选上市日期早于当前日期的股票
             query = {
-                "cal_date": {"$gte": start_date, "$lte": end_date},
-                "is_open": 1  # 1表示交易日，0表示非交易日
+                "list_date": {"$lt": current_date}  # 上市日期早于当前日期
             }
             
-            # 只获取日期字段
-            result = collection.find(query, {"cal_date": 1, "_id": 0}).sort("cal_date", 1)
+            # 从stock_basic集合中查询
+            result = self.mongodb_handler.find_documents("stock_basic", query)
             
-            # 提取日期列表
-            trade_dates = [doc["cal_date"] for doc in result]
-            
-            logger.info(f"从交易日历获取到日期范围 {start_date} 至 {end_date} 内的 {len(trade_dates)} 个交易日")
-            
-            if not trade_dates:
-                logger.warning("未从交易日历获取到交易日，将使用日期范围内的所有日期")
-                # 生成日期范围内的所有日期
-                start_date_obj = datetime.strptime(start_date, '%Y%m%d')
-                end_date_obj = datetime.strptime(end_date, '%Y%m%d')
+            if not result:
+                logger.warning("stock_basic集合中未找到数据")
+                return []
                 
-                trade_dates = []
-                current_date = start_date_obj
-                while current_date <= end_date_obj:
-                    trade_dates.append(current_date.strftime('%Y%m%d'))
-                    current_date += timedelta(days=1)
-                
-                logger.info(f"生成日期范围内的 {len(trade_dates)} 个日期")
+            # 提取股票代码
+            stock_codes = []
+            for doc in result:
+                if "ts_code" in doc:
+                    stock_codes.append(doc["ts_code"])
             
-            return trade_dates
+            logger.info(f"从stock_basic集合获取到 {len(stock_codes)} 个上市日期早于 {current_date} 的股票代码")
             
+            if not stock_codes:
+                logger.warning("未找到符合条件的股票代码")
+            
+            return stock_codes
         except Exception as e:
-            logger.error(f"获取交易日历失败: {str(e)}")
+            logger.error(f"获取股票代码列表失败: {str(e)}")
             import traceback
-            logger.debug(f"详细错误信息: {traceback.format_exc()}")
-            
-            # 出错时生成日期范围内的所有日期作为备选
-            start_date_obj = datetime.strptime(start_date, '%Y%m%d')
-            end_date_obj = datetime.strptime(end_date, '%Y%m%d')
-            
-            trade_dates = []
-            current_date = start_date_obj
-            while current_date <= end_date_obj:
-                trade_dates.append(current_date.strftime('%Y%m%d'))
-                current_date += timedelta(days=1)
-            
-            logger.info(f"生成日期范围内的 {len(trade_dates)} 个日期作为备选")
-            return trade_dates 
-
-    def _run_recent_mode(self) -> bool:
+            logger.debug(f"详细错误: {traceback.format_exc()}")
+            return []
+    
+    def _process_stock_parallel(self, stock_codes: List[str]) -> bool:
         """
-        最近一周模式 - 获取最近一周的停牌数据
-        
-        Returns:
-            是否成功
-        """
-        # 计算最近一周的日期范围
-        end_date = datetime.now().strftime("%Y%m%d")
-        start_date = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
-        
-        logger.info(f"使用recent模式获取最近一周 {start_date} 至 {end_date} 的停牌数据")
-        
-        # 获取该时间范围内的交易日
-        trade_dates = self.get_trade_calendar(start_date, end_date)
-        if not trade_dates:
-            logger.error("未获取到交易日历，无法继续")
-            return False
-        
-        # 获取目标股票代码
-        target_ts_codes = self.get_target_ts_codes_from_stock_basic()
-        if not target_ts_codes:
-            logger.error("未能获取到任何目标板块的股票代码")
-            return False
-            
-        # 检查WAN接口可用性
-        available_wans = []
-        if self.port_allocator:
-            available_wans = self.port_allocator.get_available_wan_indices()
-            if available_wans:
-                logger.info(f"获取到 {len(trade_dates)} 个交易日和 {len(target_ts_codes)} 个目标股票代码，将使用 {len(available_wans)} 个WAN接口并行处理")
-                # 使用并行模式处理多个交易日
-                return self._run_recent_mode_parallel(trade_dates, target_ts_codes)
-            else:
-                logger.warning("未检测到可用的WAN接口，将使用普通模式获取数据")
-        else:
-            logger.warning("未启用多WAN口功能，将使用普通模式获取数据")
-            
-        logger.info(f"获取到 {len(trade_dates)} 个交易日和 {len(target_ts_codes)} 个目标股票代码")
-        
-        # 按交易日获取停牌数据
-        total_records = 0
-        for trade_date in trade_dates:
-            logger.info(f"获取交易日 {trade_date} 的停牌数据")
-            
-            # 使用停牌日期等于交易日期的条件获取数据
-            df = self.fetch_suspend_with_wan(
-                suspend_date=trade_date,
-                wan_info=self._get_wan_socket()
-            )
-            
-            if not df.empty:
-                # 过滤目标板块股票
-                filtered_df = self.filter_by_target_ts_codes(df, target_ts_codes)
-                
-                if not filtered_df.empty:
-                    # 保存到MongoDB
-                    success = self.save_to_mongodb(filtered_df)
-                    if success:
-                        total_records += len(filtered_df)
-                        logger.success(f"成功保存交易日 {trade_date} 的 {len(filtered_df)} 条停牌记录")
-                    else:
-                        logger.warning(f"保存交易日 {trade_date} 的停牌数据失败")
-                else:
-                    logger.info(f"交易日 {trade_date} 没有目标板块的停牌记录")
-            else:
-                logger.info(f"交易日 {trade_date} 未获取到停牌数据")
-            
-            # 避免请求过于频繁
-            time.sleep(1)
-        
-        logger.success(f"recent模式执行完成，共获取并保存 {total_records} 条停牌记录")
-        return total_records > 0
-        
-    def _run_recent_mode_parallel(self, trade_dates: List[str], target_ts_codes: Set[str]) -> bool:
-        """
-        并行处理recent模式 - 使用多WAN口并行获取最近一周的停牌数据
+        并行处理多个股票代码数据
         
         Args:
-            trade_dates: 要处理的交易日列表
-            target_ts_codes: 目标股票代码集合
+            stock_codes: 股票代码列表
             
         Returns:
-            是否成功
+            是否全部成功
         """
-        if not trade_dates:
-            logger.error("没有交易日可以处理")
-            return False
-            
-        # 获取可用的WAN接口
-        available_wans = []
-        if self.port_allocator:
-            available_wans = self.port_allocator.get_available_wan_indices()
-            logger.info(f"可用的WAN接口数量: {len(available_wans)}, WAN索引: {available_wans}")
-            
-        if not available_wans:
-            logger.warning("没有可用的WAN接口，将使用系统默认网络接口")
-            # 如果没有可用WAN，回退到普通处理
-            return self._run_recent_mode()
-        
-        import threading
-        import queue
-        
-        # 创建工作队列和结果队列
-        task_queue = queue.Queue()
-        result_queue = queue.Queue()
-        
-        # 创建失败任务重试队列
-        retry_queue = queue.Queue()
-        
-        # 加入所有任务
-        for i, trade_date in enumerate(trade_dates):
-            task_queue.put((i, trade_date))
-        
-        total_dates = len(trade_dates)
-        
-        # 线程锁
-        lock = threading.Lock()
-        
-        # 追踪已处理的任务和WAN口使用情况
-        processed_tasks = set()
-        wan_usage_stats = {wan_idx: 0 for wan_idx in available_wans}
-        task_wan_mapping = {}  # 记录每个任务使用的WAN
-        
-        # 最大重试次数
-        MAX_RETRY = 3
-        
-        # 工作线程函数
-        def worker():
-            while True:
-                # 优先处理重试队列中的任务
-                retry_task = None
+        if self.available_wan_count == 0:
+            logger.warning("未找到可用的WAN口，降级为串行处理模式")
+            # 降级为串行处理
+            all_success = True
+            for ts_code in stock_codes:
+                # 检查是否收到停止信号
+                if STOP_PROCESSING:
+                    logger.warning("收到停止信号，中断处理")
+                    return False
+                    
                 try:
-                    if not retry_queue.empty():
-                        retry_task = retry_queue.get(block=False)
-                        task_id, trade_date, retry_count = retry_task
-                        
-                        with lock:
-                            logger.info(f"开始处理重试任务: 交易日 {trade_date} (重试 {retry_count}/{MAX_RETRY})")
-                        
-                        # 为重试任务选择一个不同的WAN
-                        if task_id in task_wan_mapping:
-                            used_wan = task_wan_mapping[task_id]
-                            # 尝试选择一个不同的WAN
-                            other_wans = [w for w in available_wans if w != used_wan]
-                            if other_wans:
-                                wan_idx = random.choice(other_wans)
-                            else:
-                                wan_idx = random.choice(available_wans)
-                        else:
-                            wan_idx = random.choice(available_wans)
-                    elif not task_queue.empty():
-                        task_id, trade_date = task_queue.get(block=False)
-                        retry_count = 0
-                        
-                        # 选择WAN接口 - 负载最小的优先
-                        wan_usage_counts = [(idx, count) for idx, count in wan_usage_stats.items()]
-                        wan_usage_counts.sort(key=lambda x: x[1])  # 按使用次数排序
-                        wan_idx = wan_usage_counts[0][0]  # 使用次数最少的WAN
-                    else:
-                        # 所有任务都已处理
-                        return
-                except queue.Empty:
-                    # 所有任务都已处理
-                    return
-                
-                # 更新WAN使用统计
-                with lock:
-                    wan_usage_stats[wan_idx] = wan_usage_stats.get(wan_idx, 0) + 1
-                    task_wan_mapping[task_id] = wan_idx
-                
-                # 获取WAN接口
-                wan_info = self._get_wan_socket(wan_idx)
-                if not wan_info:
-                    with lock:
-                        logger.warning(f"无法为WAN {wan_idx} 获取端口，将尝试其他WAN接口")
+                    df = self.fetch_stock_data(ts_code)
+                    if df is not None and not df.empty:
+                        processed_df = self.process_data(df)
+                        if processed_df is not None and not processed_df.empty:
+                            success = self.save_to_mongodb(processed_df)
+                            if not success:
+                                logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
+                                all_success = False
                     
-                    # 如果还有重试次数，放入重试队列
-                    if retry_count < MAX_RETRY:
-                        retry_queue.put((task_id, trade_date, retry_count + 1))
-                    else:
-                        with lock:
-                            logger.error(f"交易日 {trade_date} 重试达到最大次数 {MAX_RETRY}，放弃处理")
-                        result_queue.put((task_id, trade_date, 0, wan_idx))
-                    
-                    continue
-                
-                wan_idx, port = wan_info
-                
-                # 处理任务
-                try:
-                    with lock:
-                        logger.info(f"开始处理交易日 {trade_date}，使用WAN {wan_idx} 端口 {port}" + 
-                                   (f" (重试 {retry_count}/{MAX_RETRY})" if retry_count > 0 else ""))
-                    
-                    # 使用停牌日期等于交易日期的条件获取数据
-                    df = self.fetch_suspend_with_wan(
-                        suspend_date=trade_date,
-                        wan_info=wan_info
-                    )
-                    
-                    if not df.empty:
-                        # 过滤目标板块股票
-                        filtered_df = self.filter_by_target_ts_codes(df, target_ts_codes)
-                        
-                        records_count = 0
-                        if not filtered_df.empty:
-                            # 保存到MongoDB
-                            success = self.save_to_mongodb(filtered_df)
-                            if success:
-                                records_count = len(filtered_df)
-                                with lock:
-                                    logger.success(f"WAN {wan_idx}: 成功保存交易日 {trade_date} 的 {records_count} 条停牌记录")
-                            else:
-                                with lock:
-                                    logger.warning(f"WAN {wan_idx}: 保存交易日 {trade_date} 的停牌数据失败")
-                        else:
-                            with lock:
-                                logger.info(f"WAN {wan_idx}: 交易日 {trade_date} 没有目标板块的停牌记录")
-                    else:
-                        with lock:
-                            logger.info(f"WAN {wan_idx}: 交易日 {trade_date} 未获取到停牌数据")
-                    
-                    # 添加到已处理集合
-                    with lock:
-                        processed_tasks.add(task_id)
-                    
-                    # 放入结果队列
-                    if not df.empty and 'filtered_df' in locals():
-                        result_queue.put((task_id, trade_date, len(filtered_df), wan_idx))
-                    else:
-                        result_queue.put((task_id, trade_date, 0, wan_idx))
-                    
+                    # 在full模式下，添加随机等待时间避免请求过快
+                    if self.full_mode:
+                        wait_time = random.uniform(2, 5)
+                        logger.debug(f"完整模式下添加随机等待: {wait_time:.2f}秒")
+                        time.sleep(wait_time)
                 except Exception as e:
-                    with lock:
-                        logger.error(f"WAN {wan_idx} 处理交易日 {trade_date} 时出错: {str(e)}")
-                        import traceback
-                        logger.debug(f"详细错误信息: {traceback.format_exc()}")
-                    
-                    # 如果还有重试次数，放入重试队列
-                    if retry_count < MAX_RETRY:
-                        with lock:
-                            logger.warning(f"交易日 {trade_date} 处理失败，将在重试队列中等待 (重试 {retry_count+1}/{MAX_RETRY})")
-                        retry_queue.put((task_id, trade_date, retry_count + 1))
-                    else:
-                        with lock:
-                            logger.error(f"交易日 {trade_date} 重试达到最大次数 {MAX_RETRY}，放弃处理")
-                        result_queue.put((task_id, trade_date, 0, wan_idx))
-                    
-                finally:
-                    # 释放WAN端口
-                    if wan_info:
-                        # 增加延迟确保端口完全释放
-                        time.sleep(1)
-                        self.port_allocator.release_port(wan_idx, port)
+                    logger.error(f"处理股票 {ts_code} 时发生异常: {str(e)}")
+                    all_success = False
+            return all_success
         
-        # 启动工作线程
-        threads = []
-        max_concurrent = min(len(available_wans), self.max_workers)
-        logger.info(f"启动 {max_concurrent} 个工作线程进行并行处理，共 {total_dates} 个交易日")
+        threads_count = self.available_wan_count
+        logger.info(f"并行处理 {len(stock_codes)} 个股票的数据，线程数: {threads_count}，可用WAN口: {self.available_wan_indices}")
         
-        for _ in range(max_concurrent):
-            thread = threading.Thread(target=worker)
-            thread.daemon = True
-            thread.start()
-            threads.append(thread)
-        
-        # 主线程等待所有任务完成
-        start_time = time.time()
-        completed_tasks = 0
-        total_records = 0
-        
-        # 处理结果
-        while completed_tasks < total_dates:
-            try:
-                task_id, trade_date, records_count, wan_idx = result_queue.get(timeout=60)
-                
-                completed_tasks += 1
-                total_records += records_count
-                
-                # 更新进度
-                progress = completed_tasks / total_dates * 100
-                elapsed = time.time() - start_time
-                avg_time = elapsed / completed_tasks if completed_tasks > 0 else 0
-                remaining = avg_time * (total_dates - completed_tasks)
-                
-                # 活跃的WAN
-                active_wans = set()
-                for tid, wid in task_wan_mapping.items():
-                    if tid not in processed_tasks:
-                        active_wans.add(wid)
-                active_wans_str = ", ".join([f"WAN-{w}" for w in active_wans]) if active_wans else "无"
-                
-                logger.info(f"总进度: {completed_tasks}/{total_dates} ({progress:.1f}%) [WAN-{wan_idx}完成, 活跃:{active_wans_str}], "
-                           f"耗时: {elapsed:.1f}s, 剩余: {remaining:.1f}s")
-                
-            except queue.Empty:
-                # 检查是否有活动线程
-                active_threads = sum(1 for t in threads if t.is_alive())
-                if active_threads == 0:
-                    logger.warning("等待超时且所有线程已结束，检查是否有未完成的任务")
-                    
-                    remaining_tasks = task_queue.qsize() + retry_queue.qsize()
-                    if remaining_tasks == 0:
-                        logger.warning("没有剩余任务，可能有部分结果未被正确处理")
-                        break
-                    else:
-                        logger.warning(f"还有 {remaining_tasks} 个任务未完成，重新启动工作线程")
-                        # 重新启动一些工作线程
-                        for _ in range(min(remaining_tasks, max_concurrent)):
-                            thread = threading.Thread(target=worker)
-                            thread.daemon = True
-                            thread.start()
-                            threads.append(thread)
-                        
-                logger.info(f"等待结果中，活动线程: {active_threads}, 已完成: {completed_tasks}/{total_dates}")
-                # 避免CPU占用过高
-                time.sleep(1)
-        
-        # 等待所有线程结束
-        for thread in threads:
-            thread.join(timeout=5)
-            
-        # 输出最终统计信息
-        elapsed_total = time.time() - start_time
-        stats_msg = ", ".join([f"WAN-{idx}: {count}次" for idx, count in wan_usage_stats.items()])
-        
-        logger.success(f"recent模式（并行）执行完成，共获取并保存 {total_records} 条停牌记录，耗时 {elapsed_total:.1f}s")
-        logger.info(f"最终WAN使用统计: {stats_msg}")
-        
-        return total_records > 0
-
-    def _run_full_mode(self) -> bool:
-        """
-        全量模式 - 获取从1990年至今的所有停牌数据
-        
-        Returns:
-            是否成功
-        """
-        # 设置日期范围 - 从1990年1月1日到今天
-        start_date = "19900101"
-        end_date = datetime.now().strftime("%Y%m%d")
-        
-        logger.info(f"使用full模式获取从 {start_date} 至 {end_date} 的所有停牌数据")
-        
-        # 获取目标股票代码
-        target_ts_codes = list(self.get_target_ts_codes_from_stock_basic())
-        if not target_ts_codes:
-            logger.error("未能获取到任何目标板块的股票代码")
+        # 确保WAN索引列表有效
+        if not self.available_wan_indices:
+            logger.error("可用WAN口列表为空，无法进行并行处理")
             return False
         
-        # 检查WAN接口可用性
-        available_wans = []
-        if self.port_allocator:
-            available_wans = self.port_allocator.get_available_wan_indices()
-            if available_wans:
-                logger.info(f"获取到 {len(target_ts_codes)} 个目标股票代码，将使用 {len(available_wans)} 个WAN接口并行获取停牌数据")
-            else:
-                logger.warning("未检测到可用的WAN接口，将使用普通模式获取数据")
-        else:
-            logger.warning("未启用多WAN口功能，将使用普通模式获取数据")
+        # 均匀分配股票代码到可用WAN口
+        stock_groups = {wan_idx: [] for wan_idx in self.available_wan_indices}
+        for i, ts_code in enumerate(stock_codes):
+            wan_idx = self.available_wan_indices[i % len(self.available_wan_indices)]
+            stock_groups[wan_idx].append(ts_code)
+        
+        # 记录分配情况
+        for wan_idx, stocks in stock_groups.items():
+            logger.info(f"WAN口 {wan_idx} 分配到 {len(stocks)} 个股票")
+        
+        processed_stocks_count = 0
+        
+        # 创建每个WAN口对应的处理函数
+        def process_wan_stocks(wan_idx, stocks):
+            """处理单个WAN口对应的所有股票"""
+            if not stocks:  # 没有股票需要处理
+                logger.info(f"WAN口 {wan_idx} 没有分配到股票，跳过")
+                return True, 0
+                
+            # 获取WAN口锁，确保同一时间只有一个线程使用此WAN口
+            if not self.wan_locks[wan_idx].acquire(timeout=10):
+                logger.warning(f"无法获取WAN口 {wan_idx} 的锁，跳过处理")
+                return False, 0
             
-        # 使用并行方式获取数据，无需指定开始日期和结束日期
-        # full模式下，会自动获取所有历史数据
-        result = self.fetch_suspend_parallel(
-            target_ts_codes, 
-            batch_size=self.batch_size
+            logger.info(f"线程成功获取WAN口 {wan_idx} 的锁")
+            
+            try:
+                logger.info(f"线程开始处理WAN口 {wan_idx} 的 {len(stocks)} 个股票")
+                
+                wan_success = True
+                success_count = 0
+                
+                # 逐个处理该WAN口的所有股票
+                for ts_code in stocks:
+                    # 检查是否收到停止信号
+                    if STOP_PROCESSING:
+                        logger.warning(f"WAN口 {wan_idx} 收到停止信号，中断处理")
+                        return wan_success, success_count
+                        
+                    try:
+                        # 打印正在处理的股票代码
+                        logger.info(f"WAN口 {wan_idx} 正在处理股票: {ts_code}")
+                        
+                        # 获取单个股票数据，直接传递wan_idx参数
+                        df = self.fetch_data(ts_code=ts_code, wan_idx=wan_idx)
+                        if df is None or df.empty:
+                            logger.warning(f"股票 {ts_code} 的数据为空或获取失败")
+                            continue
+                        
+                        # 处理数据
+                        processed_df = self.process_data(df)
+                        if processed_df is None or processed_df.empty:
+                            logger.warning(f"股票 {ts_code} 的处理后数据为空")
+                            continue
+                        
+                        # 保存到MongoDB
+                        success = self.save_to_mongodb(processed_df)
+                        if success:
+                            logger.success(f"股票 {ts_code} 的数据已保存到MongoDB")
+                            success_count += 1
+                        else:
+                            logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
+                            wan_success = False
+                        
+                        # 在full模式下，添加随机等待时间避免请求过快
+                        if self.full_mode:
+                            wait_time = random.uniform(2, 5)
+                            logger.debug(f"WAN口 {wan_idx} 完整模式下添加随机等待: {wait_time:.2f}秒")
+                            time.sleep(wait_time)
+                            
+                    except Exception as e:
+                        logger.error(f"WAN口 {wan_idx} 处理股票 {ts_code} 时发生异常: {str(e)}")
+                        wan_success = False
+                
+                # 如果至少成功处理了一个股票，视为部分成功
+                if success_count > 0:
+                    logger.info(f"WAN口 {wan_idx} 成功处理了 {success_count}/{len(stocks)} 个股票")
+                    wan_success = True
+                
+                logger.info(f"线程完成WAN口 {wan_idx} 的所有股票处理")
+                return wan_success, success_count
+            finally:
+                # 释放WAN口锁
+                self.wan_locks[wan_idx].release()
+                logger.info(f"释放WAN口 {wan_idx} 的锁")
+        
+        all_success = True
+        
+        # 创建线程池，线程数等于可用WAN口数量，设置线程为守护线程
+        global executor_pool
+        executor_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=threads_count, 
+            thread_name_prefix="wan_worker"
         )
         
-        # 判断是否成功
-        if hasattr(self, 'last_operation_stats'):
-            total_records = sum(
-                self.last_operation_stats.get(key, 0) 
-                for key in ['inserted', 'updated']
-            )
-            logger.success(f"full模式执行完成，共处理 {total_records} 条停牌记录")
-            return total_records > 0
+        try:
+            # 提交任务，每个WAN口一个任务
+            future_to_wan = {}
+            for wan_idx in self.available_wan_indices:
+                stocks = stock_groups.get(wan_idx, [])
+                # 即使没有股票，也提交任务以保持线程和WAN口一一对应
+                logger.info(f"提交WAN口 {wan_idx} 处理 {len(stocks)} 个股票的任务")
+                future = executor_pool.submit(process_wan_stocks, wan_idx, stocks)
+                future_to_wan[future] = wan_idx
+            
+            # 处理结果
+            for future in concurrent.futures.as_completed(future_to_wan):
+                # 检查是否收到停止信号
+                if STOP_PROCESSING:
+                    logger.warning("收到停止信号，不再等待其他任务完成")
+                    break
+                    
+                wan_idx = future_to_wan[future]
+                try:
+                    result = future.result()
+                    # 现在result是一个元组(success, count)
+                    if isinstance(result, tuple) and len(result) == 2:
+                        success, count = result
+                        processed_stocks_count += count
+                        if not success:
+                            logger.warning(f"WAN口 {wan_idx} 的任务处理失败")
+                            # 不再直接设置all_success = False
+                    else:
+                        logger.warning(f"WAN口 {wan_idx} 返回了意外的结果格式: {result}")
+                except Exception as e:
+                    logger.error(f"WAN口 {wan_idx} 的任务处理时发生异常: {str(e)}")
+                    # 不再直接设置all_success = False
         
-        logger.warning("full模式执行完成，但无法获取处理记录数")
-        return True  # 假设成功
-
-    def run(self, config: Optional[Dict[str, Any]] = None) -> bool:
+        finally:
+            # 确保线程池被关闭
+            if executor_pool:
+                executor_pool.shutdown(wait=False)
+                executor_pool = None
+        
+        # 只有当没有成功处理任何股票时，才返回失败
+        if processed_stocks_count == 0 and len(stock_codes) > 0:
+            logger.error(f"所有 {len(stock_codes)} 个股票都处理失败")
+            return False
+        
+        # 如果至少处理了一些股票，就返回成功
+        logger.success(f"成功处理了 {processed_stocks_count}/{len(stock_codes)} 个股票")
+        return True
+    
+    def run(self) -> bool:
         """
-        运行停牌数据获取器，支持多种模式
+        运行数据获取和保存流程
         
-        Args:
-            config: 配置字典，包含如下字段：
-                - recent: 获取最近一周的停牌数据
-                - full: 获取从1990年至今的所有停牌数据
-                - batch_size: 每批处理的股票数量
-                
         Returns:
             是否成功
         """
-        # 默认配置
-        default_config = {
-            "recent": False,
-            "full": False,
-            "batch_size": self.batch_size,
-        }
-        
-        # 合并配置
-        if config is None:
-            config = {}
-        
-        effective_config = {**default_config, **config}
-        recent = effective_config["recent"]
-        full = effective_config["full"]
-        self.batch_size = effective_config["batch_size"]
-        
-        # 设置默认模式 - 如果没有指定模式，使用recent模式
-        if not (recent or full):
-            logger.info("未指定获取模式，默认使用recent模式")
-            recent = True
-        
-        # 根据模式执行相应的操作
-        if recent:
-            return self._run_recent_mode()
+        try:
+            # 第一步：检查并确保集合和索引存在
+            logger.info("第一步：检查并确保MongoDB集合和索引存在")
+            if not self._ensure_collection_and_indexes():
+                logger.error("无法确保MongoDB集合和索引，放弃数据获取")
+                return False
             
-        elif full:
-            return self._run_full_mode()
+            # 根据模式走不同的处理流程
+            if self.full_mode:
+                # 完整模式：按股票代码获取
+                logger.info("使用完整模式，按股票代码获取所有历史数据")
+                
+                # 第二步：获取所有股票代码
+                logger.info("第二步：从stock_basic集合获取股票代码列表")
+                stock_codes = self.get_stock_codes()
+                
+                if not stock_codes:
+                    logger.error("未能获取到任何股票代码，抓取失败")
+                    return False  # 没有找到股票代码应该返回失败
+                
+                # 第三步：获取数据（串行或并行）
+                logger.info(f"第三步：处理 {len(stock_codes)} 个股票的数据")
+                
+                if self.serial_mode:
+                    # 串行模式
+                    logger.info(f"使用串行模式处理 {len(stock_codes)} 个股票的数据")
+                    all_success = True
+                    
+                    for ts_code in stock_codes:
+                        # 检查是否收到停止信号
+                        if STOP_PROCESSING:
+                            logger.warning("收到停止信号，中断处理")
+                            return False
+                            
+                        logger.info(f"正在处理股票: {ts_code}")  # 保留这一行，显示当前处理的股票代码
+                        
+                        try:
+                            # 获取单个股票数据
+                            df = self.fetch_stock_data(ts_code)
+                            if df is None or df.empty:
+                                logger.warning(f"股票 {ts_code} 的数据为空或获取失败")
+                                continue
+                            
+                            # 处理数据
+                            processed_df = self.process_data(df)
+                            if processed_df is None or processed_df.empty:
+                                logger.warning(f"股票 {ts_code} 的处理后数据为空")
+                                continue
+                            
+                            # 保存数据到MongoDB
+                            success = self.save_to_mongodb(processed_df)
+                            if success:
+                                logger.success(f"股票 {ts_code} 的数据已保存到MongoDB")
+                            else:
+                                logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
+                                all_success = False
+                        except Exception as e:
+                            logger.error(f"处理股票 {ts_code} 的数据时发生异常: {str(e)}")
+                            all_success = False
+                    
+                    return all_success
+                else:
+                    # 并行模式
+                    logger.info(f"使用并行模式处理 {len(stock_codes)} 个股票的数据")
+                    return self._process_stock_parallel(stock_codes)
+            else:
+                # 日期模式：按交易日获取
+                logger.info("使用日期模式，按交易日获取数据")
+                
+                # 第二步：获取日期范围内的所有交易日
+                logger.info(f"第二步：获取日期范围 {self.start_date} - {self.end_date} 内的交易日...")
+                trade_dates = self.get_trade_dates(self.start_date, self.end_date)
+                
+                if not trade_dates:
+                    logger.warning("未找到交易日，没有数据需要处理")
+                    return True  # 没有数据也视为成功
+                
+                # 第三步：获取数据（串行或并行）
+                if self.serial_mode:
+                    # 串行模式
+                    logger.info(f"第三步：串行处理 {len(trade_dates)} 个交易日的数据")
+                    all_success = True
+                    
+                    for trade_date in trade_dates:
+                        # 检查是否收到停止信号
+                        if STOP_PROCESSING:
+                            logger.warning("收到停止信号，中断处理")
+                            return False
+                            
+                        logger.info(f"正在处理交易日: {trade_date}")
+                        
+                        try:
+                            # 获取单日数据
+                            df = self.fetch_suspend_data(trade_date)
+                            if df is None or df.empty:
+                                logger.warning(f"交易日 {trade_date} 的数据为空或获取失败")
+                                continue
+                            
+                            # 处理数据
+                            processed_df = self.process_data(df)
+                            if processed_df is None or processed_df.empty:
+                                logger.warning(f"交易日 {trade_date} 的处理后数据为空")
+                                continue
+                            
+                            # 保存单日数据到MongoDB
+                            success = self.save_to_mongodb(processed_df)
+                            if success:
+                                logger.success(f"交易日 {trade_date} 的数据已保存到MongoDB")
+                            else:
+                                logger.error(f"保存交易日 {trade_date} 的数据到MongoDB失败")
+                                all_success = False
+                        except Exception as e:
+                            logger.error(f"处理交易日 {trade_date} 的数据时发生异常: {str(e)}")
+                            all_success = False
+                    
+                    return all_success
+                else:
+                    # 并行模式
+                    logger.info(f"第三步：并行处理 {len(trade_dates)} 个交易日的数据")
+                    return self._process_date_parallel(trade_dates)
             
-        else:
-            logger.error("无效的运行模式")
+            logger.info("数据获取和保存流程完成")
+            return True
+            
+        except Exception as e:
+            logger.error(f"运行过程中发生异常: {str(e)}")
+            import traceback
+            logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return False
 
-    def create_mock_data(self) -> pd.DataFrame:
+    def save_to_mongodb(self, df: pd.DataFrame, max_retries=3, chunk_size=10000) -> bool:
         """
-        创建模拟停牌数据（用于测试）
-        
-        Returns:
-            模拟的停牌数据DataFrame
-        """
-        # 模拟数据
-        sample_data = [
-            {
-                "ts_code": "000001.SZ", 
-                "suspend_date": "20230101", 
-                "suspend_type": 444016000, 
-                "resume_date": "20230110", 
-                "change_reason": "重大事项", 
-                "suspend_time": "09:30", 
-                "change_reason_type": 1
-            },
-            {
-                "ts_code": "000002.SZ", 
-                "suspend_date": "20230105", 
-                "suspend_type": 444003000, 
-                "resume_date": "20230106", 
-                "change_reason": "临时停牌", 
-                "suspend_time": "09:30", 
-                "change_reason_type": 2
-            },
-            {
-                "ts_code": "600000.SH", 
-                "suspend_date": "20230110", 
-                "suspend_type": 444016000, 
-                "resume_date": "20230111", 
-                "change_reason": "重大资产重组", 
-                "suspend_time": "09:30", 
-                "change_reason_type": 3
-            },
-            {
-                "ts_code": "600036.SH", 
-                "suspend_date": "20230115", 
-                "suspend_type": 444016000, 
-                "resume_date": None, 
-                "change_reason": "重大事项", 
-                "suspend_time": "09:30", 
-                "change_reason_type": 1
-            },
-        ]
-        
-        # 创建DataFrame
-        df = pd.DataFrame(sample_data)
-        logger.info(f"生成 {len(df)} 条模拟停牌数据")
-        return df
-
-    def _record_error(self):
-        """记录错误并调整退避策略"""
-        now = time.time()
-        with self.backoff_lock:
-            self.error_count += 1
-            # 计算错误频率
-            error_interval = now - self.last_error_time
-            self.last_error_time = now
-            
-            # 检查是否需要调整退避因子
-            if self.error_count > self.error_threshold:
-                # 如果错误间隔很短，增加退避因子
-                if error_interval < 5.0:
-                    old_factor = self.backoff_factor
-                    self.backoff_factor = min(self.backoff_factor * 1.5, 10.0)
-                    logger.warning(f"连续错误频率高，增加退避因子: {old_factor:.2f} -> {self.backoff_factor:.2f}")
-                    
-                    # 当错误累积较多时，强制等待一段时间
-                    if self.error_count > self.error_threshold * 2:
-                        wait_time = 30 + random.randint(0, 30)
-                        logger.warning(f"检测到高频错误，强制等待 {wait_time} 秒后继续")
-                        time.sleep(wait_time)
-                        # 减少错误计数
-                        self.error_count = max(self.error_count - self.error_threshold, 0)
-    
-    def _record_success(self):
-        """记录成功并调整退避策略"""
-        with self.backoff_lock:
-            # 连续成功，降低错误计数和退避因子
-            self.error_count = max(self.error_count - 1, 0)
-            if self.error_count == 0 and self.backoff_factor > 1.0:
-                self.backoff_factor = max(self.backoff_factor * 0.8, 1.0)
-                logger.info(f"操作成功，降低退避因子至 {self.backoff_factor:.2f}")
-                
-    def _get_retry_wait_time(self, retry_count, error_type=None):
-        """
-        计算重试等待时间，结合指数退避、随机抖动和动态调整
+        保存数据到MongoDB，高效版本：增加差异检测，减少不必要的更新操作
         
         Args:
-            retry_count: 当前重试次数
-            error_type: 错误类型，可用于针对特定错误调整等待时间
+            df: 要保存的数据
+            max_retries: 最大重试次数 
+            chunk_size: 每批处理的记录数，默认10000
             
         Returns:
-            等待时间(秒)
+            是否成功
         """
-        # 基础公式: base_delay * backoff_factor * (2 ^ retry_count) * (0.5 + random.random())
-        max_delay = 3600  # 最大等待时间（秒）
-        jitter_factor = 0.5 + random.random()  # 0.5-1.5之间的随机因子
+        if df is None or df.empty:
+            logger.warning("没有数据需要保存")
+            return False
         
-        # 根据错误类型调整
-        if error_type == "rate_limit":
-            # API速率限制
-            wait_time = min(max_delay, self.retry_delay * self.backoff_factor * (3 ** retry_count) * jitter_factor)
-        else:
-            # 一般错误
-            wait_time = min(max_delay, self.retry_delay * self.backoff_factor * (2 ** retry_count) * jitter_factor)
+        # 获取数据库和集合名称
+        db_name = self.db_name
+        collection_name = self.collection_name
+        
+        logger.info(f"保存数据到MongoDB数据库：{db_name}，集合：{collection_name}")
+        
+        # 检查MongoDB连接
+        if not self.mongodb_handler.is_connected():
+            logger.warning("MongoDB未连接，尝试连接...")
+            if not self.mongodb_handler.connect():
+                logger.error("连接MongoDB失败")
+                return False
+        
+        # 转换DataFrame为字典列表，减少转换开销
+        records = df.to_dict("records")
+        total_records = len(records)
+        
+        # 跟踪统计
+        inserted_count = 0
+        updated_count = 0
+        skipped_count = 0
+        
+        try:
+            # 获取集合
+            collection = self.mongodb_handler.get_collection(collection_name)
             
-        return wait_time
+            # 分批处理，减少每次处理的数据量
+            for i in range(0, total_records, chunk_size):
+                chunk = records[i:i+chunk_size]
+                chunk_len = len(chunk)
+                
+                # 设置重试计数器
+                retries = 0
+                success = False
+                
+                while retries < max_retries and not success:
+                    try:
+                        # 1. 提取唯一标识符
+                        identifiers = [
+                            {field: doc[field] for field in self.index_fields if field in doc}
+                            for doc in chunk
+                        ]
+                        
+                        # 2. 检查已存在的记录
+                        existing_docs_cursor = collection.find(
+                            {"$or": identifiers},
+                            {"_id": 1, **{field: 1 for field in self.index_fields}}
+                        )
+                        existing_ids = {
+                            tuple(doc[field] for field in self.index_fields if field in doc): doc["_id"]
+                            for doc in existing_docs_cursor
+                        }
+                        
+                        # 3. 准备操作列表
+                        inserts = []  # 新记录
+                        updates = []  # 更新记录
+                        
+                        for doc in chunk:
+                            # 创建复合键用于查找匹配记录
+                            key = tuple(doc[field] for field in self.index_fields if field in doc)
+                            
+                            if key in existing_ids:
+                                # 记录存在，需要更新
+                                updates.append(
+                                    pymongo.UpdateOne(
+                                        {"_id": existing_ids[key]},
+                                        {"$set": doc}
+                                    )
+                                )
+                            else:
+                                # 记录不存在，需要插入
+                                inserts.append(doc)
+                        
+                        # 4. 执行插入操作
+                        if inserts:
+                            insert_result = collection.insert_many(inserts, ordered=False)
+                            inserted_count += len(insert_result.inserted_ids)
+                        
+                        # 5. 执行更新操作
+                        if updates:
+                            update_result = collection.bulk_write(updates, ordered=False)
+                            updated_count += update_result.modified_count
+                            skipped_count += (len(updates) - update_result.modified_count)
+                        
+                        # 记录当前批次结果
+                        if i % (chunk_size * 5) == 0 or i + chunk_size >= total_records:
+                            logger.info(
+                                f"进度 {(i+chunk_len)}/{total_records}, "
+                                f"插入: {inserted_count}, 更新: {updated_count}, 跳过: {skipped_count}"
+                            )
+                        
+                        success = True
+                    
+                    except pymongo.errors.BulkWriteError as bwe:
+                        retries += 1
+                        logger.warning(f"批次 {i//chunk_size + 1} 批量写入错误 (尝试 {retries}/{max_retries})")
+                        if retries >= max_retries:
+                            # 在最后一次尝试，记录错误详情
+                            logger.error(f"批量写入失败: {bwe.details}")
+                            # 检查是否有重复键错误
+                            if 'writeErrors' in bwe.details:
+                                for error in bwe.details.get('writeErrors', []):
+                                    if error.get('code') == 11000:  # 重复键错误
+                                        logger.debug(f"重复键错误: {error.get('errmsg', '')}")
+                            return False
+                        # full模式下增加重试等待时间
+                        wait_time = random.uniform(2, 5) if self.full_mode else 1
+                        logger.info(f"等待 {wait_time:.2f} 秒后重试...")
+                        time.sleep(wait_time)  # 重试前等待
+                        
+                    except Exception as e:
+                        retries += 1
+                        logger.warning(f"批次 {i//chunk_size + 1} 处理失败 (尝试 {retries}/{max_retries}): {str(e)}")
+                        if retries >= max_retries:
+                            logger.error(f"批次 {i//chunk_size + 1} 处理失败，已达到最大重试次数")
+                            return False
+                        # full模式下增加重试等待时间
+                        wait_time = random.uniform(2, 5) if self.full_mode else 1
+                        logger.info(f"等待 {wait_time:.2f} 秒后重试...")
+                        time.sleep(wait_time)  # 重试前等待
+            
+            # 记录最终结果
+            logger.success(
+                f"数据保存完成: 总计: {total_records}, 插入: {inserted_count}, "
+                f"更新: {updated_count}, 跳过: {skipped_count}"
+            )
+            return True
+            
+        except Exception as e:
+            logger.error(f"保存数据过程发生错误: {str(e)}")
+            import traceback
+            logger.debug(f"错误详情: {traceback.format_exc()}")
+            return False
 
+    def _process_date_with_wan_no_lock(self, trade_date: str, wan_idx: int) -> bool:
+        """
+        使用指定的WAN口处理单个交易日数据，不获取锁（由调用者控制锁）
+        
+        Args:
+            trade_date: 交易日
+            wan_idx: 要使用的WAN口索引
+            
+        Returns:
+            是否成功
+        """
+        logger.info(f"WAN口 {wan_idx} 处理交易日 {trade_date}")
+        
+        success = False
+        df = None
+        
+        try:
+            # 使用新的fetch_suspend_data方法获取单日停复牌数据
+            df = self.fetch_suspend_data(trade_date)
+            if df is None or df.empty:
+                logger.warning(f"交易日 {trade_date} 的停复牌数据为空或获取失败")
+                return False
+            
+            # 处理数据
+            processed_df = self.process_data(df)
+            if processed_df is None or processed_df.empty:
+                logger.warning(f"交易日 {trade_date} 的处理后数据为空")
+                return False
+            
+            # 保存单日数据到MongoDB
+            if not self.mongodb_handler.is_connected():
+                logger.warning("MongoDB未连接，尝试连接...")
+                if not self.mongodb_handler.connect():
+                    logger.error("连接MongoDB失败")
+                    # 添加到结果队列，供后续处理
+                    self.result_queue.put((trade_date, processed_df))
+                    return False
+                    
+            # 保存到MongoDB
+            success = self.save_to_mongodb(processed_df)
+            if success:
+                logger.success(f"交易日 {trade_date} 的停复牌数据已保存到MongoDB")
+            else:
+                logger.error(f"保存交易日 {trade_date} 的停复牌数据到MongoDB失败")
+                # 添加到结果队列，供后续处理
+                self.result_queue.put((trade_date, processed_df))
+        except Exception as e:
+            logger.error(f"处理交易日 {trade_date} 时发生异常: {str(e)}")
+            # 如果有数据但处理失败，添加到结果队列
+            if df is not None and not df.empty:
+                processed_df = self.process_data(df)
+                if processed_df is not None and not processed_df.empty:
+                    self.result_queue.put((trade_date, processed_df))
+        
+        return success
+
+    def _process_date_with_wan(self, trade_date: str, wan_idx: int) -> bool:
+        """
+        使用指定的WAN口处理单个交易日数据
+        
+        Args:
+            trade_date: 交易日
+            wan_idx: 要使用的WAN口索引
+            
+        Returns:
+            是否成功
+        """
+        # 检查WAN口索引是否有效
+        if wan_idx not in self.wan_locks:
+            logger.warning(f"WAN口索引 {wan_idx} 无效或不可用，尝试使用默认处理")
+            # 尝试使用默认处理方式
+            try:
+                df = self.fetch_suspend_data(trade_date)
+                if df is None or df.empty:
+                    return False
+                
+                processed_df = self.process_data(df)
+                if processed_df is None or processed_df.empty:
+                    return False
+                
+                success = self.save_to_mongodb(processed_df)
+                if not success:
+                    self.result_queue.put((trade_date, processed_df))
+                
+                return success
+            except Exception as e:
+                logger.error(f"默认处理交易日 {trade_date} 时发生异常: {str(e)}")
+                return False
+        
+        logger.info(f"线程使用WAN口 {wan_idx} 处理交易日 {trade_date}")
+        
+        # 获取WAN口锁
+        if not self.wan_locks[wan_idx].acquire(timeout=5):
+            logger.warning(f"无法获取WAN口 {wan_idx} 的锁，跳过处理交易日 {trade_date}")
+            return False
+        
+        try:
+            return self._process_date_with_wan_no_lock(trade_date, wan_idx)
+        finally:
+            # 释放WAN口锁
+            self.wan_locks[wan_idx].release()
+            logger.debug(f"释放WAN口 {wan_idx} 的锁")
+
+    def _process_date_parallel(self, trade_dates: List[str]) -> bool:
+        """
+        并行处理多个交易日数据
+        
+        Args:
+            trade_dates: 交易日列表
+            
+        Returns:
+            是否全部成功
+        """
+        if self.available_wan_count == 0:
+            logger.warning("未找到可用的WAN口，降级为串行处理模式")
+            # 降级为串行处理
+            all_success = True
+            for trade_date in trade_dates:
+                # 检查是否收到停止信号
+                if STOP_PROCESSING:
+                    logger.warning("收到停止信号，中断处理")
+                    return False
+                
+                try:
+                    df = self.fetch_suspend_data(trade_date)
+                    if df is not None and not df.empty:
+                        processed_df = self.process_data(df)
+                        if processed_df is not None and not processed_df.empty:
+                            success = self.save_to_mongodb(processed_df)
+                            if not success:
+                                logger.error(f"保存交易日 {trade_date} 的停复牌数据到MongoDB失败")
+                                self.result_queue.put((trade_date, processed_df))
+                                all_success = False
+                except Exception as e:
+                    logger.error(f"处理交易日 {trade_date} 时发生异常: {str(e)}")
+                    all_success = False
+            return all_success
+        
+        threads_count = self.available_wan_count
+        logger.info(f"并行处理 {len(trade_dates)} 个交易日的停复牌数据，线程数: {threads_count}，可用WAN口: {self.available_wan_indices}")
+        
+        # 确保WAN索引列表有效
+        if not self.available_wan_indices:
+            logger.error("可用WAN口列表为空，无法进行并行处理")
+            return False
+        
+        # 均匀分配交易日到可用WAN口
+        date_groups = {wan_idx: [] for wan_idx in self.available_wan_indices}
+        for i, date in enumerate(trade_dates):
+            wan_idx = self.available_wan_indices[i % len(self.available_wan_indices)]
+            date_groups[wan_idx].append(date)
+        
+        # 记录分配情况
+        for wan_idx, dates in date_groups.items():
+            logger.info(f"WAN口 {wan_idx} 分配到 {len(dates)} 个交易日")
+        
+        all_success = True
+        processed_dates_count = 0  # 添加计数器跟踪处理的日期数
+        
+        # 创建每个WAN口对应的处理函数
+        def process_wan_dates(wan_idx, dates):
+            """处理单个WAN口对应的所有日期"""
+            if not dates:  # 没有日期需要处理
+                logger.info(f"WAN口 {wan_idx} 没有分配到交易日，跳过")
+                return True, 0
+                
+            # 获取WAN口锁，确保同一时间只有一个线程使用此WAN口
+            if not self.wan_locks[wan_idx].acquire(timeout=10):  # 增加超时时间
+                logger.warning(f"无法获取WAN口 {wan_idx} 的锁，跳过处理")
+                return False, 0
+            
+            logger.info(f"线程成功获取WAN口 {wan_idx} 的锁")
+            
+            try:
+                logger.info(f"线程开始处理WAN口 {wan_idx} 的 {len(dates)} 个交易日")
+                
+                wan_success = True
+                success_count = 0
+                
+                # 逐个处理该WAN口的所有交易日
+                for date in dates:
+                    # 检查是否收到停止信号
+                    if STOP_PROCESSING:
+                        logger.warning(f"WAN口 {wan_idx} 收到停止信号，中断处理")
+                        return wan_success, success_count
+                        
+                    try:
+                        success = self._process_date_with_wan_no_lock(date, wan_idx)
+                        if success:
+                            success_count += 1
+                        else:
+                            logger.warning(f"WAN口 {wan_idx} 处理交易日 {date} 失败")
+                            wan_success = False
+                    except Exception as e:
+                        logger.error(f"WAN口 {wan_idx} 处理交易日 {date} 时发生异常: {str(e)}")
+                        wan_success = False
+                
+                # 如果至少成功处理了一个日期，视为部分成功
+                if success_count > 0:
+                    logger.info(f"WAN口 {wan_idx} 成功处理了 {success_count}/{len(dates)} 个交易日")
+                    # 即使有些失败，只要有成功的，我们就不认为整体失败
+                    wan_success = True
+                
+                logger.info(f"线程完成WAN口 {wan_idx} 的所有交易日处理")
+                return wan_success, success_count
+            finally:
+                # 释放WAN口锁
+                self.wan_locks[wan_idx].release()
+                logger.info(f"释放WAN口 {wan_idx} 的锁")  # 改为INFO级别，更易于调试
+        
+        # 创建线程池，线程数等于可用WAN口数量，设置线程为守护线程
+        global executor_pool
+        executor_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=threads_count, 
+            thread_name_prefix="wan_worker"
+        )
+        
+        try:
+            # 提交任务，每个WAN口一个任务
+            future_to_wan = {}
+            for wan_idx in self.available_wan_indices:
+                dates = date_groups.get(wan_idx, [])
+                # 即使没有日期，也提交任务以保持线程和WAN口一一对应
+                logger.info(f"提交WAN口 {wan_idx} 处理 {len(dates)} 个交易日的任务")
+                future = executor_pool.submit(process_wan_dates, wan_idx, dates)
+                future_to_wan[future] = wan_idx
+            
+            # 处理结果
+            for future in concurrent.futures.as_completed(future_to_wan):
+                # 检查是否收到停止信号
+                if STOP_PROCESSING:
+                    logger.warning("收到停止信号，不再等待其他任务完成")
+                    break
+                    
+                wan_idx = future_to_wan[future]
+                try:
+                    result = future.result()
+                    # 现在result是一个元组(success, count)
+                    if isinstance(result, tuple) and len(result) == 2:
+                        success, count = result
+                        processed_dates_count += count
+                        if not success:
+                            logger.warning(f"WAN口 {wan_idx} 的任务处理失败")
+                            # 不再直接设置all_success = False
+                    else:
+                        logger.warning(f"WAN口 {wan_idx} 返回了意外的结果格式: {result}")
+                except Exception as e:
+                    logger.error(f"WAN口 {wan_idx} 的任务处理时发生异常: {str(e)}")
+                    # 不再直接设置all_success = False
+        
+        finally:
+            # 确保线程池被关闭
+            if executor_pool:
+                executor_pool.shutdown(wait=False)
+                executor_pool = None
+        
+        # 只有当没有成功处理任何日期时，才返回失败
+        if processed_dates_count == 0 and len(trade_dates) > 0:
+            logger.error(f"所有 {len(trade_dates)} 个交易日都处理失败")
+            return False
+        
+        # 如果至少处理了一些日期，就返回成功
+        logger.success(f"成功处理了 {processed_dates_count}/{len(trade_dates)} 个交易日")
+        return True
 
 def main():
     """主函数"""
     import argparse
     
-    # 解析命令行参数
-    parser = argparse.ArgumentParser(description="A股停复牌信息获取工具")
-    parser.add_argument("--verbose", action="store_true", help="输出详细日志")
-    parser.add_argument("--mock", action="store_true", help="使用模拟数据模式（API不可用时）")
-    parser.add_argument("--recent", action="store_true", help="获取最近一周的停牌数据")
-    parser.add_argument("--full", action="store_true", help="获取从1990年至今的所有停牌数据")
-    parser.add_argument("--ts-code", type=str, help="指定股票代码，例如600000.SH")
-    parser.add_argument("--batch-size", type=int, default=1, help="每批次处理的股票数量，默认10")
-    parser.add_argument("--max-workers", type=int, default=3, help="最大并行工作线程数，默认3")
-    parser.add_argument("--market-codes", type=str, default="00,30,60,68", help="目标市场代码，用逗号分隔，默认为00,30,60,68")
-    parser.add_argument("--config", type=str, default="config/config.yaml", help="配置文件路径")
+    # 设置信号处理器
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # 注册退出处理函数
+    atexit.register(exit_handler)
+    
+    logger.info("初始化中断处理，可以使用Ctrl+C安全退出程序")
+
+    # ---- 在解析参数前，先初始化核心服务 ----
+    # （如果初始化依赖配置，则需要先解析参数）
+    # 显式初始化 MongoDB Handler
+    logger.info("Initializing MongoDB Handler...")
+    mongo_instance = None # 初始化为 None
+    try:
+        mongo_instance = init_mongodb_handler() # 调用初始化函数并获取返回的实例
+        if mongo_instance:
+             logger.info("MongoDB Handler initialized successfully.")
+        else:
+             logger.warning("init_mongodb_handler() did not initialize the handler.")
+    except Exception as e:
+        logger.error(f"Failed to initialize MongoDB Handler: {e}")
+        # 这里可以选择退出或继续（取决于是否必须要有DB）
+        # sys.exit(1)
+    # ---- 初始化结束 ----
+    
+    parser = argparse.ArgumentParser(description='获取日线基本数据并保存到MongoDB')
+    parser.add_argument('--config', default='config/config.yaml', help='配置文件路径')
+    parser.add_argument('--interface-dir', default='config/interfaces', help='接口配置文件目录')
+    parser.add_argument('--exchange', default='SSE', help='交易所代码：SSE-上交所, SZSE-深交所')
+    parser.add_argument('--start-date', help='开始日期，格式：YYYYMMDD')
+    parser.add_argument('--end-date', help='结束日期，格式：YYYYMMDD')
+    parser.add_argument('--db-name', help='MongoDB数据库名称')
+    parser.add_argument('--collection-name', default='suspend', help='MongoDB集合名称')
+    parser.add_argument('--verbose', action='store_true', help='输出详细日志')
+    parser.add_argument('--shared-config', type=str, default=None, help='共享配置文件路径')
+    parser.add_argument('--skip-validation', action='store_true', help='跳过配置验证')
+    parser.add_argument('--serial', action='store_true', help='使用串行模式处理数据（默认为并行模式）')
+    parser.add_argument('--recent', action='store_true', help='使用并行模式处理数据（默认）')
+    parser.add_argument('--max-workers', type=int, default=3, help='并行模式下的最大工作线程数（默认为3）')
+    parser.add_argument('--full', action='store_true', help='使用完整模式，按股票代码列表获取所有股票的基本数据')
+    
     args = parser.parse_args()
     
-    # 解析市场代码
-    target_market_codes = set(args.market_codes.split(','))
+    # 根据verbose参数设置日志级别
+    if not args.verbose:
+        # 非详细模式下，设置日志级别为INFO，不显示DEBUG消息
+        logger.remove()  # 移除所有处理器
+        logger.add(sys.stderr, level="INFO")  # 添加标准错误输出处理器，级别为INFO
     
-    # 创建获取器
-    fetcher = SuspendFetcher(
-        config_path=args.config,
-        target_market_codes=target_market_codes,
-        verbose=args.verbose,
-        max_workers=args.max_workers,
-        batch_size=args.batch_size
-    )
-    
-    if args.mock:
-        logger.warning("使用模拟数据模式")
-        # 生成模拟数据
-        df = fetcher.create_mock_data()
-        # 保存到MongoDB
-        fetcher.save_to_mongodb(df)
-        logger.success("模拟数据获取和保存成功")
-        sys.exit(0)
-    
-    if args.ts_code:
-        # 单个股票处理模式
-        logger.info(f"获取单个股票 {args.ts_code} 的停牌数据")
-        df = fetcher.fetch_suspend_by_code(
-            ts_code=args.ts_code
+    try:
+        # 加载共享配置（如果有）
+        shared_config = load_shared_config(args.shared_config)
+        
+        # 使用共享配置中的验证状态
+        if shared_config:
+            validation_status = get_validation_status(shared_config)
+            logger.info(f"从共享配置获取验证状态：{validation_status}")
+            
+            # 如果共享配置中指定了配置文件路径，优先使用
+            if "config_file" in shared_config and not args.config:
+                args.config = shared_config.get("config_file")
+                logger.info(f"从共享配置获取配置文件路径：{args.config}")
+        
+        # 创建获取器并运行 - 传入 mongo_instance
+        fetcher = suspendFetcher(
+            config_path=args.config,
+            interface_dir=args.interface_dir,
+            exchange=args.exchange,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            db_name=args.db_name,
+            collection_name=args.collection_name,
+            verbose=args.verbose,
+            shared_config=shared_config,
+            skip_validation=args.skip_validation,
+            serial_mode=args.serial,
+            max_workers=args.max_workers,
+            full_mode=args.full,
+            mongo_handler_instance=mongo_instance # 显式传入实例
         )
         
-        if not df.empty:
-            # 过滤目标板块
-            code_prefix = args.ts_code[:6][:2] if len(args.ts_code) >= 6 else ""
-            if code_prefix in target_market_codes:
-                # 保存到MongoDB
-                fetcher.save_to_mongodb(df)
-                logger.success(f"股票 {args.ts_code} 的停牌数据获取和保存成功，共 {len(df)} 条记录")
+        try:
+            success = fetcher.run()
+            
+            if success:
+                logger.success("日线基本数据获取和保存成功")
+                return 0
             else:
-                logger.warning(f"股票 {args.ts_code} 不在目标市场 {target_market_codes} 中，不保存数据")
-        else:
-            logger.warning(f"未获取到股票 {args.ts_code} 的停牌数据")
+                logger.error("日线基本数据获取或保存失败")
+                return 1
+        except KeyboardInterrupt:
+            logger.warning("接收到Ctrl+C，正在强制退出...")
+            return 130  # 标准的SIGINT退出码
         
-        sys.exit(0)
-    
-    # 构建运行配置
-    run_config = {
-        "recent": args.recent,
-        "full": args.full,
-        "batch_size": args.batch_size
-    }
-    
-    # 运行获取器
-    logger.info("开始获取停牌数据...")
-    success = fetcher.run(config=run_config)
-    
-    if success:
-        logger.success("停牌数据获取和保存成功")
-        sys.exit(0)
-    else:
-        logger.error("停牌数据获取或保存失败")
-        sys.exit(1)
-
+    except Exception as e:
+        logger.error(f"运行过程中发生异常: {str(e)}")
+        import traceback
+        logger.error(f"详细错误信息: {traceback.format_exc()}")
+        return 1
 
 if __name__ == "__main__":
-    main() 
+    try:
+        exit_code = main()
+        sys.exit(exit_code)
+    except KeyboardInterrupt:
+        logger.warning("程序被用户中断")
+        os._exit(130)  # 使用os._exit强制退出 
