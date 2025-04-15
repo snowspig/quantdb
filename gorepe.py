@@ -29,8 +29,8 @@ from datetime import datetime
 from typing import Dict, List, Set, Tuple, Optional, Any, Union
 import multiprocessing
 
-# 修复导入配置状态管理器
-from core.config_state_manager import ConfigStateManager
+# 修复导入配置管理器
+from core.config_manager import ConfigManager
 import concurrent.futures
 import queue
 
@@ -56,49 +56,6 @@ PARALLEL_WORKERS = max(1, TOTAL_WORKERS - SERIAL_WORKERS)  # 并行任务工作�
 # 运行状态
 RUNNING = True
 
-# 添加在类外部，作为兼容层函数
-def get_validation_summary(config_manager):
-    """
-    获取配置验证状态摘要，兼容不同版本的ConfigStateManager
-    
-    如果ConfigStateManager没有get_validation_summary方法，则提供默认实现
-    
-    Returns:
-        Dict: 包含验证状态的字典
-    """
-    try:
-        # 尝试调用原生方法
-        if hasattr(config_manager, 'get_validation_summary'):
-            return config_manager.get_validation_summary()
-        
-        # 如果没有该方法，则尝试从属性获取状态
-        default_summary = {
-            "mongodb": True,  # 假设MongoDB已经验证
-            "tushare": True,  # 假设Tushare已经验证
-            "wan": True,      # 假设WAN已经验证
-            "all_valid": True # 假设所有项都已验证
-        }
-        
-        # 尝试从属性获取
-        if hasattr(config_manager, 'mongodb_valid'):
-            default_summary['mongodb'] = config_manager.mongodb_valid
-        if hasattr(config_manager, 'tushare_valid'):
-            default_summary['tushare'] = config_manager.tushare_valid
-        if hasattr(config_manager, 'wan_valid'):
-            default_summary['wan'] = config_manager.wan_valid
-        
-        # 检查是否全部有效
-        default_summary['all_valid'] = all([
-            default_summary['mongodb'], 
-            default_summary['tushare'], 
-            default_summary['wan']
-        ])
-        
-        return default_summary
-    except Exception as e:
-        logger.warning(f"获取验证状态时出错：{str(e)}，将使用默认全部有效状态")
-        return {"mongodb": True, "tushare": True, "wan": True, "all_valid": True}
-
 class TaskManager:
     """任务管理器类，负责加载、调度和执行任务"""
     
@@ -122,12 +79,12 @@ class TaskManager:
         self.end_time = None
         self.verbose = False  # 默认不使用详细日志
         
-        # 使用配置状态管理器来检查配置是否已经验证过
-        self.config_state_manager = ConfigStateManager()
-        # 使用兼容函数获取验证摘要
-        validation_summary = get_validation_summary(self.config_state_manager)
+        # 使用配置管理器来检查配置是否已经验证过
+        self.config_state_manager = ConfigManager()
+        # 获取验证状态
+        validation_status = self.config_state_manager.get_validation_status()
         # 检查是否所有配置都已验证
-        self.configurations_validated = validation_summary.get("all_valid", False)
+        self.configurations_validated = all(validation_status.values())
         
         # 共享配置文件路径
         self.shared_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
@@ -220,8 +177,12 @@ class TaskManager:
             # 准备环境变量
             env = os.environ.copy()
             # 添加配置状态信息
-            for key, value in get_validation_summary(self.config_state_manager).items():
+            validation_status = self.config_state_manager.get_validation_status()
+            for key, value in validation_status.items():
                 env[f"QUANTDB_CONFIG_{key.upper()}"] = str(value)
+            
+            # 环境变量支持传递更详细的验证状态
+            env["QUANTDB_CONFIG_VALIDATED"] = str(all(validation_status.values()))
             
             # 添加共享配置文件路径到环境变量
             env["QUANTDB_SHARED_CONFIG"] = self.shared_config_path
@@ -234,8 +195,7 @@ class TaskManager:
             cmd_args.extend(["--shared-config", self.shared_config_path])
             
             # 如果有验证状态，添加到命令行
-            validation_summary = get_validation_summary(self.config_state_manager)
-            if validation_summary.get('all_valid', False):
+            if all(validation_status.values()):
                 cmd_args.append("--skip-validation")
             
             # 默认不使用详细日志模式，减少输出量
@@ -262,7 +222,21 @@ class TaskManager:
             stdout, stderr = process.communicate(timeout=timeout)
             
             # 检查返回码
-            if process.returncode != 0:
+            if process.returncode == 0:
+                # 正常退出 - 成功
+                end_time = time.time()
+                duration = end_time - start_time
+                logger.info(f"程序执行成功 [{program}]，耗时：{duration:.2f} 秒")
+                return True, stdout
+            elif process.returncode == 2:
+                # 退出码为2 - 表示正常执行但没有数据
+                end_time = time.time()
+                duration = end_time - start_time
+                logger.info(f"程序执行成功 [{program}]，但没有数据，耗时：{duration:.2f} 秒")
+                # 当退出码为2时，仍然视为成功，但记录详细信息
+                return True, f"无数据返回: {stderr}"
+            else:
+                # 其他非零退出码 - 失败
                 logger.error(f"程序执行失败 [{program}]，退出代码：{process.returncode}")
                 logger.error(f"错误信息：{stderr}")
                 return False, stderr
@@ -674,12 +648,12 @@ class TaskManager:
         """
         try:
             # 获取验证状态
-            validation_summary = get_validation_summary(self.config_state_manager)
+            validation_status = self.config_state_manager.get_validation_status()
             
             # 创建共享配置字典
             shared_config = {
                 "config_file": self.config_file,
-                "validation_summary": validation_summary,
+                "validation_status": validation_status,
                 "timestamp": time.time(),
                 # 可以添加其他需要共享的配置
             }
@@ -768,31 +742,30 @@ def main() -> int:
     signal.signal(signal.SIGTERM, signal_handler)
     
     try:
-        # 创建配置状态管理器
-        config_state_manager = ConfigStateManager()
+        # 创建配置管理器
+        config_manager = ConfigManager()
         
         # 检查配置状态，仅在需要时验证配置
-        validation_summary = get_validation_summary(config_state_manager)
-        logging.info(f"配置验证状态: MongoDB={validation_summary['mongodb']}, "
-                     f"Tushare={validation_summary['tushare']}, WAN={validation_summary['wan']}")
+        validation_status = config_manager.get_validation_status()
+        logging.info(f"配置验证状态: MongoDB={validation_status['mongo']}, "
+                     f"Tushare={validation_status['tushare']}, WAN={validation_status['wan']}")
                      
         # 如果指定强制检查配置或配置尚未验证，则执行配置验证
-        if args.force_config_check or not validation_summary['all_valid']:
+        if args.force_config_check or not all(validation_status.values()):
             logging.info("开始验证系统配置...")
-            # 导入验证配置模块并执行验证
-            from validate_configurations import validate_all_configurations
-            validate_all_configurations()
+            # 使用ConfigManager的verify_and_store_config方法
+            config_state = config_manager.verify_and_store_config(force_check=True)
             # 重新获取验证状态用于记录
-            validation_summary = get_validation_summary(config_state_manager)
-            if not validation_summary['all_valid']:
+            validation_status = config_manager.get_validation_status()
+            if not all(validation_status.values()):
                 logging.error("配置验证失败，部分组件可能无法正常工作")
         else:
             logging.info("使用已缓存的配置验证结果")
             
         # 创建任务管理器
         manager = TaskManager(config_file=args.config)
-        # 设置配置状态管理器
-        manager.config_state_manager = config_state_manager
+        # 设置配置管理器
+        manager.config_state_manager = config_manager
         # 设置详细日志模式
         manager.verbose = args.verbose
         

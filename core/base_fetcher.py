@@ -13,7 +13,7 @@ import pandas as pd
 import concurrent.futures
 from datetime import datetime, timedelta
 from abc import ABC, abstractmethod
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 # 导入核心组件
 from .config_manager import config_manager
@@ -38,29 +38,55 @@ class BaseFetcher(ABC):
     - get_date_range: 获取日期范围内的所有日期（有默认实现）
     """
     
-    def __init__(self, api_name: str, config_path=None, silent=False):
+    def __init__(self, 
+                 config_path: str = "config/config.yaml",
+                 interface_dir: str = "config/interfaces",
+                 interface_name: str = None,
+                 db_name: str = None,
+                 collection_name: str = None,
+                 verbose: bool = False,
+                 shared_config: Dict[str, Any] = None,
+                 skip_validation: bool = False,
+                 mongo_handler_instance: Optional[Any] = None # 添加参数，接受外部传入的MongoDB处理器实例
+                 ):
         """
-        初始化数据获取器
+        初始化基础抓取器
         
         Args:
-            api_name: 接口名称（对应接口配置文件名）
-            config_path: 配置文件路径（可选）
-            silent: 静默模式，不输出日志
+            config_path: 配置文件路径
+            interface_dir: 接口配置文件目录
+            interface_name: 接口配置文件名称
+            db_name: MongoDB数据库名称
+            collection_name: MongoDB集合名称
+            verbose: 是否输出详细日志
+            shared_config: 共享配置
+            skip_validation: 是否跳过配置验证
+            mongo_handler_instance: 外部传入的MongoDB处理器实例
         """
-        self.api_name = api_name
-        self.silent = silent
+        self.config_path = config_path
+        self.interface_dir = interface_dir
+        self.interface_name = interface_name
+        self.collection_name = collection_name
+        self.verbose = verbose
+        self.skip_validation = skip_validation
+        self.db_name = db_name
+        self.shared_config = shared_config
+        self.mongo_handler_instance = mongo_handler_instance
+        
+        # 添加错误消息列表，用于记录运行过程中的错误
+        self.error_messages = []
         
         # 初始化日志
         self._setup_logging()
         
         # 加载配置
-        self.interface_config = config_manager.get_interface_config(api_name)
+        self.interface_config = config_manager.get_interface_config(self.interface_name)
         if not self.interface_config:
-            self.logger.warning(f"接口配置不存在: {api_name}.json，将使用默认配置")
+            self.logger.warning(f"接口配置不存在: {self.interface_name}.json，将使用默认配置")
             self.interface_config = {}
             
         # 获取抓取器配置
-        fetcher_config = config_manager.get_fetch_config(api_name)
+        fetcher_config = config_manager.get_fetch_config(self.interface_name)
         default_config = config_manager.get_default_fetcher_config()
         
         # 设置参数
@@ -81,7 +107,7 @@ class BaseFetcher(ABC):
             
     def _setup_logging(self):
         """设置日志记录"""
-        self.logger = logging.getLogger(f"core.BaseFetcher.{self.api_name}")
+        self.logger = logging.getLogger(f"core.BaseFetcher.{self.interface_name}")
         
         if not self.logger.handlers:
             # 控制台处理器
@@ -97,7 +123,7 @@ class BaseFetcher(ABC):
                 if not os.path.exists(log_dir):
                     os.makedirs(log_dir)
                     
-                file_handler = logging.FileHandler(os.path.join(log_dir, f"{self.api_name}.log"))
+                file_handler = logging.FileHandler(os.path.join(log_dir, f"{self.interface_name}.log"))
                 file_handler.setFormatter(logging.Formatter(
                     '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
                 ))
@@ -106,10 +132,10 @@ class BaseFetcher(ABC):
                 pass  # 忽略文件处理器创建失败的异常
             
             # 设置日志级别
-            if self.silent:
-                self.logger.setLevel(logging.WARNING)
-            else:
+            if self.verbose:
                 self.logger.setLevel(logging.INFO)
+            else:
+                self.logger.setLevel(logging.WARNING)
     
     @abstractmethod
     def fetch_data(self, **kwargs) -> pd.DataFrame:

@@ -32,6 +32,7 @@ from loguru import logger
 import random
 import socket
 import pymongo
+import argparse
 
 # 添加项目根目录到Python路径
 current_dir = Path(__file__).resolve().parent
@@ -171,6 +172,9 @@ class DivFetcher(TushareFetcher):
             full_mode: 是否使用完整模式（按股票代码抓取）
             mongo_handler_instance: 显式传入的 MongoDBHandler 实例
         """
+        # 初始化错误消息列表
+        self.error_messages = []
+        
         # 使用共享配置中的设置（如果有）
         if shared_config:
             # 可以从共享配置中获取配置文件路径
@@ -665,7 +669,9 @@ class DivFetcher(TushareFetcher):
             # 获取单日数据 - 直接传递 wan_idx 给 fetch_data
             df = self.fetch_data(trade_date=trade_date, wan_idx=wan_idx)
             if df is None or df.empty:
-                logger.warning(f"交易日 {trade_date} 的除权除息数据为空或获取失败")
+                error_msg = f"交易日 {trade_date} 的除权除息数据为空或获取失败"
+                logger.warning(error_msg)
+                self.error_messages.append(error_msg)  # 添加到错误消息列表
                 return False
             
             # 处理数据
@@ -1120,145 +1126,84 @@ class DivFetcher(TushareFetcher):
     
     def run(self) -> bool:
         """
-        运行数据获取和保存流程
+        执行抓取任务
         
         Returns:
-            是否成功
+            bool: 是否成功
         """
+        # 确保错误消息列表为空
+        self.error_messages = []
+        
+        logger.info(f"交易所: {self.exchange}, 日期范围: {self.start_date} - {self.end_date}")
+        
         try:
-            # 第一步：检查并确保集合和索引存在
+            # 设置索引字段
+            index_fields = ["ts_code", "div_proc", "ann_date", "ex_date"]
+            
+            # 检查并设置MongoDB集合
             logger.info("第一步：检查并确保MongoDB集合和索引存在")
-            if not self._ensure_collection_and_indexes():
-                logger.error("无法确保MongoDB集合和索引，放弃数据获取")
+            
+            # 检查MongoDB集合是否存在
+            logger.info(f"检查MongoDB集合 {self.collection_name} 是否存在")
+            if not self.mongodb_handler.collection_exists(self.collection_name):
+                logger.info(f"集合 {self.collection_name} 不存在，将创建")
+                self.mongodb_handler.create_collection(self.collection_name)
+            else:
+                logger.info(f"集合 {self.collection_name} 已存在")
+            
+            # 获取集合
+            collection = self.mongodb_handler.get_collection(self.collection_name)
+            
+            # 设置索引
+            logger.info(f"为集合 {self.collection_name} 设置索引字段: {index_fields}")
+            # 替换ensure_indexes方法，逐个创建索引
+            for field in index_fields:
+                try:
+                    # 先检查索引是否已存在
+                    existing_indexes = collection.index_information()
+                    index_name = f"{field}_1"  # MongoDB的默认索引命名格式
+                    
+                    if index_name in existing_indexes:
+                        logger.info(f"索引 {index_name} 已存在，无需重新创建")
+                    else:
+                        # 尝试为每个字段创建索引
+                        collection.create_index(field, unique=(field == "ts_code"))
+                        logger.info(f"为字段 {field} 创建索引成功")
+                except Exception as e:
+                    logger.warning(f"为字段 {field} 创建索引失败: {str(e)}")
+                    # 继续处理其他字段
+            
+            # 使用日期模式抓取数据
+            logger.info("使用日期模式，按除权除息日获取数据")
+            
+            # 获取日期范围内的所有交易日
+            logger.info(f"第二步：获取日期范围 {self.start_date} - {self.end_date} 内的交易日...")
+            trade_dates = self.get_trade_dates(self.start_date, self.end_date)
+            if not trade_dates:
+                error_msg = f"未找到日期范围 {self.start_date} - {self.end_date} 内的交易日"
+                logger.error(error_msg)
+                self.error_messages.append(error_msg)
+                return False
+                
+            logger.info(f"从trade_cal集合获取到 {len(trade_dates)} 个不重复的交易日 (所有交易所)")
+            
+            # 并行处理所有交易日
+            logger.info(f"第三步：并行处理 {len(trade_dates)} 个交易日的除权除息数据")
+            result = self._process_date_parallel(trade_dates)
+            
+            # 如果无数据但正常执行，记录特殊消息
+            if not result and all("为空或获取失败" in msg for msg in self.error_messages):
+                logger.warning("数据为空，但这是正常的情况，将作为特殊成功处理")
                 return False
             
-            # 根据模式走不同的处理流程
-            if self.full_mode:
-                # 完整模式：按股票代码获取
-                logger.info("使用完整模式，按股票代码获取所有历史数据")
-                
-                # 第二步：获取所有股票代码
-                logger.info("第二步：从stock_basic集合获取股票代码列表")
-                stock_codes = self.get_stock_codes()
-                
-                if not stock_codes:
-                    logger.error("未能获取到任何股票代码，抓取失败")
-                    return False  # 没有找到股票代码应该返回失败
-                
-                # 第三步：获取数据（串行或并行）
-                logger.info(f"第三步：处理 {len(stock_codes)} 个股票的数据")
-                
-                if self.serial_mode:
-                    # 串行模式
-                    logger.info(f"使用串行模式处理 {len(stock_codes)} 个股票的数据")
-                    all_success = True
-                    
-                    for ts_code in stock_codes:
-                        # 检查是否收到停止信号
-                        if STOP_PROCESSING:
-                            logger.warning("收到停止信号，中断处理")
-                            return False
-                            
-                        logger.info(f"正在处理股票: {ts_code}")  # 保留这一行，显示当前处理的股票代码
-                        
-                        try:
-                            # 获取单个股票数据
-                            df = self.fetch_stock_data(ts_code)
-                            if df is None or df.empty:
-                                logger.warning(f"股票 {ts_code} 的数据为空或获取失败")
-                                continue
-                            
-                            # 处理数据
-                            processed_df = self.process_data(df)
-                            if processed_df is None or processed_df.empty:
-                                logger.warning(f"股票 {ts_code} 的处理后数据为空")
-                                continue
-                            
-                            # 保存数据到MongoDB
-                            success = self.save_to_mongodb(processed_df)
-                            if success:
-                                logger.success(f"股票 {ts_code} 的数据已保存到MongoDB")
-                            else:
-                                logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
-                                all_success = False
-                                
-                            # full模式下添加5秒延时
-                            if self.full_mode:
-                                logger.info(f"full模式: 等待5秒后继续下一个请求...")
-                                time.sleep(5)
-                                
-                        except Exception as e:
-                            logger.error(f"处理股票 {ts_code} 的数据时发生异常: {str(e)}")
-                            all_success = False
-                    
-                    return all_success
-                else:
-                    # 并行模式
-                    logger.info(f"使用并行模式处理 {len(stock_codes)} 个股票的数据，将在每个请求后添加5秒延时")
-                    return self._process_stock_parallel(stock_codes)
-            else:
-                # 日期模式：按交易日获取
-                logger.info("使用日期模式，按交易日获取数据")
-                
-                # 第二步：获取日期范围内的所有交易日
-                logger.info(f"第二步：获取日期范围 {self.start_date} - {self.end_date} 内的交易日...")
-                trade_dates = self.get_trade_dates(self.start_date, self.end_date)
-                
-                if not trade_dates:
-                    logger.warning("未找到交易日，没有数据需要处理")
-                    return True  # 没有数据也视为成功
-                
-                # 第三步：获取数据（串行或并行）
-                if self.serial_mode:
-                    # 串行模式
-                    logger.info(f"第三步：串行处理 {len(trade_dates)} 个交易日的数据")
-                    all_success = True
-                    
-                    for ex_date in trade_dates:
-                        # 检查是否收到停止信号
-                        if STOP_PROCESSING:
-                            logger.warning("收到停止信号，中断处理")
-                            return False
-                            
-                        logger.info(f"正在处理除权除息日: {ex_date}")
-                        
-                        try:
-                            # 获取单日数据
-                            df = self.fetch_div_data(ex_date)
-                            if df is None or df.empty:
-                                logger.warning(f"除权除息日 {ex_date} 的数据为空或获取失败")
-                                continue
-                            
-                            # 处理数据
-                            processed_df = self.process_data(df)
-                            if processed_df is None or processed_df.empty:
-                                logger.warning(f"除权除息日 {ex_date} 的处理后数据为空")
-                                continue
-                            
-                            # 保存单日数据到MongoDB
-                            success = self.save_to_mongodb(processed_df)
-                            if success:
-                                logger.success(f"除权除息日 {ex_date} 的数据已保存到MongoDB")
-                            else:
-                                logger.error(f"保存除权除息日 {ex_date} 的数据到MongoDB失败")
-                                all_success = False
-                        except Exception as e:
-                            logger.error(f"处理除权除息日 {ex_date} 的数据时发生异常: {str(e)}")
-                            all_success = False
-                    
-                    return all_success
-                else:
-                    # 并行模式
-                    logger.info(f"第三步：并行处理 {len(trade_dates)} 个交易日的除权除息数据")
-                    return self._process_date_parallel(trade_dates)
-            
-            logger.info("数据获取和保存流程完成")
-            return True
+            return result
             
         except Exception as e:
-            logger.error(f"运行过程中发生异常: {str(e)}")
+            error_msg = f"执行任务时发生异常: {str(e)}"
+            logger.error(error_msg)
+            self.error_messages.append(error_msg)
             import traceback
-            logger.debug(f"详细错误信息: {traceback.format_exc()}")
+            logger.debug(f"错误详情: {traceback.format_exc()}")
             return False
 
     def save_to_mongodb(self, df: pd.DataFrame, max_retries=3, chunk_size=10000) -> bool:
@@ -1401,35 +1346,12 @@ class DivFetcher(TushareFetcher):
             return False
 
 def main():
-    """主函数"""
-    import argparse
-    
-    # 设置信号处理器
+    """主函数入口"""
+    # 设置信号处理器，用于处理CTRL+C
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # 注册退出处理函数
-    atexit.register(exit_handler)
-    
-    logger.info("初始化中断处理，可以使用Ctrl+C安全退出程序")
-
-    # ---- 在解析参数前，先初始化核心服务 ----
-    # （如果初始化依赖配置，则需要先解析参数）
-    # 显式初始化 MongoDB Handler
-    logger.info("Initializing MongoDB Handler...")
-    mongo_instance = None # 初始化为 None
-    try:
-        mongo_instance = init_mongodb_handler() # 调用初始化函数并获取返回的实例
-        if mongo_instance:
-             logger.info("MongoDB Handler initialized successfully.")
-        else:
-             logger.warning("init_mongodb_handler() did not initialize the handler.")
-    except Exception as e:
-        logger.error(f"Failed to initialize MongoDB Handler: {e}")
-        # 这里可以选择退出或继续（取决于是否必须要有DB）
-        # sys.exit(1)
-    # ---- 初始化结束 ----
-    
+    # 解析命令行参数
     parser = argparse.ArgumentParser(description='获取日线基本数据并保存到MongoDB')
     parser.add_argument('--config', default='config/config.yaml', help='配置文件路径')
     parser.add_argument('--interface-dir', default='config/interfaces', help='接口配置文件目录')
@@ -1441,69 +1363,66 @@ def main():
     parser.add_argument('--verbose', action='store_true', help='输出详细日志')
     parser.add_argument('--shared-config', type=str, default=None, help='共享配置文件路径')
     parser.add_argument('--skip-validation', action='store_true', help='跳过配置验证')
-    parser.add_argument('--serial', action='store_true', help='使用串行模式处理数据（默认为并行模式）')
-    parser.add_argument('--recent', action='store_true', help='使用并行模式处理数据（默认）')
-    parser.add_argument('--max-workers', type=int, default=3, help='并行模式下的最大工作线程数（默认为3）')
-    parser.add_argument('--full', action='store_true', help='使用完整模式，按股票代码列表获取所有股票的基本数据')
-    
     args = parser.parse_args()
     
-    # 根据verbose参数设置日志级别
-    if not args.verbose:
-        # 非详细模式下，设置日志级别为INFO，不显示DEBUG消息
-        logger.remove()  # 移除所有处理器
-        logger.add(sys.stderr, level="INFO")  # 添加标准错误输出处理器，级别为INFO
-    
     try:
-        # 加载共享配置（如果有）
+        # 初始化MongoDB句柄
+        logger.info("Initializing MongoDB Handler...")
+        mongodb_handler = MongoDBHandler()
+        logger.info("MongoDB Handler initialized successfully.")
+        
+        # 加载共享配置
         shared_config = load_shared_config(args.shared_config)
         
-        # 使用共享配置中的验证状态
-        if shared_config:
-            validation_status = get_validation_status(shared_config)
-            logger.info(f"从共享配置获取验证状态：{validation_status}")
-            
-            # 如果共享配置中指定了配置文件路径，优先使用
-            if "config_file" in shared_config and not args.config:
-                args.config = shared_config.get("config_file")
-                logger.info(f"从共享配置获取配置文件路径：{args.config}")
-        
-        # 创建获取器并运行 - 传入 mongo_instance
+        # 初始化抓取器
         fetcher = DivFetcher(
             config_path=args.config,
             interface_dir=args.interface_dir,
+            interface_name="div.json",
+            db_name=args.db_name,
+            collection_name=args.collection_name,
             exchange=args.exchange,
             start_date=args.start_date,
             end_date=args.end_date,
-            db_name=args.db_name,
-            collection_name=args.collection_name,
             verbose=args.verbose,
             shared_config=shared_config,
             skip_validation=args.skip_validation,
-            serial_mode=args.serial,
-            max_workers=args.max_workers,
-            full_mode=args.full,
-            mongo_handler_instance=mongo_instance # 显式传入实例
+            mongo_handler_instance=mongodb_handler  # 传递已初始化的MongoDB实例
         )
         
-        try:
-            success = fetcher.run()
-            
-            if success:
-                logger.success("日线基本数据获取和保存成功")
-                return 0
-            else:
-                logger.error("日线基本数据获取或保存失败")
+        # 命令行参数验证
+        if args.start_date and args.end_date:
+            if args.start_date > args.end_date:
+                logger.error(f"开始日期 {args.start_date} 不能晚于结束日期 {args.end_date}")
                 return 1
-        except KeyboardInterrupt:
-            logger.warning("接收到Ctrl+C，正在强制退出...")
-            return 130  # 标准的SIGINT退出码
+                
+        # 执行抓取
+        success = fetcher.run()
+        
+        logger.info("程序正常退出")
+        
+        # 如果成功为False，且错误信息中包含"为空或获取失败"，则返回2表示无数据
+        if not success and any("为空或获取失败" in msg for msg in fetcher.error_messages):
+            # 检查是否所有错误都是无数据错误
+            all_no_data_errors = all("为空或获取失败" in msg for msg in fetcher.error_messages)
+            if all_no_data_errors:
+                return 2  # 表示正常执行但没有数据
+            else:
+                return 1  # 其他错误
+        
+        return 0 if success else 1
         
     except Exception as e:
-        logger.error(f"运行过程中发生异常: {str(e)}")
-        import traceback
-        logger.error(f"详细错误信息: {traceback.format_exc()}")
+        logger.exception(f"程序执行过程中出现异常: {str(e)}")
         return 1
+        
+    finally:
+        # 确保MongoDB连接被正确关闭
+        # MongoDB Handler可能没有close方法，检查一下
+        if 'mongodb_handler' in locals() and mongodb_handler:
+            # 使用hasattr检查对象是否有close方法
+            if hasattr(mongodb_handler, 'close'):
+                mongodb_handler.close()
 
 if __name__ == "__main__":
     try:
