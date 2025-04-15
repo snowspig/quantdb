@@ -1,0 +1,53 @@
+{
+  "timestamp": "2025-04-16T00:35:51.843859",
+  "valid_until": "2025-04-17T00:35:51.843859",
+  "mongo": {
+    "status": "connected",
+    "server_info": {
+      "version": "8.0.0",
+      "gitVersion": "d7cd03b239ac39a3c7d63f7145e91aca36f93db6"
+    },
+    "connection_params": {
+      "host": "localhost",
+      "port": 27017,
+      "db_name": "tushare_data"
+    }
+  },
+  "tushare": {
+    "status": "connected",
+    "token_valid": true,
+    "connection_params": {
+      "token": "b5bb************************************************f3a0",
+      "length": 56
+    }
+  },
+  "wan_interfaces": [
+    {
+      "wan_idx": 0,
+      "port_range": [
+        50001,
+        51000
+      ],
+      "status": "active",
+      "test_port": 50781
+    },
+    {
+      "wan_idx": 1,
+      "port_range": [
+        51001,
+        52000
+      ],
+      "status": "active",
+      "test_port": 51880
+    },
+    {
+      "wan_idx": 2,
+      "port_range": [
+        52001,
+        53000
+      ],
+      "status": "active",
+      "test_port": 52668
+    }
+  ]
+}

@@ -67,6 +67,17 @@ def load_shared_config(shared_config_path=None) -> Dict[str, Any]:
             config = json.load(f)
         
         logger.info(f"成功从共享配置中加载设置：{config_path}")
+        
+        # 更新配置文件路径信息
+        # 如果共享配置中包含 db_config_file 字段，更新 config_file
+        if "db_config_file" in config:
+            logger.info(f"共享配置中包含数据库配置文件路径: {config['db_config_file']}")
+            if os.path.exists(config['db_config_file']):
+                config["config_file"] = config['db_config_file']
+                logger.info(f"将使用数据库配置文件: {config['db_config_file']}")
+            else:
+                logger.warning(f"共享配置中的数据库配置文件不存在: {config['db_config_file']}")
+        
         return config
     except Exception as e:
         logger.error(f"加载共享配置失败：{str(e)}")
@@ -82,8 +93,33 @@ def get_validation_status(shared_config: Dict[str, Any]) -> Dict[str, bool]:
     Returns:
         Dict[str, bool]: 验证状态字典
     """
-    validation_summary = shared_config.get("validation_summary", {})
-    return validation_summary
+    # 使用正确的键名 "validation_status"
+    validation_status = shared_config.get("validation_status", {})
+    
+    # 转换成布尔状态字典
+    result = {}
+    
+    # 处理不同的返回格式
+    for key in ['mongo', 'tushare', 'wan']:
+        if key in validation_status:
+            # 如果是字典，检查 status 字段
+            if isinstance(validation_status[key], dict):
+                result[key] = validation_status[key].get('status') == 'connected'
+            # 如果是布尔值，直接使用
+            elif isinstance(validation_status[key], bool):
+                result[key] = validation_status[key]
+            # 其他情况视为 False
+            else:
+                result[key] = False
+        else:
+            result[key] = False
+    
+    # 如果 wan 字段不存在，但有 wan_interfaces，则检查是否有 active 接口
+    if 'wan' not in validation_status and 'wan_interfaces' in shared_config:
+        wan_interfaces = shared_config.get('wan_interfaces', [])
+        result['wan'] = any(i.get('status') == 'active' for i in wan_interfaces)
+        
+    return result
 
 class StockBasicFetcher(TushareFetcher):
     """
@@ -127,12 +163,12 @@ class StockBasicFetcher(TushareFetcher):
             config_path = shared_config.get("config_file", config_path)
             # 获取验证状态
             validation_status = get_validation_status(shared_config)
-            skip_validation = skip_validation or validation_status.get("all_valid", False)
+            # 从验证状态中判断是否所有配置都有效，并结合命令行参数
+            all_valid = all(validation_status.values())
+            skip_validation = skip_validation or all_valid 
             
             logger.info(f"使用共享配置：配置文件={config_path}, 跳过验证={skip_validation}")
-        
-        # 保存skip_validation状态，但不传递给父类
-        self.skip_validation = skip_validation
+            logger.debug(f"从共享配置获取的验证状态: {validation_status}")
         
         # 检查TushareFetcher是否支持skip_validation参数
         import inspect
@@ -150,10 +186,10 @@ class StockBasicFetcher(TushareFetcher):
         # 如果父类支持skip_validation，则添加
         if 'skip_validation' in parent_params:
             parent_args['skip_validation'] = skip_validation
-            if verbose:
-                logger.debug("TushareFetcher支持skip_validation参数")
-        else:
-            logger.debug("TushareFetcher不支持skip_validation参数，将在子类中处理")
+        # else: # 如果父类不支持，则不传递，父类将执行其默认验证行为
+            # logger.debug("TushareFetcher不支持skip_validation参数，将在子类中处理")
+            # 此时子类也不应覆盖 run 方法来强行跳过验证，应遵循父类行为
+            pass
         
         # 调用父类初始化方法
         super().__init__(**parent_args)
@@ -368,80 +404,12 @@ class StockBasicFetcher(TushareFetcher):
         Returns:
             是否成功
         """
-        # 如果需要跳过验证，检查父类是否已支持
-        # 如果父类不支持，则自己处理跳过验证
-        if hasattr(self, 'skip_validation') and self.skip_validation:
-            import inspect
-            parent_run = super().run
-            parent_params = inspect.signature(parent_run).parameters
-            
-            # 如果父类run()不支持skip_validation参数，实现自己的逻辑
-            if 'skip_validation' not in parent_params:
-                logger.info("父类不支持跳过验证，使用自定义逻辑跳过验证过程")
-                
-                try:
-                    # 获取数据
-                    logger.info("开始获取数据...")
-                    df = self.fetch_data()
-                    if df is None or df.empty:
-                        logger.error("获取数据失败或数据为空")
-                        return False
-                    
-                    # 处理数据
-                    logger.info("开始处理数据...")
-                    processed_df = self.process_data(df)
-                    if processed_df is None or processed_df.empty:
-                        logger.warning("处理后的数据为空")
-                        return False
-                    
-                    # 存储数据 - 不直接调用save_data，而是尝试使用父类的save_to_mongodb方法
-                    # 或者直接调用父类的run方法来处理保存逻辑
-                    logger.info("开始保存数据...")
-                    
-                    # 方法1：尝试使用save_to_mongodb方法（如果存在）
-                    if hasattr(self, 'save_to_mongodb'):
-                        return self.save_to_mongodb(processed_df)
-                    
-                    # 方法2：尝试其他可能的方法名
-                    for method_name in ['store_data', 'insert_data', 'save']:
-                        if hasattr(self, method_name):
-                            method = getattr(self, method_name)
-                            return method(processed_df)
-                    
-                    # 方法3：如果没有找到合适的保存方法，则使用父类的run方法
-                    logger.info("未找到直接保存方法，回退到父类的run方法...")
-                    
-                    # 保存处理后的数据供父类使用
-                    self._processed_data = processed_df
-                    
-                    # 创建一个子类，覆盖fetch_data和process_data方法来使用已处理的数据
-                    class TempFetcher(TushareFetcher):
-                        def __init__(self, parent):
-                            self.__dict__ = parent.__dict__
-                        
-                        def fetch_data(self, **kwargs):
-                            # 直接返回原始数据
-                            return self._processed_data
-                        
-                        def process_data(self, df):
-                            # 直接返回，因为数据已经处理过
-                            return df
-                    
-                    # 创建临时对象
-                    temp_fetcher = TempFetcher(self)
-                    
-                    # 调用原始的父类run方法
-                    from types import MethodType
-                    original_run = super(TempFetcher, temp_fetcher).run
-                    return original_run()
-                    
-                except Exception as e:
-                    logger.error(f"运行过程中发生异常: {str(e)}")
-                    import traceback
-                    logger.error(f"详细错误信息: {traceback.format_exc()}")
-                    return False
+        # 移除复杂的 run 方法覆盖逻辑
+        # 现在依赖父类的 run 方法，它会调用我们覆盖的 process_data 方法
+        # skip_validation 的处理应在 __init__ 中传递给父类（如果支持）
+        # 或者由父类自身根据其逻辑处理验证
         
-        # 否则使用父类的通用流程，会自动调用子类实现的process_data方法
+        # 直接调用父类的 run 方法
         return super().run()
 
 def main():
@@ -482,10 +450,24 @@ def main():
             validation_status = get_validation_status(shared_config)
             logger.info(f"从共享配置获取验证状态：{validation_status}")
             
+            # 检查是否所有配置都有效
+            all_valid = all(validation_status.values())
+            # 如果所有配置有效，或者命令行指定了--skip-validation，则设置跳过验证
+            if all_valid:
+                 logger.info("共享配置显示所有验证已通过，设置跳过验证标志。")
+                 args.skip_validation = True
+            elif args.skip_validation:
+                 logger.info("命令行指定了跳过验证。")
+            else:
+                 logger.warning("共享配置显示部分验证未通过，且未指定跳过验证。")
+
             # 如果共享配置中指定了配置文件路径，优先使用
-            if "config_file" in shared_config and not args.config:
-                args.config = shared_config.get("config_file")
-                logger.info(f"从共享配置获取配置文件路径：{args.config}")
+            # 注意：这里如果命令行提供了 --config，它会覆盖共享配置中的路径
+            if "config_file" in shared_config and args.config == 'config/config.yaml': # 只有当未通过命令行指定时才使用共享路径
+                shared_config_file = shared_config.get("config_file")
+                if shared_config_file:
+                    args.config = shared_config_file
+                    logger.info(f"从共享配置获取配置文件路径：{args.config}")
         
         # 创建获取器并运行
         fetcher = StockBasicFetcher(

@@ -9,6 +9,21 @@ sys.path.append(str(current_dir))
 
 # 导入MongoDB处理模块
 from core import mongodb_handler
+# 导入初始化函数
+from core.mongodb_handler import init_mongodb_handler
+
+# 计算配置文件路径
+config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "config.yaml")
+print(f"使用配置文件: {config_path}")
+
+# 初始化MongoDB处理器
+print("正在初始化MongoDB处理器...")
+mongodb_handler = init_mongodb_handler(config_path)
+
+# 确保mongodb_handler不为None
+if mongodb_handler is None:
+    print("MongoDB处理器初始化失败")
+    sys.exit(1)
 
 # 连接MongoDB
 if not mongodb_handler.is_connected():
