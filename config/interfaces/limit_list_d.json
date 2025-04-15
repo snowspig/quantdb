@@ -1,0 +1,18 @@
+{
+  "description": "涨跌停列表",
+  "api_name": "limit_list_d",
+  "fields": [],
+  "params": {
+  },
+  "update_frequency": "daily",
+  "update_priority": 1,
+  "index_fields": [
+      "ts_code", "trade_date"
+  ],
+  "available_fields": [
+    "trade_date", "ts_code", "industry", "name", "close", 
+    "pct_chg", "amount", "limit_amount", "float_mv", "total_mv", 
+    "turnover_ratio", "fd_amount", "first_time", "last_time", 
+    "open_times", "up_stat", "limit_times", "limit"
+  ]
+}

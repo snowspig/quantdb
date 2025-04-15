@@ -1,0 +1,16 @@
+{
+  "description": "股票月线行情数据",
+  "api_name": "monthly",
+  "fields": [],
+  "params": {
+  },
+  "update_frequency": "monthly",
+  "update_priority": 1,
+  "index_fields": [
+      "ts_code", "trade_date"
+  ],
+  "available_fields": [
+    "amount", "low", "close", "pre_close", "high", 
+    "pct_chg", "vol", "trade_date", "ts_code", "open", "change"
+  ]
+}

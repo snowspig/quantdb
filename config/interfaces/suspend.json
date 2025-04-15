@@ -1,0 +1,16 @@
+{
+    "description": "股票停牌数据",
+    "api_name": "suspend",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code", "suspend_date"
+    ],
+    "available_fields": [
+        "ts_code", "suspend_date", "suspend_type", "resump_date", 
+        "change_reason", "suspend_time", "change_reason_type"
+    ]
+}

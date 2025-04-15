@@ -1,0 +1,16 @@
+{
+  "description": "上市公司管理层",
+  "api_name": "stk_managers",
+  "fields": [],
+  "params": {
+  },
+  "update_frequency": "daily",
+  "update_priority": 1,
+  "index_fields": [
+      "ts_code", "name", "begin_date", "title", "end_date"
+  ],
+  "available_fields": [
+    "ts_code", "ann_date", "name", "gender", "lev", "title", "edu", "national", "birthday", 
+    "begin_date", "end_date"  
+  ]
+}

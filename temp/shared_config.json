@@ -1,0 +1,9 @@
+{
+  "config_file": "tasks_config.yaml",
+  "validation_status": {
+    "mongo": false,
+    "tushare": false,
+    "wan": true
+  },
+  "timestamp": 1744729323.5644274
+}

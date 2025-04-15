@@ -1,0 +1,15 @@
+{
+  "description": "沪深港股通持股明细",
+  "api_name": "hk_hold",
+  "fields": [],
+  "params": {
+  },
+  "update_frequency": "daily",
+  "update_priority": 1,
+  "index_fields": [
+      "ts_code","trade_date"
+  ],
+  "available_fields": [
+    "exchange", "ts_code", "trade_date", "name", "ratio", "code", "vol"
+  ]
+}

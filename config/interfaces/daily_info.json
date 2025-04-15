@@ -1,0 +1,15 @@
+{
+    "description": "市场每日交易统计",
+    "api_name": "daily_info",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code", "trade_date"
+    ],
+    "available_fields": [
+
+    ]
+  }

@@ -1,0 +1,17 @@
+{
+  "description": "日线行情数据",
+  "api_name": "daily",
+  "fields": [],
+  "params": {
+  },
+  "update_frequency": "daily",
+  "update_priority": 1,
+  "index_fields": [
+      "ts_code","trade_date"
+  ],
+  "available_fields": [
+      "ts_code", "trade_date", "crncy_code", "pre_close", "open", "high", "low", "close", 
+      "change", "pct_chg", "volume", "amount", "adj_pre_close", "adj_open", "adj_high", 
+      "adj_low", "adj_close", "adj_factor", "avg_price", "trade_status"
+  ]
+} 

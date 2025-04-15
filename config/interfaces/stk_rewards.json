@@ -1,0 +1,16 @@
+{
+  "description": "高管薪酬和持股",
+  "api_name": "stk_rewards",
+  "fields": [],
+  "params": {
+  },
+  "update_frequency": "quarterly",
+  "update_priority": 1,
+  "index_fields": [
+      "ts_code", "end_date", "ann_date", "name", "title"
+  ],
+  "available_fields": [
+      "ts_code", "ann_date", "end_date", "name", 
+      "title", "reward", "hold_vol"
+  ]
+}

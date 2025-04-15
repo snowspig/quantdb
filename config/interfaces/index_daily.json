@@ -1,0 +1,15 @@
+{
+    "description": "A股指数日行情",
+    "api_name": "index_daily",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code", "trade_date"
+    ],
+    "available_fields": [
+
+    ]
+  }

@@ -1,0 +1,16 @@
+{
+    "description": "中国A股交易日历",
+    "api_name": "trade_cal",
+    "fields": [],
+    "params": {},
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "trade_date",
+        "exchange"
+    ],
+    "available_fields": [
+        "trade_date",
+        "exchange"
+    ]
+}

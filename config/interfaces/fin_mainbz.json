@@ -1,0 +1,15 @@
+{
+    "description": "主营业务构成",
+    "api_name": "fin_mainbz",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "quarterly",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code", "report_period"
+    ],
+    "available_fields": [
+
+    ]
+  }

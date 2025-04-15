@@ -1,0 +1,15 @@
+{
+  "description": "股票更名信息",
+  "api_name": "previous_name",
+  "fields": [],
+  "params": {
+  },
+  "update_frequency": "daily",
+  "update_priority": 1,
+  "index_fields": [
+      "ts_code","begindate"
+  ],
+  "available_fields": [
+      "ts_code", "begindate", "enddate", "ann_dt", "s_info_name", "changereason"
+  ]
+}

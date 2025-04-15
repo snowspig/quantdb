@@ -1,0 +1,14 @@
+{
+    "description": "港股通十大成交股",
+    "api_name": "ggt_top10",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code", "trade_date"
+    ],
+    "available_fields": [
+    ]
+  }

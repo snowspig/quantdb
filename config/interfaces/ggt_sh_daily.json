@@ -1,0 +1,15 @@
+{
+  "description": "港股通(沪)每日成交",
+  "api_name": "ggt_sh_daily",
+  "fields": [],
+  "params": {
+  },
+  "update_frequency": "daily",
+  "update_priority": 1,
+  "index_fields": [
+      "trade_date"
+  ],
+  "available_fields": [
+    "trade_date", "buy_amount", "buy_volume", "sell_amount", "sell_volume" 
+  ]
+}

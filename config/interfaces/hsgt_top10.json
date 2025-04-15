@@ -1,0 +1,16 @@
+{
+  "description": "沪深股通十大成交股",
+  "api_name": "hsgt_top10",
+  "fields": [],
+  "params": {
+  },
+  "update_frequency": "daily",
+  "update_priority": 1,
+  "index_fields": [
+      "ts_code","trade_date"
+  ],
+  "available_fields": [
+      "trade_date", "ts_code", "name", "close", "change", "rank", 
+      "market_type", "amount", "net_amount", "buy", "sell"
+  ]
+}

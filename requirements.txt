@@ -1,0 +1,11 @@
+# Core dependencies
+pymongo>=4.0.0
+xcsc_tushare
+PyYAML>=6.0
+loguru>=0.6.0
+pandas>=1.3.0
+requests>=2.27.0
+retry
+# Optional dependencies
+matplotlib>=3.5.0
+numpy>=1.22.0

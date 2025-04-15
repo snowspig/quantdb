@@ -1,0 +1,15 @@
+{
+    "description": "概念股列表",
+    "api_name": "concept_detail",
+    "fields": [],
+    "params": {
+    },
+    "update_frequency": "daily",
+    "update_priority": 1,
+    "index_fields": [
+        "ts_code", "id"
+    ],
+    "available_fields": [
+
+    ]
+  }

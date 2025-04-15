@@ -1,0 +1,17 @@
+{
+  "description": "港股通每月成交统计",
+  "api_name": "ggt_monthly",
+  "fields": [],
+  "params": {
+  },
+  "update_frequency": "monthly",
+  "update_priority": 1,
+  "index_fields": [
+      "month","markettype"
+  ],
+  "available_fields": [
+    "month", "markettype", "day_buy_amt", "day_buy_vol", "day_sell_amt", 
+    "day_sell_vol", "total_buy_amt", "total_buy_vol", "total_sell_amt", "total_sell_vol"
+
+  ]
+}
