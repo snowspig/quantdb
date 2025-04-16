@@ -1,0 +1,44 @@
+{
+  "timestamp": "2025-04-16T00:07:37.561436",
+  "valid_until": "2025-04-17T00:07:37.561436",
+  "mongo": {
+    "status": "error",
+    "message": "'NoneType' object has no attribute 'connect'"
+  },
+  "tushare": {
+    "status": "connected",
+    "token_valid": true,
+    "connection_params": {
+      "token": "b5bb*****f3a0"
+    }
+  },
+  "wan_interfaces": [
+    {
+      "wan_idx": 0,
+      "port_range": [
+        50001,
+        51000
+      ],
+      "status": "active",
+      "test_port": 50354
+    },
+    {
+      "wan_idx": 1,
+      "port_range": [
+        51001,
+        52000
+      ],
+      "status": "active",
+      "test_port": 51027
+    },
+    {
+      "wan_idx": 2,
+      "port_range": [
+        52001,
+        53000
+      ],
+      "status": "active",
+      "test_port": 52865
+    }
+  ]
+}

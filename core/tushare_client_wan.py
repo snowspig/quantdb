@@ -170,7 +170,7 @@ class TushareClientWAN:
     支持参数化请求和结果处理，自动重试和错误处理
     """
     
-    def __init__(self, token: str, api_url: str = "http://api.waditu.com", wan_idx: Optional[int] = None, timeout: int = 60):
+    def __init__(self, token: str, api_url: str = "http://116.128.206.39:7172", wan_idx: Optional[int] = None, timeout: int = 60):
         """
         初始化WAN绑定的Tushare客户端
         

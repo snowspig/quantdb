@@ -7,7 +7,7 @@
     "update_frequency": "quarterly",
     "update_priority": 1,
     "index_fields": [
-        "ts_code", "ann_date", "end_date"
+        "ts_code", "ann_date", "end_date", "report_type"
     ],
     "available_fields": [
 

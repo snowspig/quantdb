@@ -34,6 +34,18 @@ parallel_programs:
   - stock_previous_name_fetcher.py # 股票曾用名获取器
   - suspend_fetcher.py        # 停复牌信息获取器
   - weekly_fetcher.py         # 周线数据获取器
+  - balancesheet_fetcher.py    # 资产负债表数据获取器
+  - income_fetcher.py         # 利润表数据获取器
+  - cashflow_fetcher.py       # 现金流量表数据获取器
+  - express_fetcher.py        # 主要财务指标数据获取器
+  - forecast_fetcher.py       # 业绩预告数据获取器
+  - ggt_daily_fetcher.py      # 港通日线数据获取器
+  - ggt_monthly_fetcher.py    # 港通月线数据获取器
+  - ggt_sh_daily_fetcher.py   # 沪股通日线数据获取器
+  - hk_hold_fetcher.py       # 港股通持股数据获取器
+  - hsgt_top10_fetcher.py    # 沪深港通十大成交股数据获取器
+  - limit_list_d_fetcher.py   # 涨停榜数据获取器
+  - stk_limit_fetcher.py      # 涨停数据获取器
 
 
 
