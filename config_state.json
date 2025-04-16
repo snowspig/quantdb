@@ -1,15 +1,36 @@
 {
+<<<<<<< HEAD
   "timestamp": "2025-04-16T00:07:37.561436",
   "valid_until": "2025-04-17T00:07:37.561436",
   "mongo": {
     "status": "error",
     "message": "'NoneType' object has no attribute 'connect'"
+=======
+  "timestamp": "2025-04-16T00:35:51.843859",
+  "valid_until": "2025-04-17T00:35:51.843859",
+  "mongo": {
+    "status": "connected",
+    "server_info": {
+      "version": "8.0.0",
+      "gitVersion": "d7cd03b239ac39a3c7d63f7145e91aca36f93db6"
+    },
+    "connection_params": {
+      "host": "localhost",
+      "port": 27017,
+      "db_name": "tushare_data"
+    }
+>>>>>>> ceb3bb1c5efdb7375505cb833946d4ea244653b1
   },
   "tushare": {
     "status": "connected",
     "token_valid": true,
     "connection_params": {
+<<<<<<< HEAD
       "token": "b5bb*****f3a0"
+=======
+      "token": "b5bb************************************************f3a0",
+      "length": 56
+>>>>>>> ceb3bb1c5efdb7375505cb833946d4ea244653b1
     }
   },
   "wan_interfaces": [
@@ -20,7 +41,11 @@
         51000
       ],
       "status": "active",
+<<<<<<< HEAD
       "test_port": 50354
+=======
+      "test_port": 50781
+>>>>>>> ceb3bb1c5efdb7375505cb833946d4ea244653b1
     },
     {
       "wan_idx": 1,
@@ -29,7 +54,11 @@
         52000
       ],
       "status": "active",
+<<<<<<< HEAD
       "test_port": 51027
+=======
+      "test_port": 51880
+>>>>>>> ceb3bb1c5efdb7375505cb833946d4ea244653b1
     },
     {
       "wan_idx": 2,
@@ -38,7 +67,11 @@
         53000
       ],
       "status": "active",
+<<<<<<< HEAD
       "test_port": 52865
+=======
+      "test_port": 52668
+>>>>>>> ceb3bb1c5efdb7375505cb833946d4ea244653b1
     }
   ]
 }

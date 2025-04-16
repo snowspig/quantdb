@@ -1,9 +1,54 @@
 {
-  "config_file": "tasks_config.yaml",
+  "task_config_file": "D:\\MongoDB\\Code\\quant\\quantdb\\tasks_config.yaml",
+  "db_config_file": "d:\\MongoDB\\Code\\quant\\quantdb\\config\\config.yaml",
   "validation_status": {
+<<<<<<< HEAD
     "mongo": false,
     "tushare": true,
     "wan": true
   },
   "timestamp": 1744733257.5753996
+=======
+    "mongo": true,
+    "tushare": true,
+    "wan": true
+  },
+  "timestamp": 1744736712.8972518,
+  "database": {
+    "mongo": {
+      "host": "localhost",
+      "port": 27017,
+      "username": "root",
+      "password": "wyd075869",
+      "db_name": "tushare_data",
+      "auth_source": "admin",
+      "auth_mechanism": "DEFAULT",
+      "options": {
+        "connect_timeout_ms": 5000,
+        "socket_timeout_ms": 30000,
+        "server_selection_timeout_ms": 30000,
+        "w": 1,
+        "retryWrites": true
+      }
+    }
+  },
+  "api": {
+    "tushare": {
+      "token": "b5bb9d57e35cf485f0366eb6581017fb69cefff888da312b0128f3a0",
+      "api_url": "http://116.128.206.39:7172",
+      "timeout": 60,
+      "max_retry": 3,
+      "retry_delay": 5,
+      "fields_limit": 4000,
+      "rate_limit": {
+        "minute_limit": 500,
+        "day_limit": 10000
+      },
+      "cache": {
+        "enabled": true,
+        "ttl": 3600
+      }
+    }
+  }
+>>>>>>> ceb3bb1c5efdb7375505cb833946d4ea244653b1
 }

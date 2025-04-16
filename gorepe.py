@@ -79,10 +79,25 @@ class TaskManager:
         self.end_time = None
         self.verbose = False  # 默认不使用详细日志
         
+        # 确保配置文件路径是绝对路径
+        if not os.path.isabs(self.config_file):
+            self.config_file = os.path.abspath(self.config_file)
+        
+        logger.info(f"TaskManager 初始化: 使用配置文件 {self.config_file}")
+        
         # 使用配置管理器来检查配置是否已经验证过
-        self.config_state_manager = ConfigManager()
+        # 将配置文件路径传递给 ConfigManager
+        self.config_state_manager = ConfigManager(config_path=self.config_file)
+        
+        # 确保配置管理器已加载
+        if not self.config_state_manager.config:
+            logger.warning(f"配置管理器未能加载配置文件 {self.config_file}")
+            self.config_state_manager.reload()
+
         # 获取验证状态
         validation_status = self.config_state_manager.get_validation_status()
+        logger.info(f"配置验证状态: {validation_status}")
+        
         # 检查是否所有配置都已验证
         self.configurations_validated = all(validation_status.values())
         
@@ -208,18 +223,43 @@ class TaskManager:
                 cmd_args.append("--verbose")
             
             # 启动子进程，同时传递环境变量和命令行参数
-            # 添加encoding='utf-8'参数解决GBK编码问题
-            process = subprocess.Popen(
-                cmd_args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True,
-                env=env,
-                encoding='utf-8'
-            )
-            
-            # 等待进程完成并获取输出
-            stdout, stderr = process.communicate(timeout=timeout)
+            # 使用gbk编码解决中文环境编码问题
+            try:
+                process = subprocess.Popen(
+                    cmd_args,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                    env=env,
+                    encoding='gbk'  # Windows中文环境使用gbk编码
+                )
+                
+                # 等待进程完成并获取输出
+                try:
+                    stdout, stderr = process.communicate(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                    logger.error(f"程序执行超时 [{program}]，超时时间：{timeout} 秒")
+                    return False, f"执行超时，超过 {timeout} 秒"
+                
+            except Exception as e:
+                logger.error(f"启动子进程时出错 [{program}]: {str(e)}")
+                # 尝试使用不同的编码重试一次
+                try:
+                    logger.info(f"尝试使用utf-8编码重新启动 [{program}]")
+                    process = subprocess.Popen(
+                        cmd_args,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        universal_newlines=True,
+                        env=env,
+                        encoding='utf-8'
+                    )
+                    stdout, stderr = process.communicate(timeout=timeout)
+                except Exception as retry_error:
+                    logger.error(f"重试启动子进程失败 [{program}]: {str(retry_error)}")
+                    return False, f"启动子进程失败: {str(e)}, 重试失败: {str(retry_error)}"
             
             # 检查返回码
             if process.returncode == 0:
@@ -246,10 +286,6 @@ class TaskManager:
             logger.info(f"程序执行成功 [{program}]，耗时：{duration:.2f} 秒")
             
             return True, stdout
-            
-        except subprocess.TimeoutExpired:
-            logger.error(f"程序执行超时 [{program}]，超时时间：{timeout} 秒")
-            return False, f"执行超时，超过 {timeout} 秒"
             
         except Exception as e:
             logger.error(f"程序执行异常 [{program}]：{str(e)}")
@@ -647,26 +683,91 @@ class TaskManager:
         创建共享配置文件，包含所有必要的设置供子进程使用
         """
         try:
+            # 导入必要的模块
+            import os
+            import json
+            import time
+            
             # 获取验证状态
             validation_status = self.config_state_manager.get_validation_status()
             
+            # 计算数据库配置文件路径 - 使用正确的项目根目录
+            project_root = os.path.dirname(os.path.abspath(__file__))
+            db_config_path = os.path.join(project_root, "config", "config.yaml")
+            
+            # 确保数据库配置文件存在
+            if not os.path.exists(db_config_path):
+                logger.warning(f"数据库配置文件不存在：{db_config_path}")
+            else:
+                logger.info(f"找到数据库配置文件：{db_config_path}")
+            
+            # 从主配置加载必要的连接信息
+            # 注意：这里我们从 config_state_manager 获取数据库配置，而不是从 self.config
+            # 因为 self.config 是从 tasks_config.yaml 加载的，不包含数据库配置信息
+            
+            # 1. 尝试获取 MongoDB 配置
+            mongo_config = self.config_state_manager.get('mongodb', {})
+            if not mongo_config:
+                logger.warning("从配置管理器未获取到MongoDB配置，可能导致子进程无法连接MongoDB")
+            else:
+                logger.info("成功从配置管理器获取MongoDB配置")
+                
+            # 2. 尝试获取 Tushare 配置
+            tushare_config = self.config_state_manager.get('tushare', {})
+            if not tushare_config:
+                logger.warning("从配置管理器未获取到Tushare配置，可能导致子进程无法连接Tushare API")
+            else:
+                logger.info("成功从配置管理器获取Tushare配置")
+                
+            # 如果找不到 Tushare token，特别处理
+            if 'token' not in tushare_config:
+                import os
+                token = os.environ.get('TUSHARE_TOKEN', '')
+                if token:
+                    logger.info("从环境变量中找到 Tushare 令牌，添加到配置中")
+                    tushare_config['token'] = token
+            
             # 创建共享配置字典
             shared_config = {
-                "config_file": self.config_file,
-                "validation_status": validation_status,
+                "task_config_file": self.config_file,
+                "db_config_file": db_config_path,
+                "validation_status": validation_status,  # 使用正确的键名
                 "timestamp": time.time(),
-                # 可以添加其他需要共享的配置
+                # 添加数据库和API配置
+                "database": {
+                    "mongo": mongo_config
+                },
+                "api": {
+                    "tushare": tushare_config
+                }
             }
+            
+            # 输出一些调试信息
+            if validation_status.get('mongo', False) and not mongo_config:
+                logger.warning("MongoDB 验证状态为成功，但配置为空！")
+            
+            if validation_status.get('tushare', False) and not tushare_config.get('token'):
+                logger.warning("Tushare 验证状态为成功，但未找到 token！")
+            
+            if 'token' in tushare_config:
+                token = tushare_config['token']
+                masked_token = token[:4] + '*' * (len(token) - 8) + token[-4:] if len(token) > 8 else "****"
+                logger.info(f"共享配置中包含 Tushare 令牌 (掩码: {masked_token})")
             
             # 写入文件
             with open(self.shared_config_path, 'w', encoding='utf-8') as f:
-                import json
-                json.dump(shared_config, f, indent=2)
+                json.dump(shared_config, f, indent=2, ensure_ascii=False)  # 增加ensure_ascii=False确保中文正常写入
                 
             logger.info(f"共享配置已创建：{self.shared_config_path}")
+            logger.debug(f"共享配置包含以下键：{list(shared_config.keys())}")
+            logger.debug(f"验证状态：MongoDB={validation_status.get('mongo', False)}, "
+                         f"Tushare={validation_status.get('tushare', False)}, "
+                         f"WAN={validation_status.get('wan', False)}")
             
         except Exception as e:
             logger.error(f"创建共享配置失败：{str(e)}")
+            import traceback
+            logger.debug(f"详细错误信息：{traceback.format_exc()}")
 
 
 def signal_handler(sig, frame):
@@ -703,6 +804,8 @@ def parse_args() -> argparse.Namespace:
                         help="显示详细日志")
     parser.add_argument("--force-config-check", action="store_true",
                         help="强制重新验证所有配置（MongoDB、Tushare、WAN等）")
+    parser.add_argument("--skip-validation", action="store_true",
+                        help="完全跳过配置验证")
                         
     return parser.parse_args()
 
@@ -742,28 +845,79 @@ def main() -> int:
     signal.signal(signal.SIGTERM, signal_handler)
     
     try:
-        # 创建配置管理器
-        config_manager = ConfigManager()
+        # 确保任务配置文件路径是绝对路径
+        tasks_config_path = args.config
+        if not os.path.isabs(tasks_config_path):
+            tasks_config_path = os.path.abspath(tasks_config_path)
+        
+        logger.info(f"使用任务配置文件: {tasks_config_path}")
+        
+        # 检查任务配置文件是否存在
+        if not os.path.exists(tasks_config_path):
+            logger.error(f"任务配置文件不存在: {tasks_config_path}")
+            return 3
+            
+        # 处理实际数据库配置文件 (config/config.yaml)
+        # 验证和获取配置使用这个文件，它包含了MongoDB和Tushare配置
+        # 当前项目根目录是 D:\MongoDB\Code\quant\quantdb，配置文件在项目根目录下的config目录
+        project_root = os.path.dirname(os.path.abspath(__file__))  # 直接获取当前目录
+        db_config_path = os.path.join(project_root, "config", "config.yaml")
+        
+        if not os.path.exists(db_config_path):
+            logger.error(f"数据库配置文件不存在: {db_config_path}")
+            return 3
+            
+        logger.info(f"使用数据库配置文件: {db_config_path}")
+        
+        # 预先初始化 mongodb_handler，以确保后续验证能使用已初始化的实例
+        logger.info("预先初始化 MongoDB 处理器...")
+        try:
+            # 直接使用 core.mongodb_handler 模块中的初始化函数
+            from core.mongodb_handler import init_mongodb_handler
+            
+            # 显式初始化 MongoDB 处理器
+            handler = init_mongodb_handler(db_config_path)
+            if handler:
+                logger.info("MongoDB 处理器初始化成功")
+                # 不再尝试设置模块级变量，避免出错
+            else:
+                logger.warning("MongoDB 处理器初始化返回为 None")
+        except Exception as e:
+            logger.error(f"初始化 MongoDB 处理器时出错: {str(e)}")
+        
+        # 创建配置管理器 - 使用数据库配置文件
+        logger.info(f"初始化 ConfigManager，配置文件路径：{db_config_path}")
+        config_manager = ConfigManager(config_path=db_config_path)
+        
+        # 确保配置已加载
+        config = config_manager.get_all_config()
+        logger.info(f"配置已加载，包含以下主要部分: {', '.join(config.keys())}")
         
         # 检查配置状态，仅在需要时验证配置
         validation_status = config_manager.get_validation_status()
-        logging.info(f"配置验证状态: MongoDB={validation_status['mongo']}, "
-                     f"Tushare={validation_status['tushare']}, WAN={validation_status['wan']}")
+        logger.info(f"配置验证状态: MongoDB={validation_status['mongo']}, "
+                   f"Tushare={validation_status['tushare']}, WAN={validation_status['wan']}")
                      
+        # 如果指定完全跳过验证，则不进行任何检查
+        if hasattr(args, 'skip_validation') and args.skip_validation:
+            logger.info("用户指定跳过验证，不进行配置检查")
+            # 使用skip_validation=True的参数调用
+            config_state = config_manager.verify_and_store_config(skip_validation=True)
         # 如果指定强制检查配置或配置尚未验证，则执行配置验证
-        if args.force_config_check or not all(validation_status.values()):
-            logging.info("开始验证系统配置...")
+        elif args.force_config_check or not all(validation_status.values()):
+            logger.info("开始验证系统配置...")
             # 使用ConfigManager的verify_and_store_config方法
             config_state = config_manager.verify_and_store_config(force_check=True)
             # 重新获取验证状态用于记录
             validation_status = config_manager.get_validation_status()
             if not all(validation_status.values()):
-                logging.error("配置验证失败，部分组件可能无法正常工作")
+                logger.error("配置验证失败，部分组件可能无法正常工作")
+                logger.debug(f"详细验证结果: {config_state}")
         else:
-            logging.info("使用已缓存的配置验证结果")
+            logger.info("使用已缓存的配置验证结果")
             
-        # 创建任务管理器
-        manager = TaskManager(config_file=args.config)
+        # 创建任务管理器 - 使用任务配置文件
+        manager = TaskManager(config_file=tasks_config_path)
         # 设置配置管理器
         manager.config_state_manager = config_manager
         # 设置详细日志模式
