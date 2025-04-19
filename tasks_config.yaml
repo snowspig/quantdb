@@ -42,10 +42,30 @@ parallel_programs:
   - ggt_daily_fetcher.py      # 港通日线数据获取器
   - ggt_monthly_fetcher.py    # 港通月线数据获取器
   - ggt_sh_daily_fetcher.py   # 沪股通日线数据获取器
+  - ggt_top10_fetcher.py     # 港通十大成交股数据获取器
   - hk_hold_fetcher.py       # 港股通持股数据获取器
   - hsgt_top10_fetcher.py    # 沪深港通十大成交股数据获取器
   - limit_list_d_fetcher.py   # 涨停榜数据获取器
   - stk_limit_fetcher.py      # 涨停数据获取器
+  - fin_indicator_fetcher.py  # 财务指标数据获取器
+  - block_trade_fetcher.py   # 大宗交易数据获取器
+  - concept_fetcher.py       # 概念数据获取器
+  - concept_detail_fetcher.py # 概念详情数据获取器
+  - dividend_fetcher.py      # 分红数据获取器
+  - margin_detail_fetcher.py # 融资融券数据获取器
+  - margin_fetcher.py        # 融资融券数据获取器
+  - pledge_detail_fetcher.py # 质押数据获取器
+  - pledge_stat_fetcher.py   # 质押统计数据获取器
+  - repurchase_fetcher.py     # 回购数据获取器
+  - stk_holdernumber_fetcher.py # 股东人数数据获取器
+  - stk_holdertrade_fetcher.py # 股东交易数据获取器
+  - top_inst_fetcher.py        # 机构持股数据获取器
+  - top_list_fetcher.py        # 龙虎榜数据获取器
+  - top10_holders_fetcher.py  # 前十大股东数据获取器
+  - top10_floatholders_fetcher.py # 前十大流通股东数据获取器
+
+  
+  
 
 
 

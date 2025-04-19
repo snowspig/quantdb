@@ -3,6 +3,9 @@
     "api_name": "fina_audit",
     "fields": [],
     "params": {
+        "ts_code": {"required": true, "type": "str"},
+        "start_date": {"required": false, "type": "str"},
+        "end_date": {"required": false, "type": "str"}
     },
     "update_frequency": "quarterly",
     "update_priority": 1,
