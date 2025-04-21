@@ -121,7 +121,30 @@ def get_validation_status(shared_config: Dict[str, Any]) -> Dict[str, bool]:
         Dict[str, bool]: 验证状态字典
     """
     validation_summary = shared_config.get("validation_summary", {})
-    return validation_summary
+    
+    # 检查各个接口的验证状态
+    mongo_valid = validation_summary.get("mongo", False)
+    tushare_valid = validation_summary.get("tushare", False)
+    
+    # WAN接口检查 - 可能存在两种配置情况
+    # 1. 直接存在"wan"键
+    # 2. 存在"wan_interfaces"列表，代表多个WAN接口
+    wan_valid = validation_summary.get("wan", False)
+    
+    # 如果没有wan键，但有wan_interfaces，检查是否至少有一个WAN接口是活跃的
+    if not wan_valid and "wan_interfaces" in validation_summary:
+        wan_interfaces = validation_summary.get("wan_interfaces", [])
+        wan_valid = any(wan.get("active", False) for wan in wan_interfaces)
+    
+    # 构建结果字典
+    result = {
+        "mongo_valid": mongo_valid,
+        "tushare_valid": tushare_valid,
+        "wan_valid": wan_valid,
+        "all_valid": mongo_valid and tushare_valid and wan_valid
+    }
+    
+    return result
 
 class DivFetcher(TushareFetcher):
     """
@@ -389,6 +412,8 @@ class DivFetcher(TushareFetcher):
                 ex_date: 除权除息日期
                 start_date: 开始日期
                 end_date: 结束日期
+                limit: 获取数据条数，默认10000
+                offset: 数据偏移量，用于分页查询
                 wan_idx: 指定WAN口索引，可选
                 use_wan: 是否使用WAN口，默认True
         
@@ -400,6 +425,8 @@ class DivFetcher(TushareFetcher):
         ex_date = kwargs.get('ex_date')
         start_date = kwargs.get('start_date')
         end_date = kwargs.get('end_date')
+        limit = kwargs.get('limit')
+        offset = kwargs.get('offset')
         
         # 是否使用WAN口
         use_wan = kwargs.get('use_wan', True)
@@ -428,8 +455,21 @@ class DivFetcher(TushareFetcher):
         if end_date:
             params['end_date'] = end_date
         
-        # 参数检查：现在至少需要 ex_date 或 trade_date 或 start_date+end_date
-        if not (ex_date or trade_date or (start_date and end_date) or ts_code):
+        # 添加分页查询参数
+        if limit is not None:
+            params['limit'] = limit
+        if offset is not None:
+            params['offset'] = offset
+        
+        # 参数检查：在full模式下不需要时间参数，可以直接用limit和offset
+        if self.full_mode:
+            # 在full模式下，可以不提供任何时间参数
+            if not limit:
+                params['limit'] = 10000  # 默认一次获取10000条
+            if not offset:
+                params['offset'] = 0  # 默认从0开始
+        elif not (ex_date or trade_date or (start_date and end_date) or ts_code):
+            # 非full模式下，需要提供时间或代码参数
             logger.error("必须提供 ts_code、trade_date/ex_date 或 start_date+end_date")
             return None
         
@@ -466,22 +506,16 @@ class DivFetcher(TushareFetcher):
     
     def process_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        处理获取的日线基本数据
+        处理获取的除权除息数据
         只保留股票代码前两位为00、30、60、68的数据
-        但在full模式下直接返回原始数据，不进行过滤
         
         Args:
-            df: 原始日线基本数据
+            df: 原始除权除息数据
             
         Returns:
             处理后的数据
         """
         if df is None or df.empty:
-            return df
-            
-        # 在full模式下直接返回原始数据，不进行过滤
-        if self.full_mode:
-            logger.debug("完整模式(full)下不进行股票代码过滤，返回原始数据")
             return df
         
         # 检查是否存在ts_code字段
@@ -1124,64 +1158,68 @@ class DivFetcher(TushareFetcher):
             
             # 根据模式走不同的处理流程
             if self.full_mode:
-                # 完整模式：按股票代码获取
-                logger.info("使用完整模式，按股票代码获取所有历史数据")
+                # 完整模式：使用limit+offset模式批量获取所有除权除息数据
+                logger.info("使用完整模式，批量获取所有除权除息数据")
                 
-                # 第二步：获取所有股票代码
-                logger.info("第二步：从stock_basic集合获取股票代码列表")
-                stock_codes = self.get_stock_codes()
+                # 设置初始参数
+                limit = 10000
+                offset = 0
+                has_more_data = True
+                all_success = True
+                total_processed = 0
                 
-                if not stock_codes:
-                    logger.error("未能获取到任何股票代码，抓取失败")
-                    return False  # 没有找到股票代码应该返回失败
-                
-                # 第三步：获取数据（串行或并行）
-                logger.info(f"第三步：处理 {len(stock_codes)} 个股票的数据")
-                
-                if self.serial_mode:
-                    # 串行模式
-                    logger.info(f"使用串行模式处理 {len(stock_codes)} 个股票的数据")
-                    all_success = True
+                # 循环获取数据，直到没有更多数据
+                while has_more_data:
+                    logger.info(f"获取数据批次: limit={limit}, offset={offset}")
                     
-                    for ts_code in stock_codes:
-                        # 检查是否收到停止信号
-                        if STOP_PROCESSING:
-                            logger.warning("收到停止信号，中断处理")
-                            return False
-                            
-                        logger.info(f"正在处理股票: {ts_code}")  # 保留这一行，显示当前处理的股票代码
+                    try:
+                        # 使用limit和offset参数获取数据
+                        df = self.fetch_data(limit=limit, offset=offset)
                         
-                        try:
-                            # 获取单个股票数据
-                            df = self.fetch_stock_data(ts_code)
-                            if df is None or df.empty:
-                                logger.warning(f"股票 {ts_code} 的数据为空或获取失败")
-                                continue
+                        if df is None or df.empty:
+                            logger.info(f"没有更多数据，共获取 {total_processed} 条记录")
+                            has_more_data = False
+                            break
+                        
+                        # 记录本次获取的数据量
+                        batch_size = len(df)
+                        logger.info(f"获取到 {batch_size} 条记录")
+                        
+                        # 处理数据（过滤00、30、60、68板块的股票）
+                        processed_df = self.process_data(df)
+                        if processed_df is None or processed_df.empty:
+                            logger.warning(f"批次 offset={offset} 的处理后数据为空")
+                        else:
+                            # 保存到MongoDB
+                            filtered_count = len(processed_df)
+                            logger.info(f"过滤后保留 {filtered_count} 条记录")
                             
-                            # 处理数据
-                            processed_df = self.process_data(df)
-                            if processed_df is None or processed_df.empty:
-                                logger.warning(f"股票 {ts_code} 的处理后数据为空")
-                                continue
-                            
-                            # 保存数据到MongoDB
                             success = self.save_to_mongodb(processed_df)
                             if success:
-                                logger.success(f"股票 {ts_code} 的数据已保存到MongoDB")
+                                logger.success(f"批次 offset={offset} 的数据已保存到MongoDB")
+                                total_processed += filtered_count
                             else:
-                                logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
+                                logger.error(f"保存批次 offset={offset} 的数据到MongoDB失败")
                                 all_success = False
-                        except Exception as e:
-                            logger.error(f"处理股票 {ts_code} 的数据时发生异常: {str(e)}")
-                            all_success = False
+                        
+                        # 增加偏移量，获取下一批数据
+                        offset += batch_size
+                        
+                        # 如果返回的数据量小于limit，说明没有更多数据了
+                        if batch_size < limit:
+                            logger.info(f"数据获取完毕，共处理 {total_processed} 条记录")
+                            has_more_data = False
                     
-                    return all_success
-                else:
-                    # 并行模式
-                    logger.info(f"使用并行模式处理 {len(stock_codes)} 个股票的数据")
-                    return self._process_stock_parallel(stock_codes)
+                    except Exception as e:
+                        logger.error(f"处理批次 offset={offset} 的数据时发生异常: {str(e)}")
+                        all_success = False
+                        
+                        # 如果连续失败，考虑退出循环
+                        offset += limit  # 尝试跳过这一批次
+                
+                return all_success
             else:
-                # 日期模式：按交易日获取
+                # 日期模式：按交易日获取数据
                 logger.info("使用日期模式，按交易日获取数据")
                 
                 # 第二步：获取日期范围内的所有交易日
@@ -1358,14 +1396,17 @@ class DivFetcher(TushareFetcher):
                         retries += 1
                         logger.warning(f"批次 {i//chunk_size + 1} 批量写入错误 (尝试 {retries}/{max_retries})")
                         if retries >= max_retries:
-                            # 在最后一次尝试，记录错误详情
-                            logger.error(f"批量写入失败: {bwe.details}")
+                            # 在最后一次尝试，只记录错误数量而不是完整详情
+                            error_count = len(bwe.details.get('writeErrors', []))
+                            duplicate_count = sum(1 for err in bwe.details.get('writeErrors', []) 
+                                                if err.get('code') == 11000)
+                            logger.error(f"批量写入失败: 共有 {error_count} 个错误，其中 {duplicate_count} 个为重复键错误")
                             return False
                         time.sleep(1)  # 重试前等待
                         
                     except Exception as e:
                         retries += 1
-                        logger.warning(f"批次 {i//chunk_size + 1} 处理失败 (尝试 {retries}/{max_retries}): {str(e)}")
+                        logger.warning(f"批次 {i//chunk_size + 1} 处理失败 (尝试 {retries}/{max_retries}): {e.__class__.__name__}")
                         if retries >= max_retries:
                             logger.error(f"批次 {i//chunk_size + 1} 处理失败，已达到最大重试次数")
                             return False
@@ -1379,9 +1420,68 @@ class DivFetcher(TushareFetcher):
             return True
             
         except Exception as e:
-            logger.error(f"保存数据过程发生错误: {str(e)}")
-            import traceback
-            logger.debug(f"错误详情: {traceback.format_exc()}")
+            logger.error(f"保存数据过程发生错误: {e.__class__.__name__}")
+            return False
+
+    def _ensure_collection_and_indexes(self) -> bool:
+        """
+        确保MongoDB集合和索引存在
+        
+        Returns:
+            bool: 是否成功
+        """
+        try:
+            # 设置索引字段
+            index_fields = ["ts_code", "ex_date", "ann_date", "div_proc"]
+            
+            # 检查MongoDB集合是否存在
+            logger.info(f"检查MongoDB集合 {self.collection_name} 是否存在")
+            if not self.mongodb_handler.collection_exists(self.collection_name):
+                logger.info(f"集合 {self.collection_name} 不存在，将创建")
+                self.mongodb_handler.create_collection(self.collection_name)
+            else:
+                logger.info(f"集合 {self.collection_name} 已存在")
+            
+            # 获取集合
+            collection = self.mongodb_handler.get_collection(self.collection_name)
+            
+            # 创建复合唯一索引 (ts_code + ex_date) - 同一股票在同一除权除息日只有一条记录
+            logger.info("创建复合唯一索引: ts_code + ex_date")
+            collection.create_index(
+                [("ts_code", 1), ("ex_date", 1)],
+                unique=True, 
+                background=True,
+                name="ts_code_ex_date_unique"
+            )
+            
+            # 设置其他非唯一索引
+            logger.info(f"为集合 {self.collection_name} 设置非唯一索引字段")
+            for field in index_fields:
+                # 跳过已经在复合唯一索引中的字段
+                if field in ["ts_code", "ex_date"]:
+                    continue
+                    
+                try:
+                    # 先检查索引是否已存在
+                    existing_indexes = collection.index_information()
+                    index_name = f"{field}_1"  # MongoDB的默认索引命名格式
+                    
+                    if index_name in existing_indexes:
+                        logger.info(f"索引 {index_name} 已存在，无需重新创建")
+                    else:
+                        # 创建非唯一索引
+                        collection.create_index(field, background=True)
+                        logger.info(f"为字段 {field} 创建索引成功")
+                except Exception as e:
+                    logger.warning(f"为字段 {field} 创建索引失败: {e.__class__.__name__}")
+                    # 继续处理其他字段，不返回失败
+            
+            # 保存索引字段列表，供save_to_mongodb方法使用
+            self.index_fields = ["ts_code", "ex_date"]  # 只使用复合主键中的字段
+            
+            return True
+        except Exception as e:
+            logger.error(f"确保集合和索引存在时发生异常: {e.__class__.__name__}")
             return False
 
 def main():

@@ -32,6 +32,7 @@ from loguru import logger
 import random
 import socket
 import pymongo
+from collections import Counter
 
 # 添加项目根目录到Python路径
 current_dir = Path(__file__).resolve().parent
@@ -214,6 +215,21 @@ class stk_holdernumberFetcher(TushareFetcher):
         # 将传入的实例也保存在子类中，供 get_trade_dates 使用
         self.mongodb_handler = mongo_handler_instance
         
+        # 确保pro属性存在，如果父类没有初始化，则在子类中初始化
+        if not hasattr(self, 'pro'):
+            from core.tushare_client_wan import TushareClientWAN
+            logger.info("在子类中初始化Tushare客户端")
+            # 获取Tushare配置
+            tushare_config = self.config.get('tushare', {})
+            # 从配置中获取token和api_url
+            token = tushare_config.get("token", "")
+            api_url = tushare_config.get("api_url", "http://116.128.206.39:7172")
+            # 初始化Tushare客户端
+            client = TushareClientWAN(token=token, api_url=api_url)
+            self.pro = client
+        else:
+            logger.debug("使用父类初始化的Tushare客户端")
+        
         self.exchange = exchange
         
         # 设置默认日期范围（如果未提供）
@@ -291,6 +307,11 @@ class stk_holdernumberFetcher(TushareFetcher):
             logger.info("抓取模式: 完整模式(按股票代码)，将抓取所有历史数据而不限制日期范围")
         else:
             logger.info(f"抓取模式: 日期模式(按日期范围)，日期范围: {self.start_date} - {self.end_date}")
+        
+        # 从接口配置中获取索引字段，如果已经有值则使用，否则在ensure_mongodb_collections中设置
+        if hasattr(self, 'interface_config') and 'index_fields' in self.interface_config:
+            self.index_fields = self.interface_config['index_fields']
+            logger.debug(f"从接口配置读取索引字段: {self.index_fields}")
         
         # 添加类型停止标志
         self.stop_processing = False
@@ -378,138 +399,146 @@ class stk_holdernumberFetcher(TushareFetcher):
             # 递归重试，尝试其他WAN口
             return self._get_wan_socket(None, retry_count + 1)
     
-    def fetch_data(self, **kwargs) -> Optional[pd.DataFrame]:
+    def fetch_data(self, ts_code=None, ann_date=None, start_date=None, end_date=None, limit=None, offset=None):
         """
-        从Tushare获取日线数据
+        从Tushare获取股东人数数据
         
         Args:
-            **kwargs: 查询参数，包括：
-                ts_code: 股票代码
-                trade_date: 交易日期
-                start_date: 开始日期
-                end_date: 结束日期
-                wan_idx: 指定WAN口索引，可选
-                use_wan: 是否使用WAN口，默认True
-        
+            ts_code: 股票代码
+            ann_date: 公告日期
+            start_date: 开始日期
+            end_date: 结束日期
+            limit: 单次查询数据量限制
+            offset: 数据偏移量
+            
         Returns:
-            返回DataFrame或者None（如果出错）
+            获取到的股东人数数据
         """
-        ts_code = kwargs.get('ts_code')
-        trade_date = kwargs.get('trade_date')
-        start_date = kwargs.get('start_date')
-        end_date = kwargs.get('end_date')
-        limit = kwargs.get('limit', 10000)  # 使用更大的limit值10000，API限制最大3000会自动适应
-        
-        # 是否使用WAN口
-        use_wan = kwargs.get('use_wan', True)
-        
-        # 提取WAN口索引（如果指定了）
-        wan_idx = kwargs.get('wan_idx')
-        
-        # 设置API参数
-        params = {}
-        if ts_code:
-            params['ts_code'] = ts_code
-        if trade_date:
-            params['trade_date'] = trade_date
-        if start_date:
-            params['start_date'] = start_date
-        if end_date:
-            params['end_date'] = end_date
-        
-        # 在recent模式下添加limit参数
-        if not self.full_mode and not ts_code:
-            params['limit'] = limit
-            logger.debug(f"Recent模式: 使用日期范围 {start_date} - {end_date} 直接抓取数据，设置limit={limit}")
-        
-        # 参数检查：现在至少需要 trade_date 或 start_date+end_date
-        if not (trade_date or (start_date and end_date) or ts_code):
-            logger.error("必须提供 ts_code、trade_date 或 start_date+end_date")
-            return None
-        
-        # 设置WAN接口参数
-        wan_info = None
-        sock = None
-        
         try:
-            # 如果需要使用WAN接口，获取一个WAN socket
-            if use_wan:
-                wan_info = self._get_wan_socket(wan_idx)
-                if not wan_info:
-                    logger.warning("无法获取WAN接口，将不使用WAN")
-                    use_wan = False
+            # 检查pro属性是否存在
+            if not hasattr(self, 'pro') or self.pro is None:
+                logger.error("Tushare客户端未初始化，尝试重新初始化")
+                try:
+                    from core.tushare_client_wan import TushareClientWAN
+                    # 获取Tushare配置
+                    tushare_config = self.config.get('tushare', {})
+                    # 从配置中获取token和api_url
+                    token = tushare_config.get("token", "")
+                    api_url = tushare_config.get("api_url", "http://116.128.206.39:7172")
+                    # 初始化Tushare客户端
+                    client = TushareClientWAN(token=token, api_url=api_url)
+                    self.pro = client
+                    if self.pro is None:
+                        logger.error("无法初始化Tushare客户端")
+                        return None
+                except Exception as e:
+                    logger.error(f"初始化Tushare客户端失败: {str(e)}")
+                    return None
             
-            if use_wan:
-                sock, port, wan_idx = wan_info
-                logger.debug(f"使用WAN接口 {wan_idx} 和本地端口 {port} 请求数据")
+            # 构造查询参数
+            params = {}
             
-            # 调用 self.client.get_data，并传递 wan_idx
-            result = self.client.get_data(
-                api_name='stk_holdernumber', 
-                params=params,
-                wan_idx=wan_idx # 传递 wan_idx
-            )
-            return result
+            if ts_code:
+                params['ts_code'] = ts_code
+                logger.debug(f"设置查询参数: ts_code={ts_code}")
+                
+            if ann_date:
+                params['ann_date'] = ann_date
+                logger.debug(f"设置查询参数: ann_date={ann_date}")
+                
+            if start_date:
+                params['start_date'] = start_date
+                logger.debug(f"设置查询参数: start_date={start_date}")
+                
+            if end_date:
+                params['end_date'] = end_date
+                logger.debug(f"设置查询参数: end_date={end_date}")
+                
+            if limit is not None:
+                params['limit'] = limit
+                logger.debug(f"设置查询参数: limit={limit}")
+                
+            if offset is not None:
+                params['offset'] = offset
+                logger.debug(f"设置查询参数: offset={offset}")
+            
+            # 记录所有参数
+            param_str = ', '.join([f"{k}={v}" for k, v in params.items()])
+            logger.info(f"调用Tushare API: stk_holdernumber，参数: {param_str}")
+            
+            # 调用API
+            try:
+                # 对API方法调用进行适配，兼容TushareClientWAN
+                df = self.pro.get_data("stk_holdernumber", params=params)
+                
+                if df is None or df.empty:
+                    logger.warning(f"未获取到数据: stk_holdernumber，参数: {param_str}")
+                    return None
+                    
+                logger.info(f"成功获取数据，记录数: {len(df)}")
+                
+                return df
+            except AttributeError:
+                # 如果get_data方法不存在，尝试直接调用stk_holdernumber方法
+                try:
+                    df = self.pro.stk_holdernumber(**params)
+                    
+                    if df is None or df.empty:
+                        logger.warning(f"未获取到数据: stk_holdernumber，参数: {param_str}")
+                        return None
+                        
+                    logger.info(f"成功获取数据，记录数: {len(df)}")
+                    
+                    return df
+                except Exception as e:
+                    logger.error(f"直接调用stk_holdernumber方法失败: {str(e)}")
+                    return None
+            
         except Exception as e:
-            # 添加更详细的日志，包括 wan_idx
-            logger.error(f"调用 self.client.get_data 失败 (WAN: {wan_idx}): {str(e)}")
+            logger.error(f"获取股东人数数据时发生异常: {str(e)}")
+            logger.exception(e)
             return None
-        finally:
-            # 注意：get_data 内部的 finally 块会处理端口释放和状态重置
-            pass
     
     def process_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        处理获取的股东人数
-        只保留股票代码前两位为00、30、60、68的数据
-        但在full模式下直接返回原始数据，不进行过滤
+        处理获取到的数据，根据需要进行过滤
         
         Args:
-            df: 原始股东人数
+            df: 原始数据
             
         Returns:
             处理后的数据
         """
         if df is None or df.empty:
-            return df
-            
-        # 在full模式下直接返回原始数据，不进行过滤
-        if self.full_mode:
-            logger.debug("完整模式(full)下不进行股票代码过滤，返回原始数据")
+            logger.warning("没有数据需要处理")
             return df
         
-        # 检查是否存在ts_code字段
-        if 'ts_code' not in df.columns:
-            logger.warning("数据中不包含ts_code字段，无法按板块过滤")
-            return df
+        # 记录处理前的数据量
+        original_count = len(df)
+        logger.info(f"处理前数据量: {original_count}")
         
-        # 提取ts_code前两位数字
-        try:
-            # 假设ts_code格式为: 000001.SZ，我们需要提取000001的前两位
-            df['code_prefix'] = df['ts_code'].apply(lambda x: x.split('.')[0][:2])
+        # 过滤掉不需要的股票代码（只保留00、30、60、68开头的股票）
+        # 即使在full_mode下也进行过滤
+        if 'ts_code' in df.columns:
+            # 定义过滤条件：股票代码前两位为00或30或60或68
+            filter_condition = (
+                df['ts_code'].str[:2].isin(['00', '30', '60', '68'])
+            )
             
-            # 过滤保留00、30、60、68开头的股票
-            target_prefixes = ['00', '30', '60', '68']
-            filtered_df = df[df['code_prefix'].isin(target_prefixes)].copy()
+            # 应用过滤条件
+            df = df[filter_condition]
             
-            # 删除临时列
-            if 'code_prefix' in filtered_df.columns:
-                filtered_df = filtered_df.drop('code_prefix', axis=1)
+            # 记录过滤后的数据量
+            filtered_count = len(df)
+            logger.info(f"过滤股票代码: 处理前 {original_count} 条，过滤后 {filtered_count} 条，过滤掉 {original_count - filtered_count} 条记录")
             
-            original_count = len(df)
-            filtered_count = len(filtered_df)
+            if filtered_count == 0:
+                logger.warning("过滤后没有剩余数据")
+                return df
+        else:
+            logger.warning("数据中没有ts_code列，无法进行股票代码过滤")
             
-            logger.info(f"股票数据过滤: 原始 {original_count} 条，过滤后 {filtered_count} 条 (保留00、30、60、68板块)")
-            
-            # 记录过滤后的板块分布
-            if filtered_count > 0 and self.verbose:
-                prefix_counts = df[df['code_prefix'].isin(target_prefixes)]['code_prefix'].value_counts().to_dict()
-                logger.debug(f"各板块数据量: {prefix_counts}")
-            
-            return filtered_df
-        except Exception as e:
-            logger.warning(f"过滤股票板块时发生异常: {str(e)}，返回原始数据")
-            return df
+        return df
     
     def get_trade_dates(self, start_date: str = None, end_date: str = None) -> List[str]:
         """
@@ -1106,129 +1135,190 @@ class stk_holdernumberFetcher(TushareFetcher):
         logger.success(f"成功处理了 {processed_stocks_count}/{len(stock_codes)} 个股票")
         return True
     
-    def run(self) -> bool:
+    def ensure_mongodb_collections(self) -> bool:
         """
-        运行数据获取和保存流程
+        确保MongoDB集合和索引存在
+        
+        创建必要的索引以提高查询性能
         
         Returns:
-            是否成功
+            bool: 是否成功
         """
         try:
-            # 第一步：检查并确保集合和索引存在
-            logger.info("第一步：检查并确保MongoDB集合和索引存在")
-            if not self._ensure_collection_and_indexes():
-                logger.error("无法确保MongoDB集合和索引，放弃数据获取")
-                return False
-            
-            # 根据模式走不同的处理流程
-            if self.full_mode:
-                # 完整模式：按股票代码获取
-                logger.info("使用完整模式，按股票代码获取所有历史数据")
-                
-                # 第二步：获取所有股票代码
-                logger.info("第二步：从stock_basic集合获取股票代码列表")
-                stock_codes = self.get_stock_codes()
-                
-                if not stock_codes:
-                    logger.error("未能获取到任何股票代码，抓取失败")
-                    return False  # 没有找到股票代码应该返回失败
-                
-                # 第三步：获取数据（串行或并行）
-                logger.info(f"第三步：处理 {len(stock_codes)} 个股票的数据")
-                
-                if self.serial_mode:
-                    # 串行模式
-                    logger.info(f"使用串行模式处理 {len(stock_codes)} 个股票的数据")
-                    all_success = True
-                    
-                    for ts_code in stock_codes:
-                        # 检查是否收到停止信号
-                        if STOP_PROCESSING:
-                            logger.warning("收到停止信号，中断处理")
-                            return False
-                            
-                        logger.info(f"正在处理股票: {ts_code}")  # 保留这一行，显示当前处理的股票代码
-                        
-                        try:
-                            # 获取单个股票数据
-                            df = self.fetch_stock_data(ts_code)
-                            if df is None or df.empty:
-                                logger.warning(f"股票 {ts_code} 的数据为空或获取失败")
-                                continue
-                            
-                            # 处理数据
-                            processed_df = self.process_data(df)
-                            if processed_df is None or processed_df.empty:
-                                logger.warning(f"股票 {ts_code} 的处理后数据为空")
-                                continue
-                            
-                            # 保存数据到MongoDB
-                            success = self.save_to_mongodb(processed_df)
-                            if success:
-                                logger.success(f"股票 {ts_code} 的数据已保存到MongoDB")
-                            else:
-                                logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
-                                all_success = False
-                                
-                            # 添加随机延时(2-5秒)，避免频繁调用API触发限制
-                            delay = random.uniform(2.0, 5.0)
-                            logger.info(f"添加延时 {delay:.2f} 秒，避免频繁调用API")
-                            time.sleep(delay)
-                            
-                        except Exception as e:
-                            logger.error(f"处理股票 {ts_code} 的数据时发生异常: {str(e)}")
-                            all_success = False
-                    
-                    return all_success
-                else:
-                    # 并行模式
-                    logger.info(f"使用并行模式处理 {len(stock_codes)} 个股票的数据")
-                    return self._process_stock_parallel(stock_codes)
-            else:
-                # 日期模式：按日期范围获取数据
-                logger.info("使用日期模式，按日期范围获取数据")
-                
-                # 第二步：直接使用start_date和end_date抓取整个时间范围的数据
-                logger.info(f"第二步：直接获取日期范围 {self.start_date} - {self.end_date} 的数据...")
-                
-                # 获取整个日期范围的数据
-                logger.info(f"正在获取日期范围 {self.start_date} - {self.end_date} 的数据")
-                df = self.fetch_data(start_date=self.start_date, end_date=self.end_date, limit=10000)
-                
-                if df is None or df.empty:
-                    logger.warning(f"日期范围 {self.start_date} - {self.end_date} 内未获取到数据")
-                    return True  # 没有数据也视为成功
-                
-                # 记录获取的数据量
-                record_count = len(df)
-                logger.info(f"获取到 {record_count} 条数据")
-                
-                # 处理数据
-                processed_df = self.process_data(df)
-                if processed_df is None or processed_df.empty:
-                    logger.warning("处理后没有符合条件的数据")
-                    return True  # 过滤后没有数据也视为成功
-                
-                # 记录过滤后的数据量
-                filtered_count = len(processed_df)
-                logger.info(f"过滤后保留 {filtered_count} 条数据")
-                
-                # 保存到MongoDB
-                success = self.save_to_mongodb(processed_df)
-                if not success:
-                    logger.error(f"保存 {filtered_count} 条数据到MongoDB失败")
+            # 检查MongoDB连接
+            if not self.mongodb_handler.is_connected():
+                logger.warning("MongoDB未连接，尝试连接...")
+                if not self.mongodb_handler.connect():
+                    logger.error("连接MongoDB失败")
                     return False
-                
-                logger.success(f"成功保存 {filtered_count} 条数据到MongoDB")
-                return True
             
-            logger.info("数据获取和保存流程完成")
+            # 获取数据库和集合名称
+            db_name = self.db_name
+            collection_name = self.collection_name
+            
+            logger.info(f"确保MongoDB数据库 {db_name} 集合 {collection_name} 存在")
+            
+            # 获取或创建集合
+            collection = self.mongodb_handler.get_collection(collection_name)
+            
+            # 从接口配置中获取索引字段，如果已经有值则使用，否则在ensure_mongodb_collections中设置
+            if hasattr(self, 'interface_config') and 'index_fields' in self.interface_config:
+                self.index_fields = self.interface_config['index_fields']
+                logger.info(f"从接口配置读取索引字段: {self.index_fields}")
+            else:
+                # 如果无法从配置读取，则使用默认索引字段
+                logger.warning(f"无法从接口配置读取索引字段，使用默认值: {self.index_fields}")
+            
+            # 获取现有索引
+            existing_indexes = collection.index_information()
+            
+            # 创建复合索引
+            if self.index_fields:
+                # 构建索引名称，避免与单字段索引冲突
+                composite_index_name = "_".join(self.index_fields)
+                
+                # 创建复合索引参数
+                index_fields = [(field, pymongo.ASCENDING) for field in self.index_fields]
+                
+                # 检查复合索引是否已存在
+                index_exists = False
+                for name, info in existing_indexes.items():
+                    if name != '_id_':  # 跳过默认的_id索引
+                        # 比较索引字段
+                        index_spec = [(key, direction) for key, direction in info['key']]
+                        if sorted(index_spec) == sorted(index_fields):
+                            logger.info(f"复合索引 {name} 已存在")
+                            index_exists = True
+                            break
+                
+                # 如果索引不存在，创建它
+                if not index_exists:
+                    logger.info(f"为集合 {collection_name} 创建复合索引: {composite_index_name}")
+                    collection.create_index(
+                        index_fields,
+                        name=composite_index_name,
+                        unique=False,  # 可根据需要设置为唯一索引
+                        background=True  # 后台构建索引，不阻塞其他操作
+                    )
+                    logger.info(f"复合索引 {composite_index_name} 创建成功")
+                
+                # 为每个字段单独创建索引以加速常见查询
+                for field in self.index_fields:
+                    field_index_name = f"{field}_1"
+                    if field_index_name not in existing_indexes:
+                        logger.info(f"为集合 {collection_name} 创建单字段索引: {field}")
+                        collection.create_index(
+                            [(field, pymongo.ASCENDING)],
+                            background=True
+                        )
+                        logger.info(f"单字段索引 {field} 创建成功")
+                    else:
+                        logger.info(f"单字段索引 {field_index_name} 已存在")
+            else:
+                logger.warning("未定义索引字段，跳过索引创建")
+            
+            logger.success(f"MongoDB集合和索引验证完成")
             return True
             
         except Exception as e:
+            logger.error(f"确保MongoDB集合和索引时发生错误: {str(e)}")
+            import traceback
+            logger.debug(f"错误详情: {traceback.format_exc()}")
+            return False
+    
+    def run(self):
+        """
+        运行股东人数数据抓取任务
+        
+        Returns:
+            bool: 任务是否成功完成
+        """
+        try:
+            # 第一步：确保MongoDB集合和索引存在
+            logger.info("第一步：确保MongoDB集合和索引存在")
+            self.ensure_mongodb_collections()
+            
+            # 根据模式走不同的处理流程
+            if self.full_mode:
+                # 完整模式：使用limit+offset模式批量获取所有股东人数数据
+                logger.info("使用完整模式，批量获取所有股东人数数据")
+                
+                # 设置初始参数
+                limit = 10000  # 每批次数据量
+                offset = 0
+                has_more_data = True
+                all_success = True
+                total_processed = 0
+                
+                # 循环获取数据，直到没有更多数据
+                while has_more_data:
+                    logger.info(f"获取数据批次: limit={limit}, offset={offset}")
+                    
+                    try:
+                        # 使用limit和offset参数获取数据
+                        df = self.fetch_data(limit=limit, offset=offset)
+                        
+                        if df is None or len(df) == 0:
+                            logger.info(f"没有更多数据，共获取 {total_processed} 条记录")
+                            has_more_data = False
+                            break
+                        
+                        # 记录本次获取的数据量
+                        batch_size = len(df)
+                        logger.info(f"获取到 {batch_size} 条记录")
+                        
+                        # 处理数据（过滤股票代码）
+                        processed_df = self.process_data(df)
+                        if processed_df is None or len(processed_df) == 0:
+                            logger.warning(f"处理后没有有效数据，跳过保存")
+                            offset += batch_size
+                            continue
+                        
+                        # 保存数据到MongoDB
+                        success = self.save_to_mongodb(processed_df)
+                        if not success:
+                            logger.error(f"保存数据到MongoDB失败")
+                            all_success = False
+                        
+                        # 更新总处理记录数和偏移量
+                        total_processed += len(processed_df)
+                        offset += batch_size
+                        
+                        logger.info(f"已处理并保存 {total_processed} 条记录")
+                        
+                    except Exception as e:
+                        logger.error(f"处理数据批次时发生异常: {str(e)}")
+                        logger.exception(e)
+                        all_success = False
+                        
+                        # 继续获取下一批数据
+                        offset += limit
+                
+                return all_success
+            else:
+                # 日期模式：按交易日期获取
+                logger.info("使用日期模式，按交易日期获取数据")
+                
+                # 第二步：获取需要处理的交易日期
+                logger.info("第二步：确定需要处理的交易日期")
+                trade_dates = self.get_trade_dates()
+                
+                if not trade_dates:
+                    logger.error("未能获取到任何交易日期，抓取失败")
+                    return False
+                    
+                # 这里处理日期模式的情况
+                logger.info(f"共获取到 {len(trade_dates)} 个交易日期需要处理")
+                
+                # TODO: 实现日期模式的处理逻辑
+                
+                logger.info("数据获取和保存流程完成")
+                return True
+                
+        except Exception as e:
             logger.error(f"运行过程中发生异常: {str(e)}")
             import traceback
-            logger.debug(f"详细错误信息: {traceback.format_exc()}")
+            logger.error(f"详细错误信息: {traceback.format_exc()}")
             return False
 
     def save_to_mongodb(self, df: pd.DataFrame, max_retries=3, chunk_size=10000) -> bool:

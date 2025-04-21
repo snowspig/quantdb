@@ -1,5 +1,5 @@
 {
-    "description": "A股指数日行情",
+    "description": "指数日线行情数据",
     "api_name": "index_daily",
     "fields": [],
     "params": {
@@ -7,9 +7,10 @@
     "update_frequency": "daily",
     "update_priority": 1,
     "index_fields": [
-        "ts_code", "trade_date"
+        "index_code","trade_date"
     ],
     "available_fields": [
-
+        "index_code", "trade_date", "crncy_code", "pre_close", "open", "high", "low", "close", 
+        "change", "pct_chg", "volume", "amount", "sec_id"
     ]
   }

@@ -388,6 +388,8 @@ class dividendFetcher(TushareFetcher):
                 ann_date: 公告日期
                 start_date: 开始日期
                 end_date: 结束日期
+                limit: 获取数据条数，默认10000
+                offset: 数据偏移量，用于分页查询
                 wan_idx: 指定WAN口索引，可选
                 use_wan: 是否使用WAN口，默认True
         
@@ -398,6 +400,8 @@ class dividendFetcher(TushareFetcher):
         ann_date = kwargs.get('ann_date')
         start_date = kwargs.get('start_date')
         end_date = kwargs.get('end_date')
+        limit = kwargs.get('limit')
+        offset = kwargs.get('offset')
         
         # 是否使用WAN口
         use_wan = kwargs.get('use_wan', True)
@@ -416,8 +420,21 @@ class dividendFetcher(TushareFetcher):
         if end_date:
             params['end_date'] = end_date
         
-        # 参数检查：现在至少需要 ann_date 或 start_date+end_date
-        if not (ann_date or (start_date and end_date) or ts_code):
+        # 添加分页查询参数
+        if limit is not None:
+            params['limit'] = limit
+        if offset is not None:
+            params['offset'] = offset
+        
+        # 参数检查：在full模式下不需要时间参数，可以直接用limit和offset
+        if self.full_mode:
+            # 在full模式下，可以不提供任何时间参数
+            if not limit:
+                params['limit'] = 10000  # 默认一次获取10000条
+            if not offset:
+                params['offset'] = 0  # 默认从0开始
+        elif not (ann_date or (start_date and end_date) or ts_code):
+            # 非full模式下，需要提供时间或代码参数
             logger.error("必须提供 ts_code、ann_date 或 start_date+end_date")
             return None
         
@@ -454,22 +471,16 @@ class dividendFetcher(TushareFetcher):
     
     def process_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        处理获取的分红送股
+        处理获取的分红送股数据
         只保留股票代码前两位为00、30、60、68的数据
-        但在full模式下直接返回原始数据，不进行过滤
         
         Args:
-            df: 原始分红送股
+            df: 原始分红送股数据
             
         Returns:
             处理后的数据
         """
         if df is None or df.empty:
-            return df
-            
-        # 在full模式下直接返回原始数据，不进行过滤
-        if self.full_mode:
-            logger.debug("完整模式(full)下不进行股票代码过滤，返回原始数据")
             return df
         
         # 检查是否存在ts_code字段
@@ -1125,68 +1136,71 @@ class dividendFetcher(TushareFetcher):
             
             # 根据模式走不同的处理流程
             if self.full_mode:
-                # 完整模式：按股票代码获取
-                logger.info("使用完整模式，按股票代码获取所有历史数据")
+                # 完整模式：使用limit+offset模式批量获取所有分红送股数据
+                logger.info("使用完整模式，批量获取所有分红送股数据")
                 
-                # 第二步：获取所有股票代码
-                logger.info("第二步：从stock_basic集合获取股票代码列表")
-                stock_codes = self.get_stock_codes()
+                # 设置初始参数
+                limit = 10000
+                offset = 0
+                has_more_data = True
+                all_success = True
+                total_processed = 0
                 
-                if not stock_codes:
-                    logger.error("未能获取到任何股票代码，抓取失败")
-                    return False  # 没有找到股票代码应该返回失败
-                
-                # 第三步：获取数据（串行或并行）
-                logger.info(f"第三步：处理 {len(stock_codes)} 个股票的数据")
-                
-                if self.serial_mode:
-                    # 串行模式
-                    logger.info(f"使用串行模式处理 {len(stock_codes)} 个股票的数据")
-                    all_success = True
+                # 循环获取数据，直到没有更多数据
+                while has_more_data:
+                    logger.info(f"获取数据批次: limit={limit}, offset={offset}")
                     
-                    for ts_code in stock_codes:
-                        # 检查是否收到停止信号
-                        if STOP_PROCESSING:
-                            logger.warning("收到停止信号，中断处理")
-                            return False
-                            
-                        logger.info(f"正在处理股票: {ts_code}")  # 保留这一行，显示当前处理的股票代码
+                    try:
+                        # 使用limit和offset参数获取数据
+                        df = self.fetch_data(limit=limit, offset=offset)
                         
-                        try:
-                            # 获取单个股票数据
-                            df = self.fetch_stock_data(ts_code)
-                            if df is None or df.empty:
-                                logger.warning(f"股票 {ts_code} 的数据为空或获取失败")
-                                continue
+                        if df is None or df.empty:
+                            logger.info(f"没有更多数据，共获取 {total_processed} 条记录")
+                            has_more_data = False
+                            break
+                        
+                        # 记录本次获取的数据量
+                        batch_size = len(df)
+                        logger.info(f"获取到 {batch_size} 条记录")
+                        
+                        # 处理数据（过滤00、30、60、68板块的股票）
+                        processed_df = self.process_data(df)
+                        if processed_df is None or processed_df.empty:
+                            logger.warning(f"批次 offset={offset} 的处理后数据为空")
+                        else:
+                            # 保存到MongoDB
+                            filtered_count = len(processed_df)
+                            logger.info(f"过滤后保留 {filtered_count} 条记录")
                             
-                            # 处理数据
-                            processed_df = self.process_data(df)
-                            if processed_df is None or processed_df.empty:
-                                logger.warning(f"股票 {ts_code} 的处理后数据为空")
-                                continue
-                            
-                            # 保存数据到MongoDB
                             success = self.save_to_mongodb(processed_df)
                             if success:
-                                logger.success(f"股票 {ts_code} 的数据已保存到MongoDB")
+                                logger.success(f"批次 offset={offset} 的数据已保存到MongoDB")
+                                total_processed += filtered_count
                             else:
-                                logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
+                                logger.error(f"保存批次 offset={offset} 的数据到MongoDB失败")
                                 all_success = False
-                                
-                            # 在full模式下，添加2-5秒的随机延时
-                            delay = random.uniform(2, 5)
-                            logger.info(f"full模式：添加 {delay:.2f} 秒延时，避免频繁请求")
-                            time.sleep(delay)
-                            
-                        except Exception as e:
-                            logger.error(f"处理股票 {ts_code} 的数据时发生异常: {str(e)}")
-                            all_success = False
+                        
+                        # 增加偏移量，获取下一批数据
+                        offset += batch_size
+                        
+                        # 如果返回的数据量小于limit，说明没有更多数据了
+                        if batch_size < limit:
+                            logger.info(f"数据获取完毕，共处理 {total_processed} 条记录")
+                            has_more_data = False
+                        
+                        # 添加2-5秒的随机延时，避免频繁请求
+                        delay = random.uniform(2, 5)
+                        logger.info(f"full模式：添加 {delay:.2f} 秒延时，避免频繁请求")
+                        time.sleep(delay)
                     
-                    return all_success
-                else:
-                    # 并行模式
-                    logger.info(f"使用并行模式处理 {len(stock_codes)} 个股票的数据")
-                    return self._process_stock_parallel(stock_codes)
+                    except Exception as e:
+                        logger.error(f"处理批次 offset={offset} 的数据时发生异常: {str(e)}")
+                        all_success = False
+                        
+                        # 如果连续失败，考虑退出循环
+                        offset += limit  # 尝试跳过这一批次
+                
+                return all_success
             else:
                 # 日期模式：按公告日期获取
                 logger.info("使用日期模式，按公告日期获取数据")

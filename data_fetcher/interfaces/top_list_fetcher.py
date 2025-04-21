@@ -477,6 +477,12 @@ class top_listFetcher(TushareFetcher):
             else:
                 logger.info(f"【抓取无数据】交易日={trade_date or ''} 无龙虎榜数据")
             
+            # 在full模式下添加随机时间间隔
+            if self.full_mode:
+                delay = random.uniform(2.0, 5.0)
+                logger.info(f"full模式：请求后等待 {delay:.2f} 秒，防止API限制...")
+                time.sleep(delay)
+                
             return result
         except Exception as e:
             # 添加更详细的日志，包括 wan_idx
@@ -618,7 +624,10 @@ class top_listFetcher(TushareFetcher):
         """
         logger.info(f"正在获取交易日 {trade_date} 的数据 (所有交易所)...")
         # 调用 fetch_data 时不再传递 exchange 参数
-        return self.fetch_data(trade_date=trade_date)
+        result = self.fetch_data(trade_date=trade_date)
+        
+        # 在full模式下添加随机时间间隔 (已在fetch_data中添加，这里不需要重复)
+        return result
     
     def _process_date_with_wan(self, trade_date: str, wan_idx: int) -> bool:
         """
@@ -1143,7 +1152,11 @@ class top_listFetcher(TushareFetcher):
                 return False
             
             # 第二步：获取日期范围内的所有交易日
-            logger.info(f"第二步：获取日期范围 {self.start_date} - {self.end_date} 内的交易日...")
+            if self.full_mode:
+                logger.info(f"第二步：完整模式下获取日期范围 {self.start_date} - {self.end_date} 内的所有交易日...")
+            else:
+                logger.info(f"第二步：获取日期范围 {self.start_date} - {self.end_date} 内的交易日...")
+                
             trade_dates = self.get_trade_dates(self.start_date, self.end_date)
             
             if not trade_dates:
@@ -1203,9 +1216,15 @@ class top_listFetcher(TushareFetcher):
                         df = self.fetch_data(trade_date=trade_date, wan_idx=wan_idx)
                         
                         # 添加随机延时 (2-5秒)，避免触发API限制
-                        delay = random.uniform(2.0, 5.0)
-                        logger.debug(f"WAN口 {wan_idx} 处理日期 {trade_date} 后延时 {delay:.2f} 秒")
-                        time.sleep(delay)
+                        # 在full模式下使用更明显的日志
+                        if self.full_mode:
+                            delay = random.uniform(2.0, 5.0)
+                            logger.info(f"full模式：WAN口 {wan_idx} 请求后等待 {delay:.2f} 秒，防止API限制...")
+                            time.sleep(delay)
+                        else:
+                            delay = random.uniform(2.0, 5.0)
+                            logger.debug(f"WAN口 {wan_idx} 处理日期 {trade_date} 后延时 {delay:.2f} 秒")
+                            time.sleep(delay)
                         
                         if df is None or df.empty:
                             logger.debug(f"交易日 {trade_date} 的数据为空或获取失败 (WAN口 {wan_idx})")
@@ -1324,9 +1343,15 @@ class top_listFetcher(TushareFetcher):
                 df = self.fetch_top_list_data(trade_date)
                 
                 # 添加随机延时 (2-5秒)，避免触发API限制
-                delay = random.uniform(2.0, 5.0)
-                logger.debug(f"处理日期 {trade_date} 后延时 {delay:.2f} 秒")
-                time.sleep(delay)
+                # 在full模式下使用更明显的日志
+                if self.full_mode:
+                    delay = random.uniform(2.0, 5.0)
+                    logger.info(f"full模式：请求后等待 {delay:.2f} 秒，防止API限制...")
+                    time.sleep(delay)
+                else:
+                    delay = random.uniform(2.0, 5.0)
+                    logger.debug(f"处理日期 {trade_date} 后延时 {delay:.2f} 秒")
+                    time.sleep(delay)
                 
                 if df is None or df.empty:
                     logger.debug(f"交易日 {trade_date} 的数据为空或获取失败")

@@ -2,18 +2,11 @@
   "task_config_file": "D:\\MongoDB\\Code\\quant\\quantdb\\tasks_config.yaml",
   "db_config_file": "d:\\MongoDB\\Code\\quant\\quantdb\\config\\config.yaml",
   "validation_status": {
-<<<<<<< HEAD
-    "mongo": false,
-    "tushare": true,
-    "wan": true
-  },
-  "timestamp": 1744733257.5753996
-=======
     "mongo": true,
     "tushare": true,
     "wan": true
   },
-  "timestamp": 1744736712.8972518,
+  "timestamp": 1745047767.8461168,
   "database": {
     "mongo": {
       "host": "localhost",
@@ -50,5 +43,4 @@
       }
     }
   }
->>>>>>> ceb3bb1c5efdb7375505cb833946d4ea244653b1
 }

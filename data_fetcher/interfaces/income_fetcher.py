@@ -380,7 +380,7 @@ class incomeFetcher(TushareFetcher):
     
     def fetch_data(self, **kwargs) -> Optional[pd.DataFrame]:
         """
-        从Tushare获取日线数据
+        从Tushare获取利润表数据
         
         Args:
             **kwargs: 查询参数，包括：
@@ -388,6 +388,11 @@ class incomeFetcher(TushareFetcher):
                 ann_date: 公告日期
                 start_date: 开始日期
                 end_date: 结束日期
+                period: 报告期
+                report_type: 报告类型
+                comp_type: 公司类型
+                limit: 单次查询数据量限制
+                offset: 数据偏移量
                 wan_idx: 指定WAN口索引，可选
                 use_wan: 是否使用WAN口，默认True
         
@@ -398,6 +403,11 @@ class incomeFetcher(TushareFetcher):
         ann_date = kwargs.get('ann_date')
         start_date = kwargs.get('start_date')
         end_date = kwargs.get('end_date')
+        period = kwargs.get('period')
+        report_type = kwargs.get('report_type')
+        comp_type = kwargs.get('comp_type')
+        limit = kwargs.get('limit')  # 添加对limit参数的支持
+        offset = kwargs.get('offset')  # 添加对offset参数的支持
         
         # 是否使用WAN口
         use_wan = kwargs.get('use_wan', True)
@@ -407,56 +417,82 @@ class incomeFetcher(TushareFetcher):
         
         # 设置API参数
         params = {}
-        if ts_code:
-            params['ts_code'] = ts_code
-        if ann_date:
-            params['ann_date'] = ann_date
-        if start_date:
-            params['start_date'] = start_date
-        if end_date:
-            params['end_date'] = end_date
         
-        # 参数检查：现在至少需要 ann_date 或 start_date+end_date
-        if not (ann_date or (start_date and end_date) or ts_code):
+        # full模式下使用limit和offset参数
+        if self.full_mode:
+            # 在full模式下，设置limit和offset参数
+            if limit is not None:
+                params['limit'] = limit
+            if offset is not None:
+                params['offset'] = offset
+        else:
+            # 非full模式下使用标准参数
+            if ts_code:
+                params['ts_code'] = ts_code
+            if ann_date:
+                params['ann_date'] = ann_date
+            if start_date:
+                params['start_date'] = start_date
+            if end_date:
+                params['end_date'] = end_date
+            if period:
+                params['period'] = period
+            if report_type:
+                params['report_type'] = report_type
+            if comp_type:
+                params['comp_type'] = comp_type
+        
+        # 参数检查
+        if not self.full_mode and not (ann_date or (start_date and end_date) or ts_code):
             logger.error("必须提供 ts_code、ann_date 或 start_date+end_date")
             return None
         
-        # 设置WAN接口参数
-        wan_info = None
-        sock = None
-        
+        # 选择WAN口处理
         try:
-            # 如果需要使用WAN接口，获取一个WAN socket
-            if use_wan:
-                wan_info = self._get_wan_socket(wan_idx)
-                if not wan_info:
-                    logger.warning("无法获取WAN接口，将不使用WAN")
-                    use_wan = False
+            # 默认使用标准client
+            client = self.client
+            use_standard_client = False
             
-            if use_wan:
-                sock, port, wan_idx = wan_info
-                logger.debug(f"使用WAN接口 {wan_idx} 和本地端口 {port} 请求数据")
+            if use_wan and hasattr(self, 'wan_clients') and self.wan_clients:
+                try:
+                    # 如果指定了wan_idx且有效，使用指定的WAN口
+                    if wan_idx is not None and 0 <= wan_idx < len(self.wan_clients):
+                        selected_client = self.wan_clients[wan_idx]
+                    else:
+                        # 否则随机选择一个WAN口
+                        selected_client = random.choice(self.wan_clients)
+                    
+                    # 所有客户端都可以使用get_data方法
+                    client = selected_client
+                    logger.debug(f"使用WAN口客户端: {id(client)}")
+                except Exception as e:
+                    logger.warning(f"选择WAN客户端时出错: {str(e)}，使用标准客户端")
             
-            # 调用 self.client.get_data，并传递 wan_idx
-            result = self.client.get_data(
-                api_name='income', 
-                params=params,
-                wan_idx=wan_idx # 传递 wan_idx
-            )
-            return result
+            # 记录请求参数
+            params_str = ', '.join([f"{k}={v}" for k, v in params.items()])
+            logger.debug(f"Tushare请求参数: {params_str}")
+            
+            # 使用通用的get_data方法代替直接调用income方法
+            df = client.get_data(api_name='income', params=params)
+            
+            if df is None or df.empty:
+                logger.warning(f"获取到空数据集")
+                return None
+            
+            # 记录获取到的数据量
+            logger.debug(f"成功获取 {len(df)} 条记录")
+            return df
+            
         except Exception as e:
-            # 添加更详细的日志，包括 wan_idx
-            logger.error(f"调用 self.client.get_data 失败 (WAN: {wan_idx}): {str(e)}")
+            logger.error(f"获取数据时发生异常: {str(e)}")
+            logger.exception(e)
             return None
-        finally:
-            # 注意：get_data 内部的 finally 块会处理端口释放和状态重置
-            pass
     
     def process_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        处理获取的利润表
+        处理获取的利润表数据
         只保留股票代码前两位为00、30、60、68的数据
-        但在full模式下直接返回原始数据，不进行过滤
+        无论full模式与否，都进行股票代码过滤
         
         Args:
             df: 原始利润表
@@ -467,11 +503,6 @@ class incomeFetcher(TushareFetcher):
         if df is None or df.empty:
             return df
             
-        # 在full模式下直接返回原始数据，不进行过滤
-        if self.full_mode:
-            logger.debug("完整模式(full)下不进行股票代码过滤，返回原始数据")
-            return df
-        
         # 检查是否存在ts_code字段
         if 'ts_code' not in df.columns:
             logger.warning("数据中不包含ts_code字段，无法按板块过滤")
@@ -479,6 +510,10 @@ class incomeFetcher(TushareFetcher):
         
         # 提取ts_code前两位数字
         try:
+            # 记录处理前的数据量
+            original_count = len(df)
+            logger.info(f"处理前数据量: {original_count}")
+            
             # 假设ts_code格式为: 000001.SZ，我们需要提取000001的前两位
             df['code_prefix'] = df['ts_code'].apply(lambda x: x.split('.')[0][:2])
             
@@ -490,7 +525,6 @@ class incomeFetcher(TushareFetcher):
             if 'code_prefix' in filtered_df.columns:
                 filtered_df = filtered_df.drop('code_prefix', axis=1)
             
-            original_count = len(df)
             filtered_count = len(filtered_df)
             
             logger.info(f"股票数据过滤: 原始 {original_count} 条，过滤后 {filtered_count} 条 (保留00、30、60、68板块)")
@@ -700,6 +734,8 @@ class incomeFetcher(TushareFetcher):
         Returns:
             是否全部成功
         """
+        global STOP_PROCESSING
+        
         if self.available_wan_count == 0:
             logger.warning("未找到可用的WAN口，降级为串行处理模式")
             # 降级为串行处理
@@ -749,6 +785,8 @@ class incomeFetcher(TushareFetcher):
         # 创建每个WAN口对应的处理函数
         def process_wan_dates(wan_idx, dates):
             """处理单个WAN口对应的所有日期"""
+            global STOP_PROCESSING
+            
             if not dates:  # 没有日期需要处理
                 logger.info(f"WAN口 {wan_idx} 没有分配到公告日期，跳过")
                 return True, 0
@@ -926,6 +964,8 @@ class incomeFetcher(TushareFetcher):
         Returns:
             是否全部成功
         """
+        global STOP_PROCESSING
+        
         if self.available_wan_count == 0:
             logger.warning("未找到可用的WAN口，降级为串行处理模式")
             # 降级为串行处理
@@ -973,6 +1013,8 @@ class incomeFetcher(TushareFetcher):
         # 创建每个WAN口对应的处理函数
         def process_wan_stocks(wan_idx, stocks):
             """处理单个WAN口对应的所有股票"""
+            global STOP_PROCESSING
+            
             if not stocks:  # 没有股票需要处理
                 logger.info(f"WAN口 {wan_idx} 没有分配到股票，跳过")
                 return True, 0
@@ -1102,6 +1144,9 @@ class incomeFetcher(TushareFetcher):
         Returns:
             是否成功
         """
+        # 在函数开始处声明全局变量
+        global STOP_PROCESSING
+        
         try:
             # 第一步：检查并确保集合和索引存在
             logger.info("第一步：检查并确保MongoDB集合和索引存在")
@@ -1111,125 +1156,137 @@ class incomeFetcher(TushareFetcher):
             
             # 根据模式走不同的处理流程
             if self.full_mode:
-                # 完整模式：按股票代码获取
-                logger.info("使用完整模式，按股票代码获取所有历史数据")
+                # 完整模式：使用limit+offset模式批量获取所有利润表数据
+                logger.info("使用完整模式，批量获取所有利润表数据")
                 
-                # 第二步：获取所有股票代码
-                logger.info("第二步：从stock_basic集合获取股票代码列表")
-                stock_codes = self.get_stock_codes()
+                # 设置初始参数
+                limit = 10000  # 每批次数据量
+                offset = 0
+                has_more_data = True
+                all_success = True
+                total_processed = 0
                 
-                if not stock_codes:
-                    logger.error("未能获取到任何股票代码，抓取失败")
-                    return False  # 没有找到股票代码应该返回失败
-                
-                # 第三步：获取数据（串行或并行）
-                logger.info(f"第三步：处理 {len(stock_codes)} 个股票的数据")
-                
-                if self.serial_mode:
-                    # 串行模式
-                    logger.info(f"使用串行模式处理 {len(stock_codes)} 个股票的数据")
-                    all_success = True
+                # 循环获取数据，直到没有更多数据
+                while has_more_data:
+                    logger.info(f"获取数据批次: limit={limit}, offset={offset}")
                     
-                    for ts_code in stock_codes:
-                        # 检查是否收到停止信号
-                        if STOP_PROCESSING:
-                            logger.warning("收到停止信号，中断处理")
-                            return False
-                            
-                        logger.info(f"正在处理股票: {ts_code}")  # 保留这一行，显示当前处理的股票代码
+                    try:
+                        # 使用limit和offset参数获取数据
+                        df = self.fetch_data(limit=limit, offset=offset)
                         
-                        try:
-                            # 获取单个股票数据
-                            df = self.fetch_stock_data(ts_code)
-                            if df is None or df.empty:
-                                logger.warning(f"股票 {ts_code} 的数据为空或获取失败")
-                                continue
-                            
-                            # 处理数据
-                            processed_df = self.process_data(df)
-                            if processed_df is None or processed_df.empty:
-                                logger.warning(f"股票 {ts_code} 的处理后数据为空")
-                                continue
-                            
-                            # 保存数据到MongoDB
-                            success = self.save_to_mongodb(processed_df)
-                            if success:
-                                logger.success(f"股票 {ts_code} 的数据已保存到MongoDB")
-                            else:
-                                logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
-                                all_success = False
-                        except Exception as e:
-                            logger.error(f"处理股票 {ts_code} 的数据时发生异常: {str(e)}")
+                        if df is None or len(df) == 0:
+                            logger.info(f"没有更多数据，共获取 {total_processed} 条记录")
+                            has_more_data = False
+                            break
+                        
+                        # 记录本次获取的数据量
+                        batch_size = len(df)
+                        logger.info(f"获取到 {batch_size} 条记录")
+                        
+                        # 处理数据（过滤股票代码）
+                        processed_df = self.process_data(df)
+                        if processed_df is None or len(processed_df) == 0:
+                            logger.warning(f"处理后没有有效数据，跳过保存")
+                            offset += batch_size
+                            continue
+                        
+                        # 保存数据到MongoDB
+                        success = self.save_to_mongodb(processed_df)
+                        if not success:
+                            logger.error(f"保存数据到MongoDB失败")
                             all_success = False
-                    
-                    return all_success
-                else:
-                    # 并行模式
-                    logger.info(f"使用并行模式处理 {len(stock_codes)} 个股票的数据")
-                    return self._process_stock_parallel(stock_codes)
+                        
+                        # 更新总处理记录数和偏移量
+                        total_processed += len(processed_df)
+                        offset += batch_size
+                        
+                        logger.info(f"已处理并保存 {total_processed} 条记录")
+                        
+                        # 如果返回的数据量小于limit，说明没有更多数据了
+                        if batch_size < limit:
+                            logger.info(f"数据获取完毕，共处理 {total_processed} 条记录")
+                            has_more_data = False
+                        
+                        # 添加随机延时，避免频繁请求
+                        delay = random.uniform(1, 3)
+                        logger.info(f"添加 {delay:.2f} 秒延时，避免频繁请求")
+                        time.sleep(delay)
+                        
+                    except Exception as e:
+                        logger.error(f"处理数据批次时发生异常: {str(e)}")
+                        logger.exception(e)
+                        all_success = False
+                        
+                        # 继续获取下一批数据
+                        offset += limit
+                
+                return all_success
             else:
-                # 日期模式：按公告日期获取
-                logger.info("使用日期模式，按公告日期获取数据")
+                # 日期模式：按天获取数据
+                logger.info("使用日期模式，按公告日期获取利润表数据")
                 
-                # 第二步：获取日期范围内的所有公告日期
-                logger.info(f"第二步：获取日期范围 {self.start_date} - {self.end_date} 内的公告日期...")
-                ann_dates = self.get_trade_dates(self.start_date, self.end_date)
+                # 获取公告日期列表
+                try:
+                    trade_dates = self.get_trade_dates()
+                    if not trade_dates:
+                        logger.error("无法获取公告日期列表，放弃数据获取")
+                        return False
+                except Exception as e:
+                    logger.error(f"获取公告日期列表时发生异常: {str(e)}")
+                    return False
                 
-                if not ann_dates:
-                    logger.warning("未找到公告日期，没有数据需要处理")
-                    return True  # 没有数据也视为成功
-                
-                # 第三步：获取数据（串行或并行）
-                if self.serial_mode:
-                    # 串行模式
-                    logger.info(f"第三步：串行处理 {len(ann_dates)} 个公告日期的数据")
+                # 使用串行还是并行模式处理
+                if self.serial_mode or len(trade_dates) <= 3:  # 如果日期很少，强制使用串行模式
+                    logger.info(f"使用串行模式处理 {len(trade_dates)} 个公告日期")
                     all_success = True
                     
-                    for ann_date in ann_dates:
+                    for trade_date in trade_dates:
                         # 检查是否收到停止信号
                         if STOP_PROCESSING:
                             logger.warning("收到停止信号，中断处理")
                             return False
                             
-                        logger.info(f"正在处理公告日期: {ann_date}")
-                        
+                        logger.info(f"处理公告日期: {trade_date}")
                         try:
-                            # 获取单日数据
-                            df = self.fetch_income_data(ann_date)
-                            if df is None or df.empty:
-                                logger.warning(f"公告日期 {ann_date} 的数据为空或获取失败")
+                            df = self.fetch_income_data(trade_date)
+                            if df is None:
+                                logger.warning(f"公告日期 {trade_date} 未获取到数据，跳过")
                                 continue
+                                
+                            logger.info(f"成功获取公告日期 {trade_date} 的数据，记录数: {len(df)}")
                             
                             # 处理数据
                             processed_df = self.process_data(df)
                             if processed_df is None or processed_df.empty:
-                                logger.warning(f"公告日期 {ann_date} 的处理后数据为空")
+                                logger.warning(f"公告日期 {trade_date} 处理后无有效数据，跳过")
                                 continue
-                            
-                            # 保存单日数据到MongoDB
+                                
+                            # 保存到 MongoDB
                             success = self.save_to_mongodb(processed_df)
-                            if success:
-                                logger.success(f"公告日期 {ann_date} 的数据已保存到MongoDB")
-                            else:
-                                logger.error(f"保存公告日期 {ann_date} 的数据到MongoDB失败")
+                            if not success:
+                                logger.error(f"保存公告日期 {trade_date} 的数据到MongoDB失败")
                                 all_success = False
+                                # 添加到结果队列，供后续处理
+                                self.result_queue.put((trade_date, processed_df))
                         except Exception as e:
-                            logger.error(f"处理公告日期 {ann_date} 的数据时发生异常: {str(e)}")
+                            logger.error(f"处理公告日期 {trade_date} 时发生异常: {str(e)}")
+                            logger.exception(e)
                             all_success = False
                     
                     return all_success
                 else:
                     # 并行模式
-                    logger.info(f"第三步：并行处理 {len(ann_dates)} 个公告日期的数据")
-                    return self._process_date_parallel(ann_dates)
-            
-            logger.info("数据获取和保存流程完成")
-            return True
-            
+                    logger.info(f"使用并行模式处理 {len(trade_dates)} 个公告日期")
+                    return self._process_date_parallel(trade_dates)
+                
+        except KeyboardInterrupt:
+            logger.warning("用户中断，停止数据获取")
+            # 移除这里的global声明，因为已经在函数开始处声明了
+            STOP_PROCESSING = True
+            return False
         except Exception as e:
-            logger.error(f"运行过程中发生异常: {str(e)}")
-            import traceback
-            logger.debug(f"详细错误信息: {traceback.format_exc()}")
+            logger.error(f"数据获取过程中发生异常: {str(e)}")
+            logger.exception(e)
             return False
 
     def save_to_mongodb(self, df: pd.DataFrame, max_retries=3, chunk_size=10000) -> bool:

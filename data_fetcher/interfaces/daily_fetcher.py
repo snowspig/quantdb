@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Daily Basic Fetcher V2 - 获取日线基本数据并保存到MongoDB
+daily Basic Fetcher V2 - 获取日线基本数据并保存到MongoDB
 
 该脚本用于从湘财Tushare获取日线基本数据，并保存到MongoDB数据库中
 该版本继承TushareFetcher基类，实现了与stock_basic_fetcher相同的架构和功能
@@ -123,7 +123,7 @@ def get_validation_status(shared_config: Dict[str, Any]) -> Dict[str, bool]:
     validation_summary = shared_config.get("validation_summary", {})
     return validation_summary
 
-class DailyFetcher(TushareFetcher):
+class DailyBasicFetcher(TushareFetcher):
     """
     日线基本数据获取器V2
     
@@ -944,6 +944,11 @@ class DailyFetcher(TushareFetcher):
                             if not success:
                                 logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
                                 all_success = False
+                            
+                            # 增加随机延时，避免API限制
+                            delay = random.uniform(5, 10)
+                            logger.info(f"添加 {delay:.2f} 秒延时，避免API限制")
+                            time.sleep(delay)
                 except Exception as e:
                     logger.error(f"处理股票 {ts_code} 时发生异常: {str(e)}")
                     all_success = False
@@ -1021,6 +1026,11 @@ class DailyFetcher(TushareFetcher):
                         else:
                             logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
                             wan_success = False
+                        
+                        # 增加随机延时，避免API限制
+                        delay = random.uniform(5, 10)
+                        logger.info(f"WAN口 {wan_idx} 添加 {delay:.2f} 秒延时，避免API限制")
+                        time.sleep(delay)
                     except Exception as e:
                         logger.error(f"WAN口 {wan_idx} 处理股票 {ts_code} 时发生异常: {str(e)}")
                         wan_success = False
@@ -1157,13 +1167,18 @@ class DailyFetcher(TushareFetcher):
                             else:
                                 logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
                                 all_success = False
+                                
+                            # 增加随机延时，避免API限制
+                            delay = random.uniform(5, 10)
+                            logger.info(f"添加 {delay:.2f} 秒延时，避免API限制")
+                            time.sleep(delay)
                         except Exception as e:
                             logger.error(f"处理股票 {ts_code} 的数据时发生异常: {str(e)}")
                             all_success = False
                     
                     return all_success
                 else:
-                    # 并行模式
+                    # 并行模式 - 在_process_stock_parallel方法中添加延时
                     logger.info(f"使用并行模式处理 {len(stock_codes)} 个股票的数据")
                     return self._process_stock_parallel(stock_codes)
             else:
@@ -1439,7 +1454,7 @@ def main():
                 logger.info(f"从共享配置获取配置文件路径：{args.config}")
         
         # 创建获取器并运行 - 传入 mongo_instance
-        fetcher = DailyFetcher(
+        fetcher = DailyBasicFetcher(
             config_path=args.config,
             interface_dir=args.interface_dir,
             exchange=args.exchange,

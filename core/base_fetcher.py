@@ -16,7 +16,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Any, Optional
 
 # 导入核心组件
-from .config_manager import config_manager
+from core import config_manager
 from .mongodb_handler import mongodb_handler
 
 class BaseFetcher(ABC):

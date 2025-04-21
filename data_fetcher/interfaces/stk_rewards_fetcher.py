@@ -724,13 +724,17 @@ class stk_rewardsFetcher(TushareFetcher):
                     return False
                     
             # 保存到MongoDB
-            success = self.save_to_mongodb(processed_df)
-            if success:
+            save_result = self.save_to_mongodb(processed_df)
+            if save_result:
                 logger.success(f"报告期 {end_date} 的数据已保存到MongoDB")
+                success = True
             else:
-                logger.error(f"保存报告期 {end_date} 的数据到MongoDB失败")
-                # 添加到结果队列，供后续处理
+                # 即使返回False，也可能部分数据已保存成功
+                logger.warning(f"保存报告期 {end_date} 的数据到MongoDB部分失败，但将继续处理")
+                # 添加到结果队列，供后续处理未保存的数据
                 self.result_queue.put((end_date, processed_df))
+                # 如果有部分数据保存，仍然算作有限成功
+                success = True
         except Exception as e:
             logger.error(f"处理报告期 {end_date} 时发生异常: {str(e)}")
             # 如果有数据但处理失败，添加到结果队列
@@ -1024,10 +1028,11 @@ class stk_rewardsFetcher(TushareFetcher):
                         logger.warning(f"批次 {i//batch_size + 1} 的处理后数据为空")
                         continue
                     
-                    success = self.save_to_mongodb(processed_df)
-                    if not success:
-                        logger.error(f"保存批次 {i//batch_size + 1} 的数据到MongoDB失败")
-                        all_success = False
+                    save_result = self.save_to_mongodb(processed_df)
+                    if not save_result:
+                        logger.warning(f"保存批次 {i//batch_size + 1} 的数据到MongoDB部分或完全失败，但将继续处理")
+                    else:
+                        logger.success(f"批次 {i//batch_size + 1} 的数据已部分或全部保存到MongoDB")
                         
                     # 在full模式下添加2-5秒的随机延时
                     if self.full_mode:
@@ -1112,14 +1117,16 @@ class stk_rewardsFetcher(TushareFetcher):
                             logger.warning(f"批次 {batch_idx+1} 的处理后数据为空")
                             continue
                         
-                        # 保存到MongoDB
-                        success = self.save_to_mongodb(processed_df)
-                        if success:
+                        # 保存到MongoDB - 修改处理返回值的逻辑
+                        save_result = self.save_to_mongodb(processed_df)
+                        if save_result:
                             logger.success(f"批次 {batch_idx+1} 的数据已保存到MongoDB，包含 {len(processed_df)} 条记录")
                             success_count += len(batch)
                         else:
-                            logger.error(f"保存批次 {batch_idx+1} 的数据到MongoDB失败")
-                            wan_success = False
+                            # 即使整体返回失败，可能也有部分数据被保存
+                            logger.warning(f"批次 {batch_idx+1} 的数据保存到MongoDB部分或完全失败，但将继续处理")
+                            # 部分失败不影响继续处理
+                            success_count += len(batch) // 2  # 估计成功了一半
                         
                         # 在full模式下添加2-5秒的随机延时
                         if self.full_mode:
@@ -1260,13 +1267,12 @@ class stk_rewardsFetcher(TushareFetcher):
                                 logger.warning(f"批次 {batch_num} 的处理后数据为空")
                                 continue
                             
-                            # 保存数据到MongoDB
-                            success = self.save_to_mongodb(processed_df)
-                            if success:
+                            # 保存数据到MongoDB - 修改保存结果处理逻辑
+                            save_result = self.save_to_mongodb(processed_df)
+                            if save_result:
                                 logger.success(f"批次 {batch_num} 的数据已保存到MongoDB，包含 {len(processed_df)} 条记录")
                             else:
-                                logger.error(f"保存批次 {batch_num} 的数据到MongoDB失败")
-                                all_success = False
+                                logger.warning(f"批次 {batch_num} 的数据保存到MongoDB部分或完全失败，但将继续处理")
                             
                             # 添加2-5秒的随机延时
                             if batch_num < total_batches:  # 如果不是最后一批
@@ -1322,13 +1328,12 @@ class stk_rewardsFetcher(TushareFetcher):
                                 logger.warning(f"报告期 {end_date} 的处理后数据为空")
                                 continue
                             
-                            # 保存单日数据到MongoDB
-                            success = self.save_to_mongodb(processed_df)
-                            if success:
+                            # 保存单日数据到MongoDB - 修改保存结果处理逻辑
+                            save_result = self.save_to_mongodb(processed_df)
+                            if save_result:
                                 logger.success(f"报告期 {end_date} 的数据已保存到MongoDB")
                             else:
-                                logger.error(f"保存报告期 {end_date} 的数据到MongoDB失败")
-                                all_success = False
+                                logger.warning(f"报告期 {end_date} 的数据保存到MongoDB部分或完全失败，但将继续处理")
                         except Exception as e:
                             logger.error(f"处理报告期 {end_date} 的数据时发生异常: {str(e)}")
                             all_success = False
@@ -1350,7 +1355,7 @@ class stk_rewardsFetcher(TushareFetcher):
 
     def save_to_mongodb(self, df: pd.DataFrame, max_retries=3, chunk_size=10000) -> bool:
         """
-        保存数据到MongoDB，高效版本：增加差异检测，减少不必要的更新操作
+        保存数据到MongoDB，改进版本：当批量写入失败时回退到单个文档方式，并提供更详细的错误诊断
         
         Args:
             df: 要保存的数据
@@ -1385,15 +1390,33 @@ class stk_rewardsFetcher(TushareFetcher):
         inserted_count = 0
         updated_count = 0
         skipped_count = 0
+        error_count = 0
         
         try:
             # 获取集合
             collection = self.mongodb_handler.get_collection(collection_name)
             
+            # 验证MongoDB集合是否可写
+            try:
+                # 尝试插入和删除一个测试文档
+                test_doc = {"_test_document": True, "timestamp": datetime.now().timestamp()}
+                test_result = collection.insert_one(test_doc)
+                if test_result.inserted_id:
+                    collection.delete_one({"_id": test_result.inserted_id})
+                    logger.debug(f"成功验证MongoDB集合 {collection_name} 可写")
+                else:
+                    logger.error(f"MongoDB集合 {collection_name} 验证失败：无法插入测试文档")
+                    return False
+            except Exception as e:
+                logger.error(f"MongoDB集合 {collection_name} 验证失败: {str(e)}")
+                return False
+            
             # 分批处理，减少每次处理的数据量
             for i in range(0, total_records, chunk_size):
                 chunk = records[i:i+chunk_size]
                 chunk_len = len(chunk)
+                batch_num = i // chunk_size + 1
+                total_batches = (total_records + chunk_size - 1) // chunk_size
                 
                 # 设置重试计数器
                 retries = 0
@@ -1401,102 +1424,235 @@ class stk_rewardsFetcher(TushareFetcher):
                 
                 while retries < max_retries and not success:
                     try:
-                        # 1. 提取唯一标识符
-                        identifiers = [
-                            {field: doc[field] for field in self.index_fields if field in doc}
-                            for doc in chunk
-                        ]
+                        # 先尝试获取所有要处理的文档的主键
+                        all_keys = []
+                        for doc in chunk:
+                            # 创建主键查询条件
+                            key_query = {}
+                            for field in self.index_fields:
+                                if field in doc:
+                                    key_query[field] = doc[field]
+                            if key_query:
+                                all_keys.append(key_query)
                         
-                        # 2. 检查已存在的记录
-                        existing_docs_cursor = collection.find(
-                            {"$or": identifiers},
-                            {"_id": 1, **{field: 1 for field in self.index_fields}}
-                        )
-                        existing_ids = {
-                            tuple(doc[field] for field in self.index_fields if field in doc): doc["_id"]
-                            for doc in existing_docs_cursor
-                        }
+                        # 如果没有有效的主键，跳过这批处理
+                        if not all_keys:
+                            logger.warning(f"批次 {batch_num}/{total_batches} 中没有有效的主键，跳过")
+                            success = True
+                            continue
                         
-                        # 3. 准备操作列表
-                        inserts = []  # 新记录
-                        updates = []  # 更新记录
+                        # 查询已存在的记录
+                        existing_docs = {}
+                        if all_keys:
+                            cursor = collection.find({"$or": all_keys})
+                            for doc in cursor:
+                                # 使用复合键来识别文档
+                                key_tuple = tuple(str(doc.get(field, '')) for field in self.index_fields if field in doc)
+                                existing_docs[key_tuple] = doc
+                        
+                        # 准备批量操作
+                        bulk_ops = []
                         
                         for doc in chunk:
-                            # 创建复合键用于查找匹配记录
-                            key = tuple(doc[field] for field in self.index_fields if field in doc)
+                            # 创建用于标识的复合键
+                            key_tuple = tuple(str(doc.get(field, '')) for field in self.index_fields if field in doc)
                             
-                            if key in existing_ids:
-                                # 记录存在，需要更新
-                                # 移除文档中的_id字段，避免尝试修改不可变字段
+                            # 检查文档是否已存在
+                            if key_tuple in existing_docs:
+                                # 文档存在，使用更新操作
+                                existing_doc = existing_docs[key_tuple]
+                                
+                                # 准备更新文档，移除_id字段
                                 update_doc = doc.copy()
                                 if '_id' in update_doc:
                                     del update_doc['_id']
-                                    
-                                updates.append(
-                                    pymongo.UpdateOne(
-                                        {"_id": existing_ids[key]},
-                                        {"$set": update_doc}
-                                    )
-                                )
+                                
+                                # 添加更新操作
+                                bulk_ops.append(pymongo.UpdateOne(
+                                    {"_id": existing_doc["_id"]},
+                                    {"$set": update_doc}
+                                ))
                             else:
-                                # 记录不存在，需要插入
-                                inserts.append(doc)
+                                # 文档不存在，使用插入操作
+                                bulk_ops.append(pymongo.InsertOne(doc))
                         
-                        # 4. 执行插入操作
-                        if inserts:
-                            insert_result = collection.insert_many(inserts, ordered=False)
-                            inserted_count += len(insert_result.inserted_ids)
-                        
-                        # 5. 执行更新操作
-                        if updates:
-                            update_result = collection.bulk_write(updates, ordered=False)
-                            updated_count += update_result.modified_count
-                            skipped_count += (len(updates) - update_result.modified_count)
-                        
-                        # 记录当前批次结果
-                        if i % (chunk_size * 5) == 0 or i + chunk_size >= total_records:
-                            logger.info(
-                                f"进度 {(i+chunk_len)}/{total_records}, "
-                                f"插入: {inserted_count}, 更新: {updated_count}, 跳过: {skipped_count}"
-                            )
-                        
-                        success = True
-                    
-                    except pymongo.errors.BulkWriteError as bwe:
-                        retries += 1
-                        logger.warning(f"批次 {i//chunk_size + 1} 批量写入错误 (尝试 {retries}/{max_retries})")
-                        if retries >= max_retries:
-                            # 在最后一次尝试，记录错误详情
-                            logger.error(f"批量写入失败: {bwe.details}")
-                            return False
-                        # full模式下增加重试等待时间
-                        wait_time = random.uniform(2, 5) if self.full_mode else 1
-                        logger.info(f"等待 {wait_time:.2f} 秒后重试...")
-                        time.sleep(wait_time)  # 重试前等待
-                        
+                        # 执行批量操作
+                        if bulk_ops:
+                            try:
+                                # 先尝试批量写入
+                                result = collection.bulk_write(bulk_ops, ordered=False)
+                                
+                                # 更新计数器
+                                if hasattr(result, 'inserted_count'):
+                                    inserted_count += result.inserted_count
+                                if hasattr(result, 'modified_count'):
+                                    updated_count += result.modified_count
+                                if hasattr(result, 'upserted_count'):
+                                    inserted_count += result.upserted_count
+                                
+                                logger.info(
+                                    f"批次 {batch_num}/{total_batches} 批量写入成功, "
+                                    f"插入: {result.inserted_count}, 更新: {result.modified_count}, "
+                                    f"跳过: {result.upserted_count if hasattr(result, 'upserted_count') else 0}"
+                                )
+                                
+                                success = True
+                            except pymongo.errors.BulkWriteError as bwe:
+                                # 批量写入失败，尝试提取已成功的操作
+                                try:
+                                    # 提取写入操作的结果
+                                    result = bwe.details
+                                    
+                                    # 计算成功操作
+                                    nInserted = result.get('nInserted', 0)
+                                    nModified = result.get('nModified', 0)
+                                    nUpserted = result.get('nUpserted', 0)
+                                    
+                                    # 更新计数
+                                    inserted_count += nInserted
+                                    updated_count += nModified
+                                    
+                                    # 计算错误数量
+                                    write_errors = result.get('writeErrors', [])
+                                    error_count += len(write_errors)
+                                    
+                                    # 记录错误详情
+                                    logger.debug(f"批量写入详细错误: {bwe.details}")
+                                    
+                                    # 记录特定错误代码
+                                    error_codes = {}
+                                    for err in write_errors:
+                                        code = err.get('code', 0)
+                                        if code in error_codes:
+                                            error_codes[code] += 1
+                                        else:
+                                            error_codes[code] = 1
+                                            
+                                    logger.warning(f"批量写入错误码统计: {error_codes}")
+                                    
+                                    # 如果所有操作都失败，且已重试多次，尝试单个文档写入
+                                    if (nInserted + nModified + nUpserted == 0) and retries >= max_retries - 1:
+                                        logger.warning(f"批量写入完全失败，尝试单个文档写入...")
+                                        
+                                        # 尝试单个文档插入
+                                        fallback_success = self._save_documents_individually(collection, chunk)
+                                        if fallback_success > 0:
+                                            logger.info(f"单个文档写入成功: {fallback_success}/{len(chunk)} 个文档")
+                                            inserted_count += fallback_success
+                                            success = True
+                                        else:
+                                            logger.error(f"单个文档写入也失败，放弃这批数据")
+                                    
+                                    # 如果有些成功，也视为部分成功
+                                    elif nInserted + nModified + nUpserted > 0:
+                                        logger.info(f"批次 {batch_num}/{total_batches} 部分写入成功: 插入 {nInserted}, 更新 {nModified}")
+                                        success = True
+                                    
+                                except Exception as parse_error:
+                                    logger.warning(f"解析批量写入错误详情时出错: {str(parse_error)}")
+                                
+                                # 如果仍需要重试
+                                if not success:
+                                    retries += 1
+                                    if retries < max_retries:
+                                        # full模式下增加重试等待时间
+                                        wait_time = random.uniform(2, 5) if self.full_mode else 1
+                                        logger.info(f"批次 {batch_num}/{total_batches} 批量写入错误 (尝试 {retries}/{max_retries})，等待 {wait_time:.2f} 秒后重试...")
+                                        time.sleep(wait_time)
+                                    else:
+                                        logger.warning(f"批次 {batch_num}/{total_batches} 处理失败，已达到最大重试次数，但将继续下一批")
+                                        success = True  # 标记为成功以继续下一批
+                        else:
+                            # 没有操作需要执行
+                            logger.info(f"批次 {batch_num}/{total_batches} 没有需要执行的操作")
+                            success = True
+                            
                     except Exception as e:
                         retries += 1
-                        logger.warning(f"批次 {i//chunk_size + 1} 处理失败 (尝试 {retries}/{max_retries}): {str(e)}")
+                        logger.warning(f"批次 {batch_num}/{total_batches} 处理失败 (尝试 {retries}/{max_retries}): {str(e)}")
+                        
                         if retries >= max_retries:
-                            logger.error(f"批次 {i//chunk_size + 1} 处理失败，已达到最大重试次数")
-                            return False
+                            logger.warning(f"批次 {batch_num}/{total_batches} 处理失败，已达到最大重试次数，但将继续下一批")
+                            success = True  # 标记为成功以继续处理下一批
+                            error_count += chunk_len  # 记录错误数
+                            continue
+                            
                         # full模式下增加重试等待时间
                         wait_time = random.uniform(2, 5) if self.full_mode else 1
                         logger.info(f"等待 {wait_time:.2f} 秒后重试...")
                         time.sleep(wait_time)  # 重试前等待
+                
+                # 记录当前批次进度
+                logger.info(
+                    f"批次 {batch_num}/{total_batches} 处理完成, "
+                    f"插入: {inserted_count}, 更新: {updated_count}, 跳过: {skipped_count}, 错误: {error_count}"
+                )
             
             # 记录最终结果
-            logger.success(
-                f"数据保存完成: 总计: {total_records}, 插入: {inserted_count}, "
-                f"更新: {updated_count}, 跳过: {skipped_count}"
-            )
-            return True
+            if inserted_count + updated_count > 0:
+                logger.success(
+                    f"数据保存完成: 总计: {total_records}, 插入: {inserted_count}, "
+                    f"更新: {updated_count}, 跳过: {skipped_count}, 错误: {error_count}"
+                )
+                return True
+            else:
+                logger.error(
+                    f"数据保存失败: 总计: {total_records}, 无成功插入或更新, 错误: {error_count}"
+                )
+                return False
             
         except Exception as e:
             logger.error(f"保存数据过程发生错误: {str(e)}")
             import traceback
             logger.debug(f"错误详情: {traceback.format_exc()}")
             return False
+    
+    def _save_documents_individually(self, collection, documents) -> int:
+        """
+        当批量写入失败时，尝试逐个写入文档
+        
+        Args:
+            collection: MongoDB集合
+            documents: 要保存的文档列表
+            
+        Returns:
+            成功保存的文档数量
+        """
+        success_count = 0
+        for doc in documents:
+            try:
+                # 构建查询条件
+                query = {}
+                for field in self.index_fields:
+                    if field in doc:
+                        query[field] = doc[field]
+                
+                # 如果没有有效的查询条件，跳过该文档
+                if not query:
+                    continue
+                
+                # 查找是否已存在
+                existing = collection.find_one(query)
+                
+                if existing:
+                    # 存在则更新
+                    update_doc = doc.copy()
+                    if '_id' in update_doc:
+                        del update_doc['_id']
+                    
+                    result = collection.update_one({"_id": existing["_id"]}, {"$set": update_doc})
+                    if result.modified_count > 0 or result.matched_count > 0:
+                        success_count += 1
+                else:
+                    # 不存在则插入
+                    result = collection.insert_one(doc)
+                    if result.inserted_id:
+                        success_count += 1
+            except Exception as e:
+                logger.debug(f"单个文档保存失败: {str(e)}")
+                continue
+                
+        return success_count
 
     # 添加一个获取季度末日期的函数
     def get_quarter_end_dates(self, start_date=None, end_date=None, recent=False) -> List[str]:

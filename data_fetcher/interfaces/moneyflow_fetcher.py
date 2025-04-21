@@ -443,6 +443,12 @@ class moneyflowFetcher(TushareFetcher):
                 params=params,
                 wan_idx=wan_idx # 传递 wan_idx
             )
+            
+            # 添加随机延迟防止API限制
+            sleep_time = random.uniform(2, 5)
+            logger.debug(f"API请求完成，随机延迟{sleep_time:.2f}秒以防止API限制")
+            time.sleep(sleep_time)
+            
             return result
         except Exception as e:
             # 添加更详细的日志，包括 wan_idx
@@ -1021,6 +1027,9 @@ class moneyflowFetcher(TushareFetcher):
                         else:
                             logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
                             wan_success = False
+                            
+                        # 注意：fetch_data方法中已经添加了2-5秒的随机延迟，这里不需要再添加
+                        
                     except Exception as e:
                         logger.error(f"WAN口 {wan_idx} 处理股票 {ts_code} 时发生异常: {str(e)}")
                         wan_success = False
@@ -1157,6 +1166,9 @@ class moneyflowFetcher(TushareFetcher):
                             else:
                                 logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
                                 all_success = False
+                                
+                            # 注意：fetch_data方法中已经添加了2-5秒的随机延迟，这里不需要再添加
+                            
                         except Exception as e:
                             logger.error(f"处理股票 {ts_code} 的数据时发生异常: {str(e)}")
                             all_success = False
@@ -1212,6 +1224,9 @@ class moneyflowFetcher(TushareFetcher):
                             else:
                                 logger.error(f"保存交易日 {trade_date} 的数据到MongoDB失败")
                                 all_success = False
+                                
+                            # 注意：fetch_data方法中已经添加了2-5秒的随机延迟，这里不需要再添加
+                            
                         except Exception as e:
                             logger.error(f"处理交易日 {trade_date} 的数据时发生异常: {str(e)}")
                             all_success = False

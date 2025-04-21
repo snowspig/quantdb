@@ -27,6 +27,7 @@ from typing import Dict, List, Set, Tuple, Optional, Any
 from pathlib import Path
 from loguru import logger
 import time
+import random
 
 # 添加项目根目录到Python路径
 current_dir = Path(__file__).resolve().parent
@@ -582,11 +583,12 @@ class DailyBasicDataChecker:
             # 创建DailyBasicFetcher实例
             fetcher = DailyBasicFetcher(
                 config_path=self.config_path,
-                target_market_codes=self.target_market_codes,
                 verbose=self.verbose,
                 db_name=self.db_name,
                 collection_name=self.collection_name,
-                batch_size=10000  # 设置API批量请求的数据最大数量
+                start_date=start_date,
+                end_date=end_date,
+                serial_mode=not use_parallel
             )
             
             # 检查是否有可用的WAN接口
@@ -686,27 +688,58 @@ class DailyBasicDataChecker:
                             task_queue.task_done()
                             continue
                             
-                        wan_idx, port = wan_info
+                        # 正确解包wan_info元组，它应该包含三个值：(sock, port, wan_idx)
+                        sock, port, wan_idx_returned = wan_info
                         
                         # 使用WAN接口获取数据
                         with log_lock:
                             logger.info(f"使用WAN {wan_idx}:{port} 抓取股票 {ts_code}")
                         
-                        # 使用fetch_daily_basic_by_code_with_wan方法
-                        result = fetcher.fetch_daily_basic_by_code_with_wan(
+                        # 尝试获取数据 - 使用普通的fetch_data方法而不是特定方法
+                        result = fetcher.fetch_data(
                             ts_code=ts_code, 
                             start_date=start_date, 
                             end_date=end_date, 
-                            wan_info=wan_info,
-                            max_count=10000  # 设置为最大值，提高单次获取效率
+                            wan_idx=wan_idx_returned  # 使用正确的WAN索引
                         )
                         
-                        if not result.empty:
-                            # 保存数据
-                            fetcher.store_data(result)
-                            with log_lock:
-                                logger.success(f"WAN {wan_idx} 成功获取并保存股票 {ts_code} 的数据，共 {len(result)} 条记录")
-                            result_queue.put((ts_code, True))
+                        if result is not None and not result.empty:
+                            # 处理数据
+                            processed_df = fetcher.process_data(result)
+                            if processed_df is not None and not processed_df.empty:
+                                # 检查MongoDB处理器是否为None
+                                if not hasattr(fetcher, 'mongodb_handler') or fetcher.mongodb_handler is None:
+                                    with log_lock:
+                                        logger.warning("MongoDB处理器未初始化，尝试创建新的处理器")
+                                    try:
+                                        # 尝试从全局获取或创建新的MongoDB处理器
+                                        from core.mongodb_handler import init_mongodb_handler
+                                        fetcher.mongodb_handler = init_mongodb_handler()
+                                    except Exception as e:
+                                        with log_lock:
+                                            logger.error(f"初始化MongoDB处理器失败: {str(e)}")
+                                        result_queue.put((ts_code, False))
+                                        continue
+                                    
+                                # 尝试保存数据
+                                try:
+                                    success = fetcher.save_to_mongodb(processed_df)
+                                    if success:
+                                        with log_lock:
+                                            logger.success(f"WAN {wan_idx} 成功获取并保存股票 {ts_code} 的数据，共 {len(processed_df)} 条记录")
+                                        result_queue.put((ts_code, True))
+                                    else:
+                                        with log_lock:
+                                            logger.warning(f"WAN {wan_idx} 获取到股票 {ts_code} 的数据但保存失败")
+                                        result_queue.put((ts_code, False))
+                                except Exception as e:
+                                    with log_lock:
+                                        logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败: {str(e)}")
+                                    result_queue.put((ts_code, False))
+                            else:
+                                with log_lock:
+                                    logger.warning(f"WAN {wan_idx} 获取到股票 {ts_code} 的数据但处理后为空")
+                                result_queue.put((ts_code, False))
                         else:
                             with log_lock:
                                 logger.warning(f"WAN {wan_idx} 未获取到股票 {ts_code} 的数据")
@@ -715,18 +748,19 @@ class DailyBasicDataChecker:
                     finally:
                         # 确保释放端口
                         if 'wan_info' in locals() and wan_info:
-                            # 添加短暂延迟，确保端口完全释放
-                            time.sleep(1.0)  # 增加到1秒，确保端口充分释放
+                            # 添加更长延迟，确保端口完全释放
+                            time.sleep(2.0)  # 增加到2秒
                             try:
-                                fetcher.port_allocator.release_port(wan_idx, port)
-                            except:
-                                pass
+                                # 确保端口正确释放代码...
+                                # ...
+                                
+                                # 额外等待，确保系统完全释放端口
+                                time.sleep(3.0)  # 增加到3秒
+                            except Exception as e:
+                                logger.error(f"释放端口失败: {str(e)}")
                             
-                            # 额外等待，确保API和端口冷却
-                            time.sleep(2.0)  # 增加额外冷却时间
-                        
-                        # 完成任务
-                        task_queue.task_done()
+                            # 完成任务
+                            task_queue.task_done()
                     
                 except Exception as e:
                     with log_lock:
@@ -854,19 +888,25 @@ class DailyBasicDataChecker:
                 
                 try:
                     # 获取数据
-                    df = fetcher.fetch_daily_basic_by_code(
+                    df = fetcher.fetch_data(
                         ts_code=ts_code, 
                         start_date=start_date, 
                         end_date=end_date
                     )
                     
-                    if not df.empty:
-                        # 保存数据
-                        result = fetcher.store_data(df)
-                        inserted = result.get("inserted", 0)
-                        updated = result.get("updated", 0)
-                        logger.success(f"成功获取并保存股票 {ts_code} 的数据，新增 {inserted} 条记录，更新 {updated} 条记录，共 {len(df)} 条记录")
-                        success_count += 1
+                    if df is not None and not df.empty:
+                        # 处理数据
+                        processed_df = fetcher.process_data(df)
+                        if processed_df is not None and not processed_df.empty:
+                            # 保存数据
+                            success = fetcher.save_to_mongodb(processed_df)
+                            if success:
+                                logger.success(f"成功获取并保存股票 {ts_code} 的数据，共 {len(processed_df)} 条记录")
+                                success_count += 1
+                            else:
+                                logger.warning(f"获取到股票 {ts_code} 的数据但保存失败")
+                        else:
+                            logger.warning(f"获取到股票 {ts_code} 的数据但处理后为空")
                     else:
                         logger.warning(f"未获取到股票 {ts_code} 的数据")
                 except Exception as e:
@@ -931,7 +971,7 @@ class DailyBasicDataChecker:
                     cmd = [
                         "python", 
                         "-m",
-                        "daily_basic_fetcher",  # 使用-m选项调用模块
+                        "data_fetcher.interfaces.daily_basic_fetcher",  # 使用正确的模块路径
                         "--ts-code", codes_str,
                         "--start-date", start_date,
                         "--end-date", end_date,

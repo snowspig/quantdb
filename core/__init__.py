@@ -10,6 +10,9 @@
 """
 # 配置管理模块
 from .config_manager import ConfigManager
+# 实例化配置管理器供全局使用
+config_manager = ConfigManager()
+
 # 数据库模块
 from .mongodb_handler import MongoDBHandler, mongodb_handler
 
@@ -40,6 +43,7 @@ except ImportError:
 __all__ = [
     # 基础组件
     'ConfigManager',
+    'config_manager',
     'MongoDBHandler',
     'mongodb_handler',
     'utils',

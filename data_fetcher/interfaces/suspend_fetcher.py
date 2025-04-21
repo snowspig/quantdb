@@ -589,7 +589,20 @@ class suspendFetcher(TushareFetcher):
         
         # 分别查询停牌日期和复牌日期数据
         suspend_df = self.fetch_data(suspend_date=trade_date)
+        
+        # 在full模式下添加随机延迟
+        if self.full_mode:
+            wait_time = random.uniform(2, 5)
+            logger.debug(f"full模式下API请求后添加随机延迟: {wait_time:.2f}秒")
+            time.sleep(wait_time)
+            
         resume_df = self.fetch_data(resume_date=trade_date)
+        
+        # 在full模式下添加随机延迟
+        if self.full_mode:
+            wait_time = random.uniform(2, 5)
+            logger.debug(f"full模式下API请求后添加随机延迟: {wait_time:.2f}秒")
+            time.sleep(wait_time)
         
         # 合并数据
         if suspend_df is not None and not suspend_df.empty and resume_df is not None and not resume_df.empty:
@@ -637,7 +650,15 @@ class suspendFetcher(TushareFetcher):
                 return None
         
         # 直接查询，full模式下
-        return self.fetch_data(**params)
+        result = self.fetch_data(**params)
+        
+        # 在full模式下添加随机延迟
+        if self.full_mode:
+            wait_time = random.uniform(2, 5)
+            logger.debug(f"full模式下API请求后添加随机延迟: {wait_time:.2f}秒")
+            time.sleep(wait_time)
+            
+        return result
     
     def get_stock_codes(self) -> List[str]:
         """
@@ -717,12 +738,11 @@ class suspendFetcher(TushareFetcher):
                             if not success:
                                 logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
                                 all_success = False
-                    
-                    # 在full模式下，添加随机等待时间避免请求过快
-                    if self.full_mode:
-                        wait_time = random.uniform(2, 5)
-                        logger.debug(f"完整模式下添加随机等待: {wait_time:.2f}秒")
-                        time.sleep(wait_time)
+                                
+                            # 添加随机延迟，避免API限制
+                            wait_time = random.uniform(2, 5)
+                            logger.info(f"full模式：等待 {wait_time:.2f} 秒后继续下一个请求...")
+                            time.sleep(wait_time)
                 except Exception as e:
                     logger.error(f"处理股票 {ts_code} 时发生异常: {str(e)}")
                     all_success = False
@@ -800,11 +820,10 @@ class suspendFetcher(TushareFetcher):
                             logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
                             wan_success = False
                         
-                        # 在full模式下，添加随机等待时间避免请求过快
-                        if self.full_mode:
-                            wait_time = random.uniform(2, 5)
-                            logger.debug(f"WAN口 {wan_idx} 完整模式下添加随机等待: {wait_time:.2f}秒")
-                            time.sleep(wait_time)
+                        # 添加随机延迟，避免API限制
+                        wait_time = random.uniform(2, 5)
+                        logger.info(f"full模式：等待 {wait_time:.2f} 秒后继续下一个请求...")
+                        time.sleep(wait_time)
                             
                     except Exception as e:
                         logger.error(f"WAN口 {wan_idx} 处理股票 {ts_code} 时发生异常: {str(e)}")
@@ -942,6 +961,12 @@ class suspendFetcher(TushareFetcher):
                             else:
                                 logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
                                 all_success = False
+                                
+                            # 添加随机延迟，避免API限制
+                            wait_time = random.uniform(2, 5)
+                            logger.info(f"full模式：等待 {wait_time:.2f} 秒后继续下一个请求...")
+                            time.sleep(wait_time)
+                            
                         except Exception as e:
                             logger.error(f"处理股票 {ts_code} 的数据时发生异常: {str(e)}")
                             all_success = False

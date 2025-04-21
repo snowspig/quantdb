@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """
-daily_basic Basic Fetcher V2 - 获取日线基本数据并保存到MongoDB
+daily_basic Basic Fetcher V2 - 获取每日指标并保存到MongoDB
 
-该脚本用于从湘财Tushare获取日线基本数据，并保存到MongoDB数据库中
+该脚本用于从湘财Tushare获取每日指标，并保存到MongoDB数据库中
 该版本继承TushareFetcher基类，实现了与stock_basic_fetcher相同的架构和功能
 
 参考接口文档：http://tushare.xcsc.com:7173/document/2?doc_id=26
@@ -125,9 +125,9 @@ def get_validation_status(shared_config: Dict[str, Any]) -> Dict[str, bool]:
 
 class DailyBasicFetcher(TushareFetcher):
     """
-    日线基本数据获取器V2
+    每日指标获取器V2
     
-    该类用于从Tushare获取日线基本数据并保存到MongoDB数据库
+    该类用于从Tushare获取每日指标并保存到MongoDB数据库
     使用TushareFetcher基类提供的通用功能
     支持串行和并行两种处理模式
     支持按日期和按股票代码两种抓取模式
@@ -152,7 +152,7 @@ class DailyBasicFetcher(TushareFetcher):
         mongo_handler_instance: Optional[MongoDBHandler] = None # 新增参数
     ):
         """
-        初始化日线基本数据获取器
+        初始化每日指标获取器
         
         Args:
             config_path: 配置文件路径
@@ -454,12 +454,12 @@ class DailyBasicFetcher(TushareFetcher):
     
     def process_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        处理获取的日线基本数据
+        处理获取的每日指标
         只保留股票代码前两位为00、30、60、68的数据
         但在full模式下直接返回原始数据，不进行过滤
         
         Args:
-            df: 原始日线基本数据
+            df: 原始每日指标
             
         Returns:
             处理后的数据
@@ -944,6 +944,11 @@ class DailyBasicFetcher(TushareFetcher):
                             if not success:
                                 logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
                                 all_success = False
+                            
+                            # 增加随机延时，避免API限制
+                            delay = random.uniform(5, 10)
+                            logger.info(f"添加 {delay:.2f} 秒延时，避免API限制")
+                            time.sleep(delay)
                 except Exception as e:
                     logger.error(f"处理股票 {ts_code} 时发生异常: {str(e)}")
                     all_success = False
@@ -1021,6 +1026,11 @@ class DailyBasicFetcher(TushareFetcher):
                         else:
                             logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
                             wan_success = False
+                        
+                        # 增加随机延时，避免API限制
+                        delay = random.uniform(5, 10)
+                        logger.info(f"WAN口 {wan_idx} 添加 {delay:.2f} 秒延时，避免API限制")
+                        time.sleep(delay)
                     except Exception as e:
                         logger.error(f"WAN口 {wan_idx} 处理股票 {ts_code} 时发生异常: {str(e)}")
                         wan_success = False
@@ -1157,13 +1167,18 @@ class DailyBasicFetcher(TushareFetcher):
                             else:
                                 logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
                                 all_success = False
+                                
+                            # 增加随机延时，避免API限制
+                            delay = random.uniform(5, 10)
+                            logger.info(f"添加 {delay:.2f} 秒延时，避免API限制")
+                            time.sleep(delay)
                         except Exception as e:
                             logger.error(f"处理股票 {ts_code} 的数据时发生异常: {str(e)}")
                             all_success = False
                     
                     return all_success
                 else:
-                    # 并行模式
+                    # 并行模式 - 在_process_stock_parallel方法中添加延时
                     logger.info(f"使用并行模式处理 {len(stock_codes)} 个股票的数据")
                     return self._process_stock_parallel(stock_codes)
             else:
@@ -1400,7 +1415,7 @@ def main():
         # sys.exit(1)
     # ---- 初始化结束 ----
     
-    parser = argparse.ArgumentParser(description='获取日线基本数据并保存到MongoDB')
+    parser = argparse.ArgumentParser(description='获取每日指标并保存到MongoDB')
     parser.add_argument('--config', default='config/config.yaml', help='配置文件路径')
     parser.add_argument('--interface-dir', default='config/interfaces', help='接口配置文件目录')
     parser.add_argument('--exchange', default='SSE', help='交易所代码：SSE-上交所, SZSE-深交所')
@@ -1460,10 +1475,10 @@ def main():
             success = fetcher.run()
             
             if success:
-                logger.success("日线基本数据获取和保存成功")
+                logger.success("每日指标获取和保存成功")
                 return 0
             else:
-                logger.error("日线基本数据获取或保存失败")
+                logger.error("每日指标获取或保存失败")
                 return 1
         except KeyboardInterrupt:
             logger.warning("接收到Ctrl+C，正在强制退出...")

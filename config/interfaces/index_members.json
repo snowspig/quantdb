@@ -1,15 +1,92 @@
 {
-    "description": "A股指数成份股",
+    "description": "获取各类指数成分股数据",
     "api_name": "index_members",
-    "fields": [],
-    "params": {
-    },
-    "update_frequency": "daily",
-    "update_priority": 1,
-    "index_fields": [
-        "ts_code", "con_ts_code"
+    "fields": [
+        {
+            "name": "index_code",
+            "type": "str",
+            "desc": "指数代码",
+            "example": "000300.SH",
+            "rename_from": "ts_code"
+        },
+        {
+            "name": "ts_code",
+            "type": "str",
+            "desc": "成份股代码",
+            "example": "600519.SH",
+            "rename_from": "con_ts_code"
+        },
+        {
+            "name": "in_date",
+            "type": "str",
+            "desc": "纳入日期",
+            "example": "20050408"
+        },
+        {
+            "name": "out_date",
+            "type": "str",
+            "desc": "剔除日期",
+            "example": "20181214"
+        },
+        {
+            "name": "cur_sign",
+            "type": "float",
+            "desc": "最新标志，0-否，1-是",
+            "example": "1"
+        }
     ],
-    "available_fields": [
-
-    ]
-  }
+    "indexes": [
+        {
+            "name": "index_code_1",
+            "fields": ["index_code"],
+            "unique": false
+        },
+        {
+            "name": "ts_code_1",
+            "fields": ["ts_code"],
+            "unique": false
+        },
+        {
+            "name": "cur_sign_1",
+            "fields": ["cur_sign"],
+            "unique": false
+        },
+        {
+            "name": "in_date_1",
+            "fields": ["in_date"],
+            "unique": false
+        },
+        {
+            "name": "composite_1",
+            "fields": ["index_code", "ts_code", "in_date"],
+            "unique": true
+        }
+    ],
+    "params": [
+        {
+            "name": "ts_code",
+            "type": "str",
+            "required": false,
+            "desc": "指数代码"
+        },
+        {
+            "name": "cur_sign",
+            "type": "str",
+            "required": false,
+            "desc": "最新标志 0-否,1-是"
+        },
+        {
+            "name": "start_date",
+            "type": "str",
+            "required": false,
+            "desc": "开始日期"
+        },
+        {
+            "name": "end_date",
+            "type": "str",
+            "required": false,
+            "desc": "结束日期"
+        }
+    ],
+    "url": "http://tushare.xcsc.com:7173/document/2?doc_id=96"
+}

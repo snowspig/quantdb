@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """
-日线行情数据完整性检查工具
+日线基本面数据完整性检查工具
 
-该脚本用于检查MongoDB中日线行情数据的完整性，识别数据不完整的股票
+该脚本用于检查MongoDB中日线基本面数据的完整性，识别数据不完整的股票
 可以设置检查的时间范围，如一周、一个月或自定义时间段
 
 使用方法：
@@ -27,21 +27,22 @@ from typing import Dict, List, Set, Tuple, Optional, Any
 from pathlib import Path
 from loguru import logger
 import time
+import random
 
 # 添加项目根目录到Python路径
 current_dir = Path(__file__).resolve().parent
 root_dir = current_dir.parent
 sys.path.append(str(root_dir))
 
-# 导入daily_fetcher模块 (如果在根目录下)
-from data_fetcher.interfaces.daily_fetcher import DailyFetcher
-DAILY_FETCHER_IMPORTABLE = True
+# 导入daily_fetcher模块 (位于根目录)
+from data_fetcher.interfaces.daily_fetcher import DailyBasicFetcher
+daily_FETCHER_IMPORTABLE = True
 
-class DailyDataChecker:
+class DailyBasicDataChecker:
     """
-    日线行情数据完整性检查器
+    日线基本面数据完整性检查器
     
-    检查MongoDB中的日线数据完整性，识别出数据不完整的股票
+    检查MongoDB中的日线基本面数据完整性，识别出数据不完整的股票
     """
     
     def __init__(
@@ -53,7 +54,7 @@ class DailyDataChecker:
         verbose: bool = False
     ):
         """
-        初始化日线行情数据完整性检查器
+        初始化日线基本面数据完整性检查器
         
         Args:
             config_path: 配置文件路径
@@ -471,7 +472,7 @@ class DailyDataChecker:
             # 生成并保存批次文件
             batch_file = output_file.replace(".csv", "_batches.txt")
             with open(batch_file, "w") as f:
-                f.write(f"# 日线数据获取批次建议 - 共{len(unique_ts_codes)}只股票，{batch_count}个批次\n\n")
+                f.write(f"# 日线基本面数据获取批次建议 - 共{len(unique_ts_codes)}只股票，{batch_count}个批次\n\n")
                 
                 # 首先列出没有数据的股票
                 if zero_data_stocks:
@@ -489,7 +490,7 @@ class DailyDataChecker:
                         # 添加命令示例
                         codes_str = ",".join(batch)
                         f.write(f"\n# 命令示例：\n")
-                        f.write(f"python daily_fetcher.py --ts-code {codes_str}\n\n")
+                        f.write(f"python -m daily_fetcher --ts-code {codes_str}\n\n")
                 
                 # 然后列出数据不完整的股票
                 incomplete_nonzero = df[(df["data_count"] > 0) & (df["completeness_pct"] < 80)].sort_values(by="completeness_pct")
@@ -526,7 +527,7 @@ class DailyDataChecker:
             end_date: 结束日期，格式为YYYYMMDD（仅用于检查，实际抓取默认到当前日期）
             max_stocks: 最多抓取的股票数量，None表示不限制
             batch_size: 每批处理的股票数量
-            use_imported: 是否使用导入的DailyFetcher类
+            use_imported: 是否使用导入的DailyBasicFetcher类
             use_parallel: 是否使用多WAN并行模式抓取
             batch_delay: 批次间延迟时间(秒)，避免API限制
             
@@ -556,16 +557,16 @@ class DailyDataChecker:
         logger.info(f"准备抓取 {total_stocks} 只不完整的股票数据，时间范围: {fetch_start_date} 至 {fetch_end_date}...")
         logger.info(f"并行模式: {'启用' if use_parallel else '禁用'}, 批次延迟: {batch_delay}秒")
         
-        # 使用导入的DailyFetcher类
-        if use_imported and DAILY_FETCHER_IMPORTABLE:
+        # 使用导入的DailyBasicFetcher类
+        if use_imported and daily_FETCHER_IMPORTABLE:
             return self._fetch_with_imported_fetcher(ts_codes, fetch_start_date, fetch_end_date, batch_size, use_parallel, batch_delay)
         # 使用命令行方式调用daily_fetcher.py
         else:
             return self._fetch_with_command_line(ts_codes, fetch_start_date, fetch_end_date, batch_size, use_parallel, batch_delay)
-            
+
     def _fetch_with_imported_fetcher(self, ts_codes: List[str], start_date: str, end_date: str, batch_size: int, use_parallel: bool = True, batch_delay: int = 5) -> bool:
         """
-        使用导入的DailyFetcher类抓取股票数据
+        使用导入的DailyBasicFetcher类抓取股票数据
         
         Args:
             ts_codes: 要抓取的股票代码列表
@@ -579,14 +580,15 @@ class DailyDataChecker:
             是否成功
         """
         try:
-            # 创建DailyFetcher实例
-            fetcher = DailyFetcher(
+            # 创建DailyBasicFetcher实例
+            fetcher = DailyBasicFetcher(
                 config_path=self.config_path,
-                target_market_codes=self.target_market_codes,
                 verbose=self.verbose,
                 db_name=self.db_name,
                 collection_name=self.collection_name,
-                batch_size=10000  # 设置API批量请求的数据最大数量
+                start_date=start_date,
+                end_date=end_date,
+                serial_mode=not use_parallel
             )
             
             # 检查是否有可用的WAN接口
@@ -605,19 +607,19 @@ class DailyDataChecker:
                 # 使用普通串行模式
                 logger.info("使用普通串行模式抓取数据")
                 return self._fetch_sequentially(fetcher, ts_codes, start_date, end_date, batch_delay)
-                
+            
         except Exception as e:
-            logger.error(f"使用DailyFetcher抓取数据失败: {str(e)}")
+            logger.error(f"使用DailyBasicFetcher抓取数据失败: {str(e)}")
             import traceback
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return False
-            
+
     def _fetch_with_wan_parallel(self, fetcher: Any, ts_codes: List[str], start_date: str, end_date: str, batch_size: int, batch_delay: int = 5) -> bool:
         """
         使用多WAN接口并行抓取多个股票的数据
         
         Args:
-            fetcher: DailyFetcher实例
+            fetcher: DailyBasicFetcher实例
             ts_codes: 要抓取的股票代码列表
             start_date: 开始日期，格式为YYYYMMDD
             end_date: 结束日期，格式为YYYYMMDD
@@ -686,27 +688,58 @@ class DailyDataChecker:
                             task_queue.task_done()
                             continue
                             
-                        wan_idx, port = wan_info
+                        # 正确解包wan_info元组，它应该包含三个值：(sock, port, wan_idx)
+                        sock, port, wan_idx_returned = wan_info
                         
                         # 使用WAN接口获取数据
                         with log_lock:
                             logger.info(f"使用WAN {wan_idx}:{port} 抓取股票 {ts_code}")
                         
-                        # 使用fetch_daily_by_code_with_wan方法
-                        result = fetcher.fetch_daily_by_code_with_wan(
+                        # 尝试获取数据 - 使用普通的fetch_data方法而不是特定方法
+                        result = fetcher.fetch_data(
                             ts_code=ts_code, 
                             start_date=start_date, 
                             end_date=end_date, 
-                            wan_info=wan_info,
-                            max_count=10000  # 设置为最大值，提高单次获取效率
+                            wan_idx=wan_idx_returned  # 使用正确的WAN索引
                         )
                         
-                        if not result.empty:
-                            # 保存数据
-                            fetcher.save_to_mongodb(result)
-                            with log_lock:
-                                logger.success(f"WAN {wan_idx} 成功获取并保存股票 {ts_code} 的数据，共 {len(result)} 条记录")
-                            result_queue.put((ts_code, True))
+                        if result is not None and not result.empty:
+                            # 处理数据
+                            processed_df = fetcher.process_data(result)
+                            if processed_df is not None and not processed_df.empty:
+                                # 检查MongoDB处理器是否为None
+                                if not hasattr(fetcher, 'mongodb_handler') or fetcher.mongodb_handler is None:
+                                    with log_lock:
+                                        logger.warning("MongoDB处理器未初始化，尝试创建新的处理器")
+                                    try:
+                                        # 尝试从全局获取或创建新的MongoDB处理器
+                                        from core.mongodb_handler import init_mongodb_handler
+                                        fetcher.mongodb_handler = init_mongodb_handler()
+                                    except Exception as e:
+                                        with log_lock:
+                                            logger.error(f"初始化MongoDB处理器失败: {str(e)}")
+                                        result_queue.put((ts_code, False))
+                                        continue
+                                    
+                                # 尝试保存数据
+                                try:
+                                    success = fetcher.save_to_mongodb(processed_df)
+                                    if success:
+                                        with log_lock:
+                                            logger.success(f"WAN {wan_idx} 成功获取并保存股票 {ts_code} 的数据，共 {len(processed_df)} 条记录")
+                                        result_queue.put((ts_code, True))
+                                    else:
+                                        with log_lock:
+                                            logger.warning(f"WAN {wan_idx} 获取到股票 {ts_code} 的数据但保存失败")
+                                        result_queue.put((ts_code, False))
+                                except Exception as e:
+                                    with log_lock:
+                                        logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败: {str(e)}")
+                                    result_queue.put((ts_code, False))
+                            else:
+                                with log_lock:
+                                    logger.warning(f"WAN {wan_idx} 获取到股票 {ts_code} 的数据但处理后为空")
+                                result_queue.put((ts_code, False))
                         else:
                             with log_lock:
                                 logger.warning(f"WAN {wan_idx} 未获取到股票 {ts_code} 的数据")
@@ -715,25 +748,26 @@ class DailyDataChecker:
                     finally:
                         # 确保释放端口
                         if 'wan_info' in locals() and wan_info:
-                            # 添加短暂延迟，确保端口完全释放
-                            time.sleep(1.0)  # 增加到1秒，确保端口充分释放
+                            # 添加更长延迟，确保端口完全释放
+                            time.sleep(2.0)  # 增加到2秒
                             try:
-                                fetcher.port_allocator.release_port(wan_idx, port)
-                            except:
-                                pass
+                                # 确保端口正确释放代码...
+                                # ...
+                                
+                                # 额外等待，确保系统完全释放端口
+                                time.sleep(3.0)  # 增加到3秒
+                            except Exception as e:
+                                logger.error(f"释放端口失败: {str(e)}")
                             
-                            # 额外等待，确保API和端口冷却
-                            time.sleep(2.0)  # 增加额外冷却时间
-                        
-                        # 完成任务
-                        task_queue.task_done()
+                            # 完成任务
+                            task_queue.task_done()
                     
                 except Exception as e:
                     with log_lock:
                         logger.error(f"工作线程 {worker_id} 处理出错: {str(e)}")
-                        import traceback
-                        logger.debug(f"详细错误信息: {traceback.format_exc()}")
-                    
+                    import traceback
+                    logger.debug(f"详细错误信息: {traceback.format_exc()}")
+                
                     # 确保无论如何都标记任务完成
                     if 'ts_code' in locals():
                         result_queue.put((ts_code, False))
@@ -764,7 +798,7 @@ class DailyDataChecker:
             while completed_tasks < total_tasks:
                 try:
                     # 从结果队列获取结果
-                    ts_code, success = result_queue.get(timeout=30)  # 增加超时时间
+                    ts_code, success = result_queue.get(timeout=60)  # 增加超时时间到1分钟
                     completed_tasks += 1
                     
                     if success:
@@ -827,13 +861,13 @@ class DailyDataChecker:
                 t.join(timeout=1)
             
             return False
-    
+
     def _fetch_sequentially(self, fetcher: Any, ts_codes: List[str], start_date: str, end_date: str, batch_delay: int = 5) -> bool:
         """
         使用串行方式逐个抓取股票数据
         
         Args:
-            fetcher: DailyFetcher实例
+            fetcher: DailyBasicFetcher实例
             ts_codes: 要抓取的股票代码列表
             start_date: 开始日期，格式为YYYYMMDD
             end_date: 结束日期，格式为YYYYMMDD
@@ -850,23 +884,33 @@ class DailyDataChecker:
             for i, ts_code in enumerate(ts_codes):
                 # 显示进度
                 logger.info(f"处理进度: {i+1}/{total_stocks} ({(i+1)/total_stocks*100:.1f}%)")
-                logger.info(f"正在抓取股票 {ts_code} 的完整历史数据...")
+                logger.info(f"正在抓取股票 {ts_code} 的每日指标数据...")
                 
-                # 获取数据
-                result = fetcher.fetch_daily_by_code_with_offset(
-                    ts_code=ts_code, 
-                    start_date=start_date, 
-                    end_date=end_date, 
-                    max_count=10000  # 设置为最大值，提高单次获取效率
-                )
-                
-                if not result.empty:
-                    # 保存数据
-                    fetcher.save_to_mongodb(result)
-                    logger.success(f"成功获取并保存股票 {ts_code} 的数据，共 {len(result)} 条记录")
-                    success_count += 1
-                else:
-                    logger.warning(f"未获取到股票 {ts_code} 的数据")
+                try:
+                    # 获取数据
+                    df = fetcher.fetch_data(
+                        ts_code=ts_code, 
+                        start_date=start_date, 
+                        end_date=end_date
+                    )
+                    
+                    if df is not None and not df.empty:
+                        # 处理数据
+                        processed_df = fetcher.process_data(df)
+                        if processed_df is not None and not processed_df.empty:
+                            # 保存数据
+                            success = fetcher.save_to_mongodb(processed_df)
+                            if success:
+                                logger.success(f"成功获取并保存股票 {ts_code} 的数据，共 {len(processed_df)} 条记录")
+                                success_count += 1
+                            else:
+                                logger.warning(f"获取到股票 {ts_code} 的数据但保存失败")
+                        else:
+                            logger.warning(f"获取到股票 {ts_code} 的数据但处理后为空")
+                    else:
+                        logger.warning(f"未获取到股票 {ts_code} 的数据")
+                except Exception as e:
+                    logger.error(f"处理股票 {ts_code} 时出错: {str(e)}")
                 
                 # 每处理一只股票后等待一段时间，避免API调用过于频繁
                 logger.debug(f"等待 {batch_delay} 秒后处理下一只股票...")
@@ -890,7 +934,7 @@ class DailyDataChecker:
             import traceback
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return False
-    
+
     def _fetch_with_command_line(self, ts_codes: List[str], start_date: str, end_date: str, batch_size: int, use_parallel: bool = True, batch_delay: int = 5) -> bool:
         """
         使用命令行方式调用daily_fetcher.py抓取股票数据
@@ -924,11 +968,10 @@ class DailyDataChecker:
                 for sub_batch_idx, sub_batch in enumerate(sub_batches):
                     # 构建命令
                     codes_str = ",".join(sub_batch)
-                    # 修改命令路径，使用-m选项调用模块而不是直接运行脚本
                     cmd = [
                         "python", 
                         "-m",
-                        "check.daily_fetcher", 
+                        "data_fetcher.interfaces.daily_fetcher",  # 使用正确的模块路径
                         "--ts-code", codes_str,
                         "--start-date", start_date,
                         "--end-date", end_date,
@@ -943,15 +986,23 @@ class DailyDataChecker:
                         cmd.append("--no-parallel")
                     
                     # 执行命令
-                    logger.info(f"执行命令: {' '.join([str(x) for x in cmd])}")
+                    logger.info(f"执行命令: {' '.join(cmd)}")
                     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
                     
-                    # 实时输出日志
-                    for line in process.stdout:
-                        logger.debug(line.strip())
-                    
-                    # 等待命令完成
-                    return_code = process.wait()
+                    # 设置超时时间 (5分钟)
+                    try:
+                        stdout, stderr = process.communicate(timeout=300)
+                        # 实时输出日志
+                        for line in stdout.splitlines():
+                            logger.debug(line)
+                        
+                        # 获取返回码
+                        return_code = process.returncode
+                    except subprocess.TimeoutExpired:
+                        logger.error(f"命令执行超时，终止进程")
+                        process.kill()
+                        stdout, stderr = process.communicate()
+                        return_code = -1
                     
                     if return_code == 0:
                         success_count += 1
@@ -959,9 +1010,9 @@ class DailyDataChecker:
                     else:
                         logger.warning(f"股票 {codes_str} 抓取失败，返回代码: {return_code}")
                         # 输出错误信息
-                        for line in process.stderr:
-                            logger.error(line.strip())
-                    
+                        for line in stderr.splitlines():
+                            logger.error(line)
+                
                     # 增加等待时间，确保端口完全释放
                     logger.debug(f"等待 {batch_delay} 秒后处理下一只股票...")
                     time.sleep(batch_delay)
@@ -978,17 +1029,17 @@ class DailyDataChecker:
             import traceback
             logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return False
-    
+
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description="日线行情数据完整性检查工具")
+    parser = argparse.ArgumentParser(description="日线基本面数据完整性检查工具")
     parser.add_argument("--verbose", action="store_true", help="输出详细日志")
     parser.add_argument("--period", type=str, choices=["week", "month", "quarter", "year"], 
                       help="检查周期，可选值: week(一周)、month(一个月)、quarter(一季度)、year(一年)")
     parser.add_argument("--start-date", type=str, help="开始日期，格式为YYYYMMDD，如20230101")
     parser.add_argument("--end-date", type=str, help="结束日期，格式为YYYYMMDD，如20230630")
     parser.add_argument("--min-count", type=int, help="最小数据点数量，低于此数量的股票将被视为不完整")
-    parser.add_argument("--output", type=str, default="incomplete_stocks.csv", help="输出文件路径，默认为incomplete_stocks.csv")
+    parser.add_argument("--output", type=str, default="incomplete_daily_stocks.csv", help="输出文件路径，默认为incomplete_daily_stocks.csv")
     parser.add_argument("--config", type=str, default="config/config.yaml", help="配置文件路径")
     parser.add_argument("--db-name", type=str, help="MongoDB数据库名称，默认从配置文件读取")
     parser.add_argument("--collection", type=str, default="daily", help="MongoDB集合名称，默认为daily")
@@ -1038,7 +1089,7 @@ def main():
         config_path = os.path.join(root_dir, config_path)
     
     # 创建检查器
-    checker = DailyDataChecker(
+    checker = DailyBasicDataChecker(
         config_path=config_path,
         db_name=args.db_name,
         collection_name=args.collection,

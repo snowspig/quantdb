@@ -2,7 +2,7 @@
 数据获取器包初始化文件
 提供各种数据获取的功能和接口
 """
-from data_fetcher.base_fetcher import BaseFetcher
+from core.base_fetcher import BaseFetcher
 
 # 导出的组件
 __all__ = [

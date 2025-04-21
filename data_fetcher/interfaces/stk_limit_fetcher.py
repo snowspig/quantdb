@@ -944,6 +944,11 @@ class stk_limitFetcher(TushareFetcher):
                             if not success:
                                 logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
                                 all_success = False
+                            else:
+                                # 增加随机延迟，避免频繁请求API服务器
+                                sleep_time = random.uniform(2, 5)
+                                logger.info(f"随机延迟 {sleep_time:.2f} 秒")
+                                time.sleep(sleep_time)
                 except Exception as e:
                     logger.error(f"处理股票 {ts_code} 时发生异常: {str(e)}")
                     all_success = False
@@ -1018,6 +1023,11 @@ class stk_limitFetcher(TushareFetcher):
                         if success:
                             logger.success(f"股票 {ts_code} 的数据已保存到MongoDB")
                             success_count += 1
+
+                            # 增加随机延迟，避免频繁请求API服务器
+                            sleep_time = random.uniform(2, 5)
+                            logger.info(f"WAN口 {wan_idx} 随机延迟 {sleep_time:.2f} 秒")
+                            time.sleep(sleep_time)
                         else:
                             logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
                             wan_success = False
@@ -1157,6 +1167,12 @@ class stk_limitFetcher(TushareFetcher):
                             else:
                                 logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
                                 all_success = False
+                                
+                            # 增加随机延迟，避免频繁请求API服务器
+                            sleep_time = random.uniform(2, 5)
+                            logger.info(f"随机延迟 {sleep_time:.2f} 秒")
+                            time.sleep(sleep_time)
+                            
                         except Exception as e:
                             logger.error(f"处理股票 {ts_code} 的数据时发生异常: {str(e)}")
                             all_success = False

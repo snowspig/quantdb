@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """
-limit_list_d Basic Fetcher V2 - 获取涨跌停列表数据并保存到MongoDB
+limit_list_d Basic Fetcher V2 - 获取涨跌停列表并保存到MongoDB
 
-该脚本用于从湘财Tushare获取涨跌停列表数据，并保存到MongoDB数据库中
+该脚本用于从湘财Tushare获取涨跌停列表，并保存到MongoDB数据库中
 该版本继承TushareFetcher基类，实现了与stock_basic_fetcher相同的架构和功能
 
 参考接口文档：http://tushare.xcsc.com:7173/document/2?doc_id=26
@@ -123,11 +123,11 @@ def get_validation_status(shared_config: Dict[str, Any]) -> Dict[str, bool]:
     validation_summary = shared_config.get("validation_summary", {})
     return validation_summary
 
-class limit_list_dFetcher(TushareFetcher):
+class limit_list_dBasicFetcher(TushareFetcher):
     """
-    涨跌停列表数据获取器V2
+    涨跌停列表获取器V2
     
-    该类用于从Tushare获取涨跌停列表数据并保存到MongoDB数据库
+    该类用于从Tushare获取涨跌停列表并保存到MongoDB数据库
     使用TushareFetcher基类提供的通用功能
     支持串行和并行两种处理模式
     支持按日期和按股票代码两种抓取模式
@@ -152,7 +152,7 @@ class limit_list_dFetcher(TushareFetcher):
         mongo_handler_instance: Optional[MongoDBHandler] = None # 新增参数
     ):
         """
-        初始化涨跌停列表数据获取器
+        初始化涨跌停列表获取器
         
         Args:
             config_path: 配置文件路径
@@ -380,96 +380,122 @@ class limit_list_dFetcher(TushareFetcher):
     
     def fetch_data(self, **kwargs) -> Optional[pd.DataFrame]:
         """
-        从Tushare获取日线数据
-        
+        获取日线基本面数据
+
         Args:
             **kwargs: 查询参数，包括：
                 ts_code: 股票代码
                 trade_date: 交易日期
                 start_date: 开始日期
                 end_date: 结束日期
+                limit: 返回数据条数，最大10000
+                offset: 数据偏移量，当使用limit时需要
                 wan_idx: 指定WAN口索引，可选
                 use_wan: 是否使用WAN口，默认True
-        
+
         Returns:
-            返回DataFrame或者None（如果出错）
+            数据DataFrame
         """
-        ts_code = kwargs.get('ts_code')
-        trade_date = kwargs.get('trade_date')
-        start_date = kwargs.get('start_date')
-        end_date = kwargs.get('end_date')
-        
-        # 是否使用WAN口
-        use_wan = kwargs.get('use_wan', True)
-        
-        # 提取WAN口索引（如果指定了）
-        wan_idx = kwargs.get('wan_idx')
-        
-        # 设置API参数
-        params = {}
-        if ts_code:
-            params['ts_code'] = ts_code
-        if trade_date:
-            params['trade_date'] = trade_date
-        if start_date:
-            params['start_date'] = start_date
-        if end_date:
-            params['end_date'] = end_date
-        
-        # 参数检查：现在至少需要 trade_date 或 start_date+end_date
-        if not (trade_date or (start_date and end_date) or ts_code):
-            logger.error("必须提供 ts_code、trade_date 或 start_date+end_date")
-            return None
-        
-        # 设置WAN接口参数
-        wan_info = None
-        sock = None
-        
         try:
-            # 如果需要使用WAN接口，获取一个WAN socket
-            if use_wan:
-                wan_info = self._get_wan_socket(wan_idx)
-                if not wan_info:
-                    logger.warning("无法获取WAN接口，将不使用WAN")
-                    use_wan = False
+            # 提取关键参数
+            ts_code = kwargs.get('ts_code')
+            trade_date = kwargs.get('trade_date')
+            start_date = kwargs.get('start_date')
+            end_date = kwargs.get('end_date')
+            limit = kwargs.get('limit')
+            offset = kwargs.get('offset')
             
-            if use_wan:
-                sock, port, wan_idx = wan_info
-                logger.debug(f"使用WAN接口 {wan_idx} 和本地端口 {port} 请求数据")
+            # 是否使用WAN口
+            use_wan = kwargs.get('use_wan', True)
             
-            # 调用 self.client.get_data，并传递 wan_idx
-            result = self.client.get_data(
-                api_name='limit_list_d', 
-                params=params,
-                wan_idx=wan_idx # 传递 wan_idx
-            )
-            return result
+            # 提取WAN口索引（如果指定了）
+            wan_idx = kwargs.get('wan_idx')
+            
+            # 构建查询参数
+            params = {}
+            
+            # 在全模式下
+            if self.full_mode:
+                if limit is not None:
+                    params['limit'] = limit
+                    if offset is not None:
+                        params['offset'] = offset
+                # 全模式下不需要提供ts_code和日期参数
+            else:
+                # 非全模式下的参数处理
+                if ts_code:
+                    params['ts_code'] = ts_code
+                
+                if trade_date:
+                    params['trade_date'] = trade_date
+                elif start_date and end_date:
+                    params['start_date'] = start_date
+                    params['end_date'] = end_date
+                
+                # 如果没有足够的参数，抛出异常
+                if not ts_code and not trade_date and not (start_date and end_date):
+                    raise ValueError("必须提供ts_code、trade_date或start_date和end_date其中之一")
+            
+            # 设置WAN接口参数
+            wan_info = None
+            sock = None
+            
+            try:
+                # 如果需要使用WAN接口，获取一个WAN socket
+                if use_wan:
+                    wan_info = self._get_wan_socket(wan_idx)
+                    if not wan_info:
+                        logger.warning("无法获取WAN接口，将不使用WAN")
+                        use_wan = False
+                
+                if use_wan:
+                    sock, port, wan_idx = wan_info
+                    logger.debug(f"使用WAN接口 {wan_idx} 和本地端口 {port} 请求数据")
+                
+                # 获取数据
+                logger.debug(f"调用Tushare API: limit_list_d，参数: {params}")
+                
+                # 调用 self.client.get_data，并传递 wan_idx
+                result = self.client.get_data(
+                    api_name='limit_list_d', 
+                    params=params,
+                    wan_idx=wan_idx
+                )
+                
+                # 检查返回数据
+                if result is None or result.empty:
+                    logger.warning(f"获取数据结果为空，参数: {params}")
+                    return None
+                
+                # 重置索引
+                result = result.reset_index(drop=True)
+                
+                return result
+            
+            except Exception as e:
+                # 添加更详细的日志，包括 wan_idx
+                logger.error(f"调用 self.client.get_data 失败 (WAN: {wan_idx}): {str(e)}")
+                return None
+            finally:
+                # 注意：get_data 内部的 finally 块会处理端口释放和状态重置
+                pass
+        
         except Exception as e:
-            # 添加更详细的日志，包括 wan_idx
-            logger.error(f"调用 self.client.get_data 失败 (WAN: {wan_idx}): {str(e)}")
+            logger.error(f"获取日线数据时发生异常: {str(e)}")
             return None
-        finally:
-            # 注意：get_data 内部的 finally 块会处理端口释放和状态重置
-            pass
     
     def process_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        处理获取的涨跌停列表数据
+        处理获取的涨跌停列表
         只保留股票代码前两位为00、30、60、68的数据
-        但在full模式下直接返回原始数据，不进行过滤
         
         Args:
-            df: 原始涨跌停列表数据
+            df: 原始涨跌停列表
             
         Returns:
             处理后的数据
         """
         if df is None or df.empty:
-            return df
-            
-        # 在full模式下直接返回原始数据，不进行过滤
-        if self.full_mode:
-            logger.debug("完整模式(full)下不进行股票代码过滤，返回原始数据")
             return df
         
         # 检查是否存在ts_code字段
@@ -1110,62 +1136,82 @@ class limit_list_dFetcher(TushareFetcher):
             
             # 根据模式走不同的处理流程
             if self.full_mode:
-                # 完整模式：按股票代码获取
-                logger.info("使用完整模式，按股票代码获取所有历史数据")
+                # 完整模式：使用limit+offset模式批量获取所有涨跌停列表
+                logger.info("使用完整模式，批量获取所有涨跌停列表")
                 
-                # 第二步：获取所有股票代码
-                logger.info("第二步：从stock_basic集合获取股票代码列表")
-                stock_codes = self.get_stock_codes()
+                # 设置初始参数
+                limit = 10000  # 降低每批次数据量以减少API负载
+                offset = 0
+                has_more_data = True
+                all_success = True
+                total_processed = 0
                 
-                if not stock_codes:
-                    logger.error("未能获取到任何股票代码，抓取失败")
-                    return False  # 没有找到股票代码应该返回失败
-                
-                # 第三步：获取数据（串行或并行）
-                logger.info(f"第三步：处理 {len(stock_codes)} 个股票的数据")
-                
-                if self.serial_mode:
-                    # 串行模式
-                    logger.info(f"使用串行模式处理 {len(stock_codes)} 个股票的数据")
-                    all_success = True
+                # 循环获取数据，直到没有更多数据
+                while has_more_data:
+                    logger.info(f"获取数据批次: limit={limit}, offset={offset}")
                     
-                    for ts_code in stock_codes:
+                    try:
+                        # 使用limit和offset参数获取数据
+                        df = self.fetch_data(limit=limit, offset=offset)
+                        
+                        if df is None or df.empty:
+                            logger.info(f"没有更多数据，共获取 {total_processed} 条记录")
+                            has_more_data = False
+                            break
+                        
+                        # 记录本次获取的数据量
+                        batch_size = len(df)
+                        logger.info(f"获取到 {batch_size} 条记录")
+                        
+                        # 处理数据（过滤00、30、60、68板块的股票）
+                        processed_df = self.process_data(df)
+                        if processed_df is None or processed_df.empty:
+                            logger.warning(f"批次 offset={offset} 的处理后数据为空")
+                        else:
+                            # 保存到MongoDB
+                            filtered_count = len(processed_df)
+                            logger.info(f"过滤后保留 {filtered_count} 条记录")
+                            
+                            success = self.save_to_mongodb(processed_df)
+                            if success:
+                                logger.success(f"批次 offset={offset} 的数据已保存到MongoDB")
+                                total_processed += filtered_count
+                            else:
+                                logger.error(f"保存批次 offset={offset} 的数据到MongoDB失败")
+                                all_success = False
+                        
+                        # 增加偏移量，获取下一批数据
+                        offset += batch_size
+                        
+                        # 如果返回的数据量小于limit，说明没有更多数据了
+                        if batch_size < limit:
+                            logger.info(f"数据获取完毕，共处理 {total_processed} 条记录")
+                            has_more_data = False
+                        
+                        # 添加随机延时，避免频繁请求
+                        delay = random.uniform(1, 3)
+                        logger.info(f"添加 {delay:.2f} 秒延时，避免频繁请求")
+                        time.sleep(delay)
+                    
+                    except Exception as e:
+                        logger.error(f"处理批次 offset={offset} 时发生异常: {str(e)}")
+                        all_success = False
+                        
                         # 检查是否收到停止信号
                         if STOP_PROCESSING:
                             logger.warning("收到停止信号，中断处理")
                             return False
-                            
-                        logger.info(f"正在处理股票: {ts_code}")  # 保留这一行，显示当前处理的股票代码
                         
-                        try:
-                            # 获取单个股票数据
-                            df = self.fetch_stock_data(ts_code)
-                            if df is None or df.empty:
-                                logger.warning(f"股票 {ts_code} 的数据为空或获取失败")
-                                continue
-                            
-                            # 处理数据
-                            processed_df = self.process_data(df)
-                            if processed_df is None or processed_df.empty:
-                                logger.warning(f"股票 {ts_code} 的处理后数据为空")
-                                continue
-                            
-                            # 保存数据到MongoDB
-                            success = self.save_to_mongodb(processed_df)
-                            if success:
-                                logger.success(f"股票 {ts_code} 的数据已保存到MongoDB")
-                            else:
-                                logger.error(f"保存股票 {ts_code} 的数据到MongoDB失败")
-                                all_success = False
-                        except Exception as e:
-                            logger.error(f"处理股票 {ts_code} 的数据时发生异常: {str(e)}")
-                            all_success = False
-                    
-                    return all_success
+                        # 发生异常后，尝试继续获取下一批
+                        offset += limit
+                
+                # 如果至少处理了一条记录，就视为部分成功
+                if total_processed > 0:
+                    logger.success(f"成功获取并处理了 {total_processed} 条记录")
+                    return True
                 else:
-                    # 并行模式
-                    logger.info(f"使用并行模式处理 {len(stock_codes)} 个股票的数据")
-                    return self._process_stock_parallel(stock_codes)
+                    logger.error("未能成功处理任何记录")
+                    return False
             else:
                 # 日期模式：按交易日获取
                 logger.info("使用日期模式，按交易日获取数据")
@@ -1400,7 +1446,7 @@ def main():
         # sys.exit(1)
     # ---- 初始化结束 ----
     
-    parser = argparse.ArgumentParser(description='获取涨跌停列表数据并保存到MongoDB')
+    parser = argparse.ArgumentParser(description='获取涨跌停列表并保存到MongoDB')
     parser.add_argument('--config', default='config/config.yaml', help='配置文件路径')
     parser.add_argument('--interface-dir', default='config/interfaces', help='接口配置文件目录')
     parser.add_argument('--exchange', default='SSE', help='交易所代码：SSE-上交所, SZSE-深交所')
@@ -1439,7 +1485,7 @@ def main():
                 logger.info(f"从共享配置获取配置文件路径：{args.config}")
         
         # 创建获取器并运行 - 传入 mongo_instance
-        fetcher = limit_list_dFetcher(
+        fetcher = limit_list_dBasicFetcher(
             config_path=args.config,
             interface_dir=args.interface_dir,
             exchange=args.exchange,
@@ -1460,10 +1506,10 @@ def main():
             success = fetcher.run()
             
             if success:
-                logger.success("涨跌停列表数据获取和保存成功")
+                logger.success("涨跌停列表获取和保存成功")
                 return 0
             else:
-                logger.error("涨跌停列表数据获取或保存失败")
+                logger.error("涨跌停列表获取或保存失败")
                 return 1
         except KeyboardInterrupt:
             logger.warning("接收到Ctrl+C，正在强制退出...")

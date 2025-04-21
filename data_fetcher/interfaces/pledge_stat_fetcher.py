@@ -459,8 +459,12 @@ class pledge_statFetcher(TushareFetcher):
                     wan_idx=wan_idx # 传递 wan_idx
                 )
                 
-                # 如果成功获取数据，跳出循环
+                # 如果成功获取数据，添加2-5秒的随机延迟并跳出循环
                 if result is not None:
+                    # 添加统一的2-5秒随机延迟，防止API限制
+                    delay = random.uniform(2.0, 5.0)
+                    logger.info(f"【API请求成功】添加{delay:.2f}秒延迟防止API限制 (WAN: {wan_idx})")
+                    time.sleep(delay)
                     break
                     
             except ConnectionError as conn_err:
@@ -481,8 +485,9 @@ class pledge_statFetcher(TushareFetcher):
                 error_msg = f"调用 API 失败 (WAN: {wan_idx}): {str(e)}"
                 if retry_count < max_retries - 1:
                     retry_count += 1
-                    logger.warning(f"{error_msg}，第 {retry_count}/{max_retries} 次重试")
-                    time.sleep(random.uniform(5.0, 10.0))
+                    delay = random.uniform(5.0, 10.0)
+                    logger.warning(f"{error_msg}，第 {retry_count}/{max_retries} 次重试，等待{delay:.2f}秒")
+                    time.sleep(delay)
                     continue
                 else:
                     logger.error(error_msg)
@@ -766,10 +771,7 @@ class pledge_statFetcher(TushareFetcher):
                         all_data_frames.append(df)
                         processed_count += 1
                         
-                    # 添加随机延时(3-8秒)，避免API限制
-                    delay = random.uniform(3.0, 8.0)
-                    logger.debug(f"WAN口 {wan_idx} API调用延时: {delay:.2f}秒")
-                    time.sleep(delay)
+                    # fetch_data方法中已添加了2-5秒的随机延迟，这里不需要额外添加
                     
                 except Exception as e:
                     logger.warning(f"WAN口 {wan_idx} 获取股票 {ts_code} 在公告日期 {ann_date} 的数据时出错: {str(e)}")
@@ -1298,10 +1300,7 @@ class pledge_statFetcher(TushareFetcher):
                         # 获取单个股票的质押统计数据
                         df = self.fetch_data(ts_code=ts_code, wan_idx=wan_idx)
                         
-                        # 添加随机延时 (2-5秒)，避免触发API限制
-                        delay = random.uniform(2.0, 5.0)
-                        logger.debug(f"WAN口 {wan_idx} 处理股票 {ts_code} 后延时 {delay:.2f} 秒")
-                        time.sleep(delay)
+                        # fetch_data方法中已添加了2-5秒的随机延迟，这里不需要额外添加
                         
                         if df is None or df.empty:
                             logger.info(f"【抓取结果】股票 {ts_code} 无数据 (WAN口 {wan_idx})")
@@ -1346,13 +1345,20 @@ class pledge_statFetcher(TushareFetcher):
                         # 标记队列任务完成
                         stock_queue.task_done()
                         
+                        # 添加延时，避免连续请求
+                        delay = random.uniform(2.0, 5.0)
+                        logger.info(f"【处理完成】添加{delay:.2f}秒延迟防止API限制 (WAN口 {wan_idx})")
+                        time.sleep(delay)
+                    
                     except Exception as e:
                         logger.error(f"WAN口 {wan_idx} 处理股票 {ts_code} 时发生异常: {str(e)}")
                         # 标记队列任务完成
                         stock_queue.task_done()
                         
                         # 添加延时，避免连续失败
-                        time.sleep(random.uniform(2.0, 5.0))
+                        delay = random.uniform(2.0, 5.0)
+                        logger.info(f"【异常处理】添加{delay:.2f}秒延迟防止API限制 (WAN口 {wan_idx})")
+                        time.sleep(delay)
                     
                     # 每处理50个股票输出一次总进度
                     if processed_stocks_count % 50 == 0:
@@ -1434,10 +1440,7 @@ class pledge_statFetcher(TushareFetcher):
                 # 使用start_date和end_date参数获取单个股票的所有数据
                 df = self.fetch_data(ts_code=ts_code)
                 
-                # 添加随机延时 (2-5秒)，避免触发API限制
-                delay = random.uniform(2.0, 5.0)
-                logger.debug(f"处理股票 {ts_code} 后延时 {delay:.2f} 秒")
-                time.sleep(delay)
+                # fetch_data方法中已添加了2-5秒的随机延迟，这里不需要额外添加
                 
                 if df is None or df.empty:
                     logger.info(f"【抓取结果】股票 {ts_code} 无数据")
@@ -1476,7 +1479,9 @@ class pledge_statFetcher(TushareFetcher):
                 logger.error(f"处理股票 {ts_code} 的数据时发生异常: {str(e)}")
                 
                 # 出错后添加延时，避免连续失败
-                time.sleep(random.uniform(2.0, 5.0))
+                delay = random.uniform(2.0, 5.0)
+                logger.info(f"【异常处理】添加{delay:.2f}秒延迟防止API限制")
+                time.sleep(delay)
             
             # 更新处理计数
             processed_count += 1
